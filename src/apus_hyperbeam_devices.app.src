@@ -1,0 +1,8 @@
+{application, apus_hyperbeam_devices, [
+    {description, "Apus HyperBEAM external devices"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib, hb]},
+    {env, []},
+    {modules, []}
+]}.

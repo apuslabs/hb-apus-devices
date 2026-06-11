@@ -1,0 +1,9 @@
+/_build/
+/priv/dev_sev_gpu/*.so
+/priv/dev_sev_gpu/lib/
+/.rebar3/
+/erl_crash.dump
+/hyperbeam-key.json
+/PUBLISH.md.tmp
+/cache-mainnet/
+/logs/
