@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>APUS GPU measurement demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1016;
+      --panel: #121a23;
+      --panel-2: #0f161e;
+      --line: #263746;
+      --text: #e7eef3;
+      --muted: #8fa3b2;
+      --cyan: #58d6e8;
+      --green: #7fe0a4;
+      --amber: #f1bd70;
+      --red: #f18b8b;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    main { max-width: 1180px; margin: 0 auto; padding: 32px 22px 64px; }
+    header { display: flex; justify-content: space-between; gap: 20px; align-items: end; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(1.65rem, 4vw, 2.6rem); letter-spacing: 0; }
+    h2 { font-size: 1.1rem; margin-bottom: 12px; }
+    h3 { font-size: .92rem; margin-bottom: 8px; }
+    .eyebrow { color: var(--cyan); font: 700 .72rem var(--mono); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 8px; }
+    .lede { color: var(--muted); max-width: 720px; margin-top: 10px; }
+    .status { border: 1px solid #315c56; color: var(--green); padding: 8px 10px; font: .72rem var(--mono); white-space: nowrap; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 22px 0; }
+    button { border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 9px 12px; cursor: pointer; font: .78rem var(--mono); }
+    button[aria-pressed="true"] { border-color: var(--cyan); color: var(--cyan); }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); padding: 18px; min-width: 0; }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+    .metric { font: 700 1.45rem var(--mono); margin: 4px 0; }
+    .label { color: var(--muted); font-size: .78rem; }
+    .ok { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); overflow-wrap: anywhere; }
+    .ladder { display: grid; gap: 8px; }
+    .rung { display: grid; grid-template-columns: 12px 150px 1fr; gap: 10px; align-items: center; border-left: 3px solid var(--line); padding: 9px 10px; background: var(--panel-2); }
+    .rung.active { border-left-color: var(--cyan); }
+    .dot { width: 8px; height: 8px; background: var(--line); }
+    .active .dot { background: var(--cyan); }
+    .rung strong { font: .78rem var(--mono); }
+    .rung span { color: var(--muted); font-size: .78rem; }
+    dl { display: grid; grid-template-columns: minmax(125px, .8fr) 1.2fr; gap: 7px 14px; margin: 0; font-size: .8rem; }
+    dt { color: var(--muted); }
+    dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+    pre { background: #091017; border: 1px solid var(--line); padding: 13px; margin: 0; overflow: auto; font: .72rem/1.55 var(--mono); color: #c8d8e1; }
+    .callout { border-left: 3px solid var(--amber); background: #211b12; padding: 12px 14px; color: #f5d9ac; font-size: .82rem; }
+    footer { color: var(--muted); border-top: 1px solid var(--line); margin-top: 24px; padding-top: 18px; font-size: .75rem; }
+    @media (max-width: 760px) {
+      main { padding: 22px 14px 44px; }
+      header { display: block; }
+      .status { display: inline-block; margin-top: 16px; }
+      .span-4, .span-6, .span-8, .span-12 { grid-column: span 12; }
+      .rung { grid-template-columns: 12px 1fr; }
+      .rung span { grid-column: 2; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">Device Forge / apus-hyperbeam-devices</div>
+      <h1>GPU measurement, with an explicit trust boundary.</h1>
+      <p class="lede">A local, offline-readable view of what the external devices observe, what the host measurement chain can bind, and what an inference receipt actually commits to.</p>
+    </div>
+    <div class="status">HYPERBEAM EDGE · 2c03978a</div>
+  </header>
+
+  <div class="toolbar" role="group" aria-label="Observation view">
+    <button data-view="local" aria-pressed="true">Local Forge node</button>
+    <button data-view="remote" aria-pressed="false">Remote RTX 4090 observation</button>
+  </div>
+
+  <section class="grid" id="local-view">
+    <article class="panel span-4"><h2>Current subject</h2><div class="metric">host-observed</div><div class="label">macOS host, no NVIDIA device exposed</div></article>
+    <article class="panel span-4"><h2>Static inventory</h2><div class="metric bad">supported=false</div><div class="label">No fake success when sysfs/NVIDIA tooling is absent</div></article>
+    <article class="panel span-4"><h2>Measurement integration</h2><div class="metric warn">observation-only</div><div class="label">Stock HyperBEAM has no measurement@1.0</div></article>
+    <article class="panel span-6"><h2>Trust gradient</h2><div class="ladder">
+      <div class="rung"><i class="dot"></i><strong>TEE / hardware</strong><span>Out of scope for consumer GPU v1.</span></div>
+      <div class="rung"><i class="dot"></i><strong>TPM / SNP chain</strong><span>Existing host measurement remains the anchor.</span></div>
+      <div class="rung active"><i class="dot"></i><strong>host-measured-subject</strong><span>Only when measurement@1.0 consumes hook-body.</span></div>
+      <div class="rung active"><i class="dot"></i><strong>host-observed</strong><span>PCI/sysfs/NVIDIA observation, spoofable by a compromised host.</span></div>
+      <div class="rung"><i class="dot"></i><strong>runtime-observed</strong><span>Temperature, power, utilization, and memory usage.</span></div>
+    </div></article>
+    <article class="panel span-6"><h2>Composition graph</h2><pre>agent@1.0 (default: unchanged)
+  └─ inference_receipt@1.0 (opt-in)
+       ├─ inference@1.0 → relay@1.0 → backend
+       ├─ gpu_inventory@1.0 → report / digest
+       └─ apus_measurement@1.0
+            └─ measurement@1.0 (hook-body, when present)
+
+sev_gpu@1.0 stays independent.</pre></article>
+    <article class="panel span-6"><h2>Inventory digest contract</h2><dl>
+      <dt>type</dt><dd>apus-gpu-inventory</dd>
+      <dt>provenance</dt><dd>host-observed</dd>
+      <dt>static fields</dt><dd>PCI BDF, vendor/device IDs, driver, IOMMU, PCIe link, topology</dd>
+      <dt>excluded</dt><dd>temperature, power, utilization, memory-used</dd>
+      <dt>digest</dt><dd class="mono">k8yLDRguIUHvCmBVUKaM1iEqYOuTYlAfJ1ruWikN70Y</dd>
+    </dl></article>
+    <article class="panel span-6"><h2>Inference receipt contract</h2><dl>
+      <dt>request</dt><dd>SHA-256 of canonical request</dd>
+      <dt>response</dt><dd>SHA-256 of original response body/data</dd>
+      <dt>links</dt><dd>GPU inventory digest + measurement ID</dd>
+      <dt>placement</dt><dd>sibling receipt metadata / receipt+link</dd>
+      <dt>streaming</dt><dd class="warn">rejected in receipt v1</dd>
+    </dl></article>
+    <article class="panel span-12"><div class="callout"><strong>Boundary:</strong> this is not GPU attestation and it is not a proof of inference correctness. It is a signed, composable observation whose confidence increases when the existing host measurement chain binds the same inventory subject.</div></article>
+  </section>
+
+  <section class="grid" id="remote-view" hidden>
+    <article class="panel span-4"><h2>Remote evidence</h2><div class="metric ok">RTX 4090</div><div class="label">Windows host observed via ssh pc-win</div></article>
+    <article class="panel span-4"><h2>PCI identity</h2><div class="metric">01:00.0</div><div class="label">NVIDIA driver 610.88 · compute capability 8.9</div></article>
+    <article class="panel span-4"><h2>Runtime snapshot</h2><div class="metric">38°C</div><div class="label">6.80 W · 0% GPU utilization · 743 MiB used</div></article>
+    <article class="panel span-8"><h2>Recorded observation</h2><pre id="remote-json"></pre></article>
+    <article class="panel span-4"><h2>Provenance</h2><dl>
+      <dt>class</dt><dd>host-observed</dd>
+      <dt>measurement</dt><dd>false / not available</dd>
+      <dt>attestation</dt><dd class="bad">not claimed</dd>
+      <dt>use</dt><dd>fixture or remote observation input only</dd>
+    </dl></article>
+    <article class="panel span-12"><div class="callout"><strong>Boundary:</strong> the RTX 4090 output is not local-node hardware evidence. The demo keeps its origin and provenance visible so a remote observation cannot be mistaken for a TPM/SNP-bound subject.</div></article>
+  </section>
+
+  <footer>Run from this repository with <span class="mono">python3 -m http.server 8088 --directory demo</span>, then open <span class="mono">http://127.0.0.1:8088/</span>. No network assets are required.</footer>
+</main>
+<script>
+  const remote = {
+    "host": "JAX-PC",
+    "os": "Windows 10.0.26200.9445",
+    "provenance.class": "host-observed",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "pci-bdf": "00000000:01:00.0",
+    "driver": "610.88",
+    "uuid": "GPU-8280e9e7-d8a0-27ab-fdf3-ee33556526d0",
+    "vram-mib": 24564,
+    "compute-capability": "8.9",
+    "runtime": {"temperature-c": 38, "power-watts": 6.8, "utilization-gpu-percent": 0, "memory-used-mib": 743, "memory-total-mib": 24564}
+  };
+  document.getElementById('remote-json').textContent = JSON.stringify(remote, null, 2);
+  document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => {
+    const view = button.dataset.view;
+    document.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+    document.getElementById('local-view').hidden = view !== 'local';
+    document.getElementById('remote-view').hidden = view !== 'remote';
+  }));
+</script>
+</body>
+</html>

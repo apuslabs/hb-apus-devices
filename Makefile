@@ -1,6 +1,6 @@
 .PHONY: compile package verify test local publish setup-inference setup-cc check-nvat-deps clean-publish
 
-HYPERBEAM_REF = df62acf0f2a5404822888f09c846d02a361f7fd2
+HYPERBEAM_REF = 2c03978a3d201444bf7aada3eb35809153e41ef3
 WALLET ?= $(HOME)/.aos.json
 
 DETERMINISTIC_INFERENCE_BRANCH ?= main
@@ -24,10 +24,13 @@ verify:
 	rebar3 device verify
 
 test:
-	rebar3 device test --device-roots dev_agent,dev_inference,dev_sev_gpu
+	rebar3 device test --device-roots dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_apus_measurement,dev_inference_receipt
+
+eunit-all:
+	rebar3 eunit-all
 
 local:
-	rebar3 device local
+	rebar3 device local --device-roots dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_apus_measurement,dev_inference_receipt
 
 publish:
 	@test -f "$(WALLET)" || (echo "Missing wallet: $(WALLET)" && exit 1)

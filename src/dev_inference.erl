@@ -105,8 +105,12 @@ forward_health_check(Opts) ->
             }}
     end.
 
-do_inference_request(_Base, Req, Opts, Path) ->
-    Params = extract_inference_params(Req, Opts),
+do_inference_request(Base, Req, Opts, Path) ->
+    %% HTTP/device callers can carry backend routing in the resolved base or
+    %% request map. Promote those keys into the options consumed by relay@1.0
+    %% while preserving the existing defaults when they are absent.
+    RequestOpts = merge_request_opts(Base, Req, Opts),
+    Params = extract_inference_params(Req, RequestOpts),
     IsStream = case maps:get(<<"stream">>, Params, false) of
         true -> true;
         <<"true">> -> true;
@@ -117,18 +121,38 @@ do_inference_request(_Base, Req, Opts, Path) ->
             Body = hb_json:encode(Params),
             #{
                 <<"stream_generator">> => fun(Sender) -> 
-                    stream_from_backend(Sender, <<"POST">>, Path, Body, Opts) 
+                    stream_from_backend(Sender, <<"POST">>, Path, Body, RequestOpts)
                 end
             };
         false ->
-            Body = prepare_request_body(Req, Opts),
-            Response = relay_to_backend(<<"POST">>, Path, Body, Opts),
+            Body = prepare_request_body(Req, RequestOpts),
+            Response = relay_to_backend(<<"POST">>, Path, Body, RequestOpts),
             
-            case should_include_attestation(Req, Opts) of
-                true -> add_attestation(Response, Req, Opts);
-                false -> format_response(Response, Req, Opts)
+            case should_include_attestation(Req, RequestOpts) of
+                true -> add_attestation(Response, Req, RequestOpts);
+                false -> format_response(Response, Req, RequestOpts)
             end
     end.
+
+merge_request_opts(Base, Req, Opts) ->
+    lists:foldl(
+        fun(Key, Acc) ->
+            case first_defined([
+                maps:get(Key, Req, undefined),
+                maps:get(Key, Base, undefined),
+                maps:get(Key, Opts, undefined)
+            ]) of
+                undefined -> Acc;
+                Value -> Acc#{Key => Value}
+            end
+        end,
+        Opts,
+        [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>]
+    ).
+
+first_defined([]) -> undefined;
+first_defined([undefined | Rest]) -> first_defined(Rest);
+first_defined([Value | _]) -> Value.
 
 prepare_request_body(Req, Opts) ->
     case hb_ao:get(<<"body">>, Req, not_found, Opts) of
@@ -307,3 +331,18 @@ receive_stream(ConnPid, StreamRef, Sender) ->
     after 30000 ->
         ok
     end.
+
+-ifdef(TEST).
+
+request_opts_promote_backend_route_test() ->
+    Result = merge_request_opts(
+        #{<<"agent-api-peer">> => <<"https://example.test">>},
+        #{<<"agent-api-path">> => <<"/v1/chat/completions">>},
+        #{}
+    ),
+    ?assertEqual(<<"https://example.test">>,
+        maps:get(<<"agent-api-peer">>, Result)),
+    ?assertEqual(<<"/v1/chat/completions">>,
+        maps:get(<<"agent-api-path">>, Result)).
+
+-endif.

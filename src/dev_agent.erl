@@ -41,7 +41,12 @@ info(_Msg) ->
 run(Base, Req, Opts) ->
     UserPrompt = hb_ao:get(<<"agent-user-prompt">>, Req, <<"Hello">>, Opts),
     SystemPrompt = default_system_prompt(),
-    Tools = default_tools(),
+    DisableTools = truthy(hb_ao:get(<<"agent-disable-tools">>, Req, false, Opts)),
+    Tools =
+        case DisableTools of
+            true -> [];
+            false -> default_tools()
+        end,
     Model = hb_ao:get(<<"agent-model">>, Req, ?DEFAULT_MODEL, Opts),
     MaxIter = hb_ao:get(<<"agent-max-iterations">>, Req, ?DEFAULT_MAX_ITERATIONS, Opts),
     %% Merge agent API config from Req/Base into Opts so that
@@ -115,6 +120,11 @@ loop(Messages, Iteration, AgentOpts, Base) ->
 %%%===================================================================
 
 %% @doc Build the OpenAI-compatible request body.
+build_request_body(Messages, [], Model) ->
+    hb_json:encode(#{
+        <<"model">> => Model,
+        <<"messages">> => Messages
+    });
 build_request_body(Messages, Tools, Model) ->
     hb_json:encode(#{
         <<"model">> => Model,
@@ -122,6 +132,12 @@ build_request_body(Messages, Tools, Model) ->
         <<"tools">> => Tools,
         <<"tool_choice">> => <<"auto">>
     }).
+
+truthy(true) -> true;
+truthy(<<"true">>) -> true;
+truthy(<<"1">>) -> true;
+truthy(1) -> true;
+truthy(_) -> false.
 
 %% @doc Default LLM call via inference@1.0.
 %% inference@1.0 relays to any OpenAI-compatible provider via relay@1.0,
@@ -131,8 +147,10 @@ build_request_body(Messages, Tools, Model) ->
 %%   agent-api-path: Completions path   (default: "/v1/chat/completions")
 %%   agent-api-key:  Bearer token       (optional)
 default_call_llm(RequestBody, Opts) ->
+    InferenceDevice = maps:get(<<"agent-inference-device">>, Opts,
+        <<"inference@1.0">>),
     case hb_ao:resolve(
-        #{<<"device">>    => <<"inference@1.0">>,
+        #{<<"device">>    => InferenceDevice,
           <<"chat-mode">> => true},
         #{<<"path">> => <<"completions">>,
           <<"body">> => RequestBody},
@@ -331,7 +349,8 @@ truncate_result(Result) ->
 %% Keys already present in Opts are not overwritten.
 %% This allows Lua ao.resolve calls to pass config via Req/Base.
 merge_agent_config(Source, Opts) ->
-    Keys = [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>],
+    Keys = [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>,
+        <<"agent-inference-device">>],
     lists:foldl(fun(Key, Acc) ->
         case maps:is_key(Key, Acc) of
             true -> Acc;

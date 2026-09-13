@@ -1,0 +1,23 @@
+{
+  "host": "JAX-PC",
+  "os": "Windows 10.0.26200.9445",
+  "provenance": {"class": "host-observed", "source": "ssh pc-win"},
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "pci-bdf": "00000000:01:00.0",
+    "driver": "610.88",
+    "uuid": "GPU-8280e9e7-d8a0-27ab-fdf3-ee33556526d0",
+    "vram-mib": 24564,
+    "compute-capability": "8.9"
+  },
+  "runtime": {
+    "temperature-c": 38,
+    "power-watts": 6.8,
+    "utilization-gpu-percent": 0,
+    "utilization-memory-percent": 0,
+    "memory-used-mib": 743,
+    "memory-total-mib": 24564
+  },
+  "measurement-integration": false,
+  "attestation": false
+}

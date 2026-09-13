@@ -5,8 +5,12 @@ External HyperBEAM Device Forge repository for Apus devices:
 - `agent@1.0`
 - `inference@1.0`
 - `sev_gpu@1.0`
+- `gpu_inventory@1.0`
+- `apus_measurement@1.0`
+- `inference_receipt@1.0`
 
-This repository is pinned to HyperBEAM `df62acf0f2a5404822888f09c846d02a361f7fd2`, the PR #915 Device Forge baseline.
+This repository is pinned to the official HyperBEAM `edge` commit
+`2c03978a3d201444bf7aada3eb35809153e41ef3`.
 
 ## Build
 
@@ -41,6 +45,19 @@ make setup-inference
 ```sh
 rebar3 device local
 ```
+
+## Offline Demo
+
+The trust-gradient and remote-observation demo is self-contained under
+`demo/`:
+
+```sh
+python3 -m http.server 8088 --directory demo
+```
+
+Open `http://127.0.0.1:8088/`. It does not claim GPU attestation or inference
+correctness, and the RTX 4090 panel is explicitly marked as a separate
+`host-observed` fixture.
 
 ## Publish
 
