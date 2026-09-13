@@ -125,7 +125,7 @@ sev_gpu@1.0 stays independent.</pre></article>
   <section class="grid" id="remote-view" hidden>
     <article class="panel span-4"><h2>Remote evidence</h2><div class="metric ok">RTX 4090</div><div class="label">Windows host observed via ssh pc-win</div></article>
     <article class="panel span-4"><h2>PCI identity</h2><div class="metric">01:00.0</div><div class="label">NVIDIA driver 610.88 · compute capability 8.9</div></article>
-    <article class="panel span-4"><h2>Runtime snapshot</h2><div class="metric">38°C</div><div class="label">6.80 W · 0% GPU utilization · 743 MiB used</div></article>
+    <article class="panel span-4"><h2>Runtime snapshot</h2><div class="metric">35°C</div><div class="label">5.43 W · 0% GPU utilization · 729 MiB used</div></article>
     <article class="panel span-8"><h2>Recorded observation</h2><pre id="remote-json"></pre></article>
     <article class="panel span-4"><h2>Provenance</h2><dl>
       <dt>class</dt><dd>host-observed</dd>
@@ -141,7 +141,8 @@ sev_gpu@1.0 stays independent.</pre></article>
 <script>
   const remote = {
     "host": "JAX-PC",
-    "os": "Windows 10.0.26200.9445",
+    "os_version": "10.0.26200",
+    "captured_at_utc": "2026-09-13T12:06:09.6371198Z",
     "provenance.class": "host-observed",
     "gpu": "NVIDIA GeForce RTX 4090",
     "pci-bdf": "00000000:01:00.0",
@@ -149,7 +150,9 @@ sev_gpu@1.0 stays independent.</pre></article>
     "uuid": "GPU-8280e9e7-d8a0-27ab-fdf3-ee33556526d0",
     "vram-mib": 24564,
     "compute-capability": "8.9",
-    "runtime": {"temperature-c": 38, "power-watts": 6.8, "utilization-gpu-percent": 0, "memory-used-mib": 743, "memory-total-mib": 24564}
+    "runtime": {"temperature-c": 35, "power-watts": 5.43, "utilization-gpu-percent": 0, "memory-used-mib": 729, "memory-total-mib": 24564},
+    "inference": {"http-status": 200, "content": "pc-win inference probe", "request-digest": "4ad7b84ea9685355b1d5733522d5bbad3f4a82d8639b71265f350f574f65869b", "response-digest": "5d3f75083b9cdae0743a55e50f7a331ee0ef79f4cae1274adb91c4def7f3eeab"},
+    "joint-digest": "106dfba43620e01f6a3afb1f97d4e384f7c7af329c92b0b4eff0b95ad23e3da8"
   };
   document.getElementById('remote-json').textContent = JSON.stringify(remote, null, 2);
   document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => {

@@ -1,6 +1,7 @@
 {
   "host": "JAX-PC",
-  "os": "Windows 10.0.26200.9445",
+  "os_version": "10.0.26200",
+  "captured_at_utc": "2026-09-13T12:06:09.6371198Z",
   "provenance": {"class": "host-observed", "source": "ssh pc-win"},
   "gpu": {
     "name": "NVIDIA GeForce RTX 4090",
@@ -11,13 +12,22 @@
     "compute-capability": "8.9"
   },
   "runtime": {
-    "temperature-c": 38,
-    "power-watts": 6.8,
+    "temperature-c": 35,
+    "power-watts": 5.43,
     "utilization-gpu-percent": 0,
     "utilization-memory-percent": 0,
-    "memory-used-mib": 743,
+    "memory-used-mib": 729,
     "memory-total-mib": 24564
   },
+  "inference": {
+    "http-status": 200,
+    "url": "https://hb.apus.network/~inference@1.0/v1/chat/completions",
+    "model": "google/gemma-4-26B-A4B-it",
+    "content": "pc-win inference probe",
+    "request-digest": "4ad7b84ea9685355b1d5733522d5bbad3f4a82d8639b71265f350f574f65869b",
+    "response-digest": "5d3f75083b9cdae0743a55e50f7a331ee0ef79f4cae1274adb91c4def7f3eeab"
+  },
+  "joint-digest": "106dfba43620e01f6a3afb1f97d4e384f7c7af329c92b0b4eff0b95ad23e3da8",
   "measurement-integration": false,
   "attestation": false
 }

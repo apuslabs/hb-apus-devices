@@ -1,6 +1,6 @@
 # GPU System Measurement Intent and Specification
 
-Status: Implemented v1 / validation in progress
+Status: Implemented v1 / local and remote probe validated
 Owner: Apus HyperBEAM Devices
 Scope: External HyperBEAM Device Forge repository only
 
@@ -412,6 +412,11 @@ On a macOS host without NVIDIA, a local Forge node reports
 `measurement-integration=false`. A remote Windows machine with an RTX 4090 was
 queried separately through `ssh pc-win`; that output is fixture/observation
 evidence only and is never presented as the local node's measured hardware.
+The checked-in scripts/pc-win-inference-gpu-probe.ps1 now performs the same
+probe from that Windows host: it collects nvidia-smi inventory/runtime fields,
+calls the published inference@1.0 endpoint, and emits request, response, and
+joint digests. This remains host-observed evidence rather than local-node
+hardware measurement.
 
 The existing real-API `dev_agent` integration test remains environment
 dependent and currently fails because its pre-existing OpenRouter API key is
