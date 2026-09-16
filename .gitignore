@@ -1,4 +1,5 @@
 /_build/
+/_checkouts/
 /priv/dev_sev_gpu/*.so
 /priv/dev_sev_gpu/lib/
 /.rebar3/
@@ -7,3 +8,5 @@
 /PUBLISH.md.tmp
 /cache-mainnet/
 /logs/
+/vendor/permaweb-os/native/lapee_snp_nif/target/
+/vendor/permaweb-os/src/priv/

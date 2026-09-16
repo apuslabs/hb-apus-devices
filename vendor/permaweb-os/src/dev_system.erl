@@ -1,0 +1,1182 @@
+%%% @doc `~system@1.0' -- structured hardware/runtime evidence.
+%%%
+%%% The device returns a nested AO-Core message describing what this LapEE
+%%% runtime observed about the host. It is deliberately neutral: it collects
+%%% and parses facts from read-only kernel/userspace interfaces, but does not
+%%% assert policy or trust.
+-module(dev_system).
+-implements(<<"system@1.0">>).
+-device_libraries([lib_lapee_tpm_tcg]).
+-export([info/1, info/3, all/3]).
+-export([report_from_root/1]).
+-include_lib("kernel/include/file.hrl").
+-define(EFI_GLOBAL_VARIABLE_GUID, "8be4df61-93ca-11d2-aa0d-00e098032b8c").
+-define(MSR_BOOT_GUARD_SACM_INFO, 16#13a).
+info(_) ->
+    #{exports => [<<"info">>, <<"all">>]}.
+
+info(_Base, _Req, _Opts) ->
+    {ok, #{
+        <<"status">> => 200,
+        <<"body">> => #{
+            <<"version">> => <<"1.0">>,
+            <<"exports">> => maps:get(exports, info(#{}), [])
+        }
+    }}.
+
+all(_Base, _Req, _Opts) ->
+    {ok, #{<<"status">> => 200, <<"body">> => report_from_root(root())}}.
+
+%%%============================================================================
+%%% Report assembly
+%%%============================================================================
+
+report_from_root(Root0) ->
+    Root = normalise_root(Root0),
+    BootGuard = boot_guard_report(Root),
+    Edac = edac_report(Root),
+    MemoryController = memory_controller_probe_report(Root, Edac),
+    #{
+        <<"device">> => <<"system@1.0">>,
+        <<"schema">> => <<"lapee-system-report@1">>,
+        <<"version">> => <<"1.0">>,
+        <<"probed-at-unix">> => erlang:system_time(second),
+        <<"boot">> => boot_report(Root),
+        <<"kernel">> => kernel_report(Root),
+        <<"cpu">> => cpu_report(Root),
+        <<"memory">> => memory_report(Root, Edac, MemoryController),
+        <<"firmware">> => firmware_report(Root, BootGuard),
+        <<"tpm">> => tpm_report(Root),
+        <<"iommu">> => iommu_report(Root),
+        <<"integrity">> => integrity_report(Root)
+    }.
+
+boot_report(Root) ->
+    #{
+        <<"loaded-uki">> => loaded_uki_report(Root)
+    }.
+
+loaded_uki_report(Root) ->
+    Source = <<"/run/lapee/boot-uki-sha256">>,
+    SourceInfo = boot_uki_source_report(Root),
+    case read_trim(Root, binary_to_list(Source)) of
+        null ->
+            #{
+                <<"available">> => false,
+                <<"source">> => Source,
+                <<"source-info">> => SourceInfo,
+                <<"sha256">> => null,
+                <<"status">> => <<"unavailable">>
+            };
+        Hex ->
+            case sha256_hex_to_id(Hex) of
+                {ok, ID} ->
+                    #{
+                        <<"available">> => true,
+                        <<"source">> => Source,
+                        <<"source-info">> => SourceInfo,
+                        <<"sha256">> => ID,
+                        <<"status">> => <<"boot-media-scan">>
+                    };
+                error ->
+                    #{
+                        <<"available">> => false,
+                        <<"source">> => Source,
+                        <<"source-info">> => SourceInfo,
+                        <<"sha256">> => null,
+                        <<"status">> => <<"invalid-source-value">>
+                    }
+            end
+    end.
+
+boot_uki_source_report(Root) ->
+    case read_file(Root, "/run/lapee/boot-uki-source") of
+        {ok, Bin} ->
+            maps:fold(
+                fun(Key, Value, Acc) -> Acc#{Key => Value} end,
+                #{},
+                lines_kv(Bin));
+        error ->
+            #{}
+    end.
+
+kernel_report(Root) ->
+    #{
+        <<"ostype">> => read_trim(Root, "/proc/sys/kernel/ostype"),
+        <<"osrelease">> => read_trim(Root, "/proc/sys/kernel/osrelease"),
+        <<"version">> => read_trim(Root, "/proc/version"),
+        <<"hostname">> => read_trim(Root, "/proc/sys/kernel/hostname"),
+        <<"cmdline">> => read_trim(Root, "/proc/cmdline")
+    }.
+
+cpu_report(Root) ->
+    CpuInfo = cpuinfo_report(Root),
+    #{
+        <<"cpuinfo">> => CpuInfo,
+        <<"cpuid">> => cpuid_report(Root),
+        <<"sysfs">> => #{
+            <<"possible">> =>
+                read_trim(Root, "/sys/devices/system/cpu/possible"),
+            <<"present">> =>
+                read_trim(Root, "/sys/devices/system/cpu/present"),
+            <<"online">> =>
+                read_trim(Root, "/sys/devices/system/cpu/online"),
+            <<"offline">> =>
+                read_trim(Root, "/sys/devices/system/cpu/offline"),
+            <<"smt">> => #{
+                <<"active">> =>
+                    read_trim(Root, "/sys/devices/system/cpu/smt/active"),
+                <<"control">> =>
+                    read_trim(Root, "/sys/devices/system/cpu/smt/control")
+            }
+        }
+    }.
+
+memory_report(Root, Edac, ControllerProbes) ->
+    #{
+        <<"meminfo">> => meminfo_report(Root),
+        <<"edac">> => Edac,
+        <<"controller-probes">> => ControllerProbes
+    }.
+
+firmware_report(Root, BootGuard) ->
+    #{
+        <<"dmi">> => dmi_report(Root),
+        <<"acpi">> => acpi_report(Root),
+        <<"efi">> => efi_report(Root),
+        <<"boot-guard">> => BootGuard
+    }.
+
+tpm_report(Root) ->
+    Devices = tpm_devices(Root),
+    #{
+        <<"available">> => Devices =/= [],
+        <<"devices">> => Devices
+    }.
+
+iommu_report(Root) ->
+    Base = "/sys/kernel/iommu_groups",
+    Groups = digit_dirs(Root, Base),
+    #{
+        <<"available">> => dir_exists(Root, Base),
+        <<"group-count">> => length(Groups)
+    }.
+
+integrity_report(Root) ->
+    #{
+        <<"lockdown">> =>
+            read_trim(Root, "/sys/kernel/security/lockdown"),
+        <<"ima">> => #{
+            <<"runtime-measurements-count">> =>
+                read_trim(
+                    Root,
+                    "/sys/kernel/security/integrity/ima/"
+                    "runtime_measurements_count"),
+            <<"policy-present">> =>
+                file_exists(
+                    Root,
+                    "/sys/kernel/security/integrity/ima/policy")
+        }
+    }.
+
+%%%============================================================================
+%%% Individual probes
+%%%============================================================================
+
+cpuinfo_report(Root) ->
+    case read_file(Root, "/proc/cpuinfo") of
+        {ok, Bin} ->
+            Stanzas = non_empty(binary:split(Bin, <<"\n\n">>, [global])),
+            First =
+                case Stanzas of
+                    [S | _] -> cpuinfo_stanza(S);
+                    [] -> #{}
+                end,
+            Flags = split_words(maps:get(<<"flags">>, First, <<>>)),
+            Bugs = split_words(maps:get(<<"bugs">>, First, <<>>)),
+            #{
+                <<"available">> => true,
+                <<"logical-processor-count">> =>
+                    length([ok || S <- Stanzas,
+                                  maps:is_key(<<"processor">>,
+                                              cpuinfo_stanza(S))]),
+                <<"first-processor">> => First,
+                <<"flags">> => Flags,
+                <<"bugs">> => Bugs
+            };
+        error ->
+            #{
+                <<"available">> => false,
+                <<"logical-processor-count">> => null,
+                <<"first-processor">> => #{},
+                <<"flags">> => [],
+                <<"bugs">> => []
+            }
+    end.
+
+cpuinfo_stanza(Bin) ->
+    lists:foldl(
+        fun line_to_kv/2,
+        #{},
+        binary:split(Bin, <<"\n">>, [global])).
+
+cpuid_report(Root) ->
+    Path = "/dev/cpu/0/cpuid",
+    Leaves = [
+        {16#00000000, 0},
+        {16#00000001, 0},
+        {16#00000007, 0},
+        {16#80000000, 0},
+        {16#80000001, 0}
+    ],
+    case file_exists(Root, Path) of
+        true ->
+            Results = [cpuid_leaf_report(Root, Path, Leaf, Subleaf)
+                       || {Leaf, Subleaf} <- Leaves],
+            #{
+                <<"available">> => true,
+                <<"source">> => <<"dev-cpu-cpuid">>,
+                <<"interface">> => to_bin(Path),
+                <<"leaves">> => Results
+            };
+        false ->
+            #{
+                <<"available">> => false,
+                <<"source">> => <<"dev-cpu-cpuid">>,
+                <<"interface">> => to_bin(Path),
+                <<"error">> => <<"enoent">>,
+                <<"leaves">> => []
+            }
+    end.
+
+cpuid_leaf_report(Root, Path, Leaf, Subleaf) ->
+    Common = #{
+        <<"leaf">> => u32_hex(Leaf),
+        <<"subleaf">> => u32_hex(Subleaf)
+    },
+    case read_cpuid_leaf(Root, Path, Leaf, Subleaf) of
+        {ok, #{eax := Eax, ebx := Ebx, ecx := Ecx, edx := Edx}} ->
+            Common#{
+                <<"available">> => true,
+                <<"registers">> => #{
+                    <<"eax">> => u32_hex(Eax),
+                    <<"ebx">> => u32_hex(Ebx),
+                    <<"ecx">> => u32_hex(Ecx),
+                    <<"edx">> => u32_hex(Edx)
+                }
+            };
+        {error, Reason} ->
+            Common#{
+                <<"available">> => false,
+                <<"error">> => to_bin(Reason)
+            }
+    end.
+
+meminfo_report(Root) ->
+    case read_file(Root, "/proc/meminfo") of
+        {ok, Bin} ->
+            lists:foldl(
+                fun meminfo_line/2,
+                #{},
+                binary:split(Bin, <<"\n">>, [global]));
+        error ->
+            #{}
+    end.
+
+meminfo_line(Line, Acc) ->
+    case binary:split(Line, <<":">>, []) of
+        [Key, Val0] ->
+            Val = trim(Val0),
+            Tokens = split_words(Val),
+            Parsed =
+                case Tokens of
+                    [NBin, Unit | _] ->
+                        case parse_int(NBin) of
+                            null -> #{<<"raw">> => Val};
+                            N -> #{<<"value">> => N, <<"unit">> => Unit}
+                        end;
+                    [NBin] ->
+                        case parse_int(NBin) of
+                            null -> #{<<"raw">> => Val};
+                            N -> #{<<"value">> => N}
+                        end;
+                    [] ->
+                        #{<<"raw">> => Val}
+                end,
+            Acc#{normalise_key(Key) => Parsed};
+        _ ->
+            Acc
+    end.
+
+edac_report(Root) ->
+    Base = "/sys/devices/system/edac/mc",
+    Controllers = [C || C <- sorted_list_dir(Root, Base),
+                        string:prefix(C, "mc") =/= nomatch,
+                        dir_exists(Root, filename:join(Base, C))],
+    Reports = [edac_controller_report(Root, Base, C) || C <- Controllers],
+    #{
+        <<"available">> => Reports =/= [],
+        <<"source">> => <<"sysfs-edac">>,
+        <<"controllers">> => Reports
+    }.
+
+edac_controller_report(Root, Base, Controller) ->
+    Path = filename:join(Base, Controller),
+    Dimms = [D || D <- sorted_list_dir(Root, Path),
+                  string:prefix(D, "dimm") =/= nomatch,
+                  dir_exists(Root, filename:join(Path, D))],
+    #{
+        <<"name">> => to_bin(Controller),
+        <<"mc-name">> => read_trim(Root, filename:join(Path, "mc_name")),
+        <<"size-mb">> => read_trim(Root, filename:join(Path, "size_mb")),
+        <<"ce-count">> => read_trim(Root, filename:join(Path, "ce_count")),
+        <<"ue-count">> => read_trim(Root, filename:join(Path, "ue_count")),
+        <<"dimms">> => [edac_dimm_report(Root, Path, D) || D <- Dimms]
+    }.
+
+edac_dimm_report(Root, ControllerPath, Dimm) ->
+    Path = filename:join(ControllerPath, Dimm),
+    #{
+        <<"name">> => to_bin(Dimm),
+        <<"label">> => read_trim(Root, filename:join(Path, "dimm_label")),
+        <<"location">> =>
+            read_trim(Root, filename:join(Path, "dimm_location")),
+        <<"memory-type">> =>
+            read_trim(Root, filename:join(Path, "dimm_mem_type")),
+        <<"device-type">> =>
+            read_trim(Root, filename:join(Path, "dimm_dev_type")),
+        <<"edac-mode">> =>
+            read_trim(Root, filename:join(Path, "dimm_edac_mode")),
+        <<"size">> => read_trim(Root, filename:join(Path, "size")),
+        <<"rank">> => read_trim(Root, filename:join(Path, "rank"))
+    }.
+
+memory_controller_probe_report(Root, Edac) ->
+    IntelDrm = intel_drm_memory_probe(Root),
+    #{
+        <<"intel-drm-controller">> => IntelDrm,
+        <<"generic-edac">> => edac_memory_probe(Edac)
+    }.
+
+intel_drm_memory_probe(Root) ->
+    Cards = intel_drm_memory_cards(Root),
+    #{
+        <<"available">> => Cards =/= [],
+        <<"source">> => <<"sysfs-drm-pci">>,
+        <<"cards">> => Cards,
+        <<"lpddr-class-observed">> => any_lpddr_card(Cards)
+    }.
+
+intel_drm_memory_cards(Root) ->
+    Base = "/sys/class/drm",
+    [intel_drm_memory_card_probe(Root, Base, Card)
+     || Card <- sorted_list_dir(Root, Base),
+        is_drm_card_name(Card),
+        intel_drm_intel_card(Root, Base, Card)].
+
+intel_drm_intel_card(Root, Base, Card) ->
+    read_trim(Root, filename:join([Base, Card, "device", "vendor"])) =:=
+        <<"0x8086">>.
+
+intel_drm_memory_card_probe(Root, Base, Card) ->
+    DevicePath = filename:join([Base, Card, "device"]),
+    Common = #{
+        <<"card">> => to_bin(Card),
+        <<"driver">> => read_link_basename(Root, filename:join(DevicePath, "driver")),
+        <<"pci">> => read_attr_map(
+            Root,
+            DevicePath,
+            ["vendor", "device", "class", "subsystem_vendor",
+             "subsystem_device", "revision"])
+    },
+    intel_drm_kernel_dram_card_probe(Root, DevicePath, Common).
+
+intel_drm_kernel_dram_card_probe(Root, DevicePath, Common) ->
+    Raw = intel_drm_kernel_dram_raw(Root, DevicePath),
+    case maps:get(<<"dram-type">>, Raw, null) of
+        null ->
+            Common#{
+                <<"available">> => false,
+                <<"status">> => <<"unavailable">>,
+                <<"source">> => <<"drm-device-sysfs">>,
+                <<"method">> => <<"intel-drm-kernel-dram-info">>,
+                <<"raw">> => Raw
+            };
+        _ ->
+            Decoded = intel_drm_kernel_dram_decode(Raw),
+            Common#{
+                <<"available">> => true,
+                <<"status">> => intel_drm_kernel_dram_status(Decoded),
+                <<"source">> => <<"drm-device-sysfs">>,
+                <<"method">> => <<"intel-drm-kernel-dram-info">>,
+                <<"raw">> => Raw,
+                <<"decoded">> => Decoded
+            }
+    end.
+
+intel_drm_kernel_dram_raw(Root, DevicePath) ->
+    read_attr_map(
+        Root,
+        DevicePath,
+        ["dram_type", "dram_lpddr_class", "dram_num_channels",
+         "dram_num_qgv_points", "dram_num_psf_gv_points",
+         "dram_mem_freq_khz", "dram_fsb_freq_khz"]).
+
+intel_drm_kernel_dram_decode(Raw) ->
+    Type = normalise_dram_type(maps:get(<<"dram-type">>, Raw, <<"unknown">>)),
+    #{
+        <<"dram-type">> => Type,
+        <<"lpddr-class">> => intel_drm_kernel_lpddr_value(Raw, Type),
+        <<"populated-channels">> =>
+            parse_int(maps:get(<<"dram-num-channels">>, Raw, null)),
+        <<"enabled-qgv-points">> =>
+            parse_int(maps:get(<<"dram-num-qgv-points">>, Raw, null)),
+        <<"enabled-psf-gv-points">> =>
+            parse_int(maps:get(<<"dram-num-psf-gv-points">>, Raw, null)),
+        <<"memory-frequency-khz">> =>
+            parse_int(maps:get(<<"dram-mem-freq-khz">>, Raw, null)),
+        <<"fsb-frequency-khz">> =>
+            parse_int(maps:get(<<"dram-fsb-freq-khz">>, Raw, null))
+    }.
+
+intel_drm_kernel_dram_status(#{<<"dram-type">> := <<"unknown">>}) ->
+    <<"unknown">>;
+intel_drm_kernel_dram_status(_) ->
+    <<"observed">>.
+
+intel_drm_kernel_lpddr_value(_Raw, <<"unknown">>) ->
+    null;
+intel_drm_kernel_lpddr_value(Raw, Type) ->
+    parse_bool_01(maps:get(<<"dram-lpddr-class">>, Raw, null),
+                  lpddr_type(Type)).
+
+normalise_dram_type(Type) when is_binary(Type) ->
+    case string:uppercase(trim(Type)) of
+        <<"UNKNOWN">> -> <<"unknown">>;
+        Upper -> binary:replace(Upper, <<"_">>, <<"-">>, [global])
+    end;
+normalise_dram_type(_) ->
+    <<"unknown">>.
+
+lpddr_type(Type) when is_binary(Type) ->
+    lists:member(normalise_dram_type(Type),
+                 [<<"LPDDR3">>, <<"LPDDR4">>, <<"LPDDR5">>]);
+lpddr_type(_) ->
+    false.
+
+any_lpddr_card([]) ->
+    null;
+any_lpddr_card(Cards) ->
+    case [Value || Card <- Cards,
+                   Value <- [card_lpddr_value(Card)],
+                   Value =/= null] of
+        [] -> null;
+        Values -> lists:member(true, Values)
+    end.
+
+card_lpddr_value(Card) ->
+    Decoded = maps:get(<<"decoded">>, Card, #{}),
+    case {maps:get(<<"status">>, Card, <<"unavailable">>),
+          maps:get(<<"lpddr-class">>, Decoded, null)} of
+        {<<"observed">>, true} -> true;
+        {<<"observed">>, false} -> false;
+        _ -> null
+    end.
+
+edac_memory_probe(Edac) ->
+    Types = edac_memory_types(Edac),
+    #{
+        <<"available">> => maps:get(<<"available">>, Edac, false),
+        <<"source">> => <<"sysfs-edac">>,
+        <<"memory-types">> => Types,
+        <<"lpddr-class-observed">> => edac_lpddr_observed(Types)
+    }.
+
+edac_memory_types(Edac) ->
+    lists:usort(
+        [Type
+         || Controller <- maps:get(<<"controllers">>, Edac, []),
+            Dimm <- maps:get(<<"dimms">>, Controller, []),
+            Type <- [maps:get(<<"memory-type">>, Dimm, null)],
+            Type =/= null]).
+
+edac_lpddr_observed([]) ->
+    null;
+edac_lpddr_observed(Types) ->
+    lists:any(fun edac_lpddr_type/1, Types).
+
+edac_lpddr_type(Type) when is_binary(Type) ->
+    Normal = string:lowercase(Type),
+    binary:match(Normal, <<"lpddr">>) =/= nomatch orelse
+        binary:match(Normal, <<"low-power-ddr">>) =/= nomatch;
+edac_lpddr_type(_) ->
+    false.
+
+dmi_report(Root) ->
+    Base = "/sys/class/dmi/id",
+    Fields = [
+        "sys_vendor",
+        "product_name",
+        "product_version",
+        "product_family",
+        "board_vendor",
+        "board_name",
+        "board_version",
+        "bios_vendor",
+        "bios_version",
+        "bios_date",
+        "bios_release",
+        "chassis_type",
+        "chassis_vendor",
+        "chassis_version"
+    ],
+    Values =
+        maps:from_list(
+            [{normalise_key(to_bin(F)),
+              read_trim(Root, filename:join(Base, F))}
+             || F <- Fields]),
+    #{
+        <<"available">> =>
+            lists:any(fun(V) -> V =/= null end, maps:values(Values)),
+        <<"source">> => <<"sysfs-dmi">>,
+        <<"fields">> => Values,
+        <<"redacted-fields">> => [
+            <<"product-uuid">>,
+            <<"product-serial">>,
+            <<"board-serial">>,
+            <<"chassis-serial">>
+        ]
+    }.
+
+acpi_report(Root) ->
+    Base = "/sys/firmware/acpi/tables",
+    DynamicBase = filename:join(Base, "dynamic"),
+    Tables = acpi_tables_map(Root, Base),
+    DynamicTables = acpi_tables_map(Root, DynamicBase),
+    #{
+        <<"available">> => dir_exists(Root, Base),
+        <<"source">> => <<"sysfs-acpi">>,
+        <<"tables">> => acpi_tables_namespace(Tables, DynamicTables),
+        <<"table-counts">> => #{
+            <<"final">> => maps:size(Tables),
+            <<"dynamic">> => maps:size(DynamicTables)
+        },
+        <<"dynamic-table-directory-present">> =>
+            dir_exists(Root, DynamicBase),
+        <<"override-provenance">> =>
+            acpi_override_provenance(Root, DynamicTables)
+    }.
+
+acpi_tables_map(Root, Base) ->
+    Entries =
+        [{Name,
+          acpi_path_key_base(Name),
+          acpi_table_report(Root, filename:join(Base, Name), Name)}
+         || Name <- sorted_list_dir(Root, Base),
+            Name =/= "dynamic",
+            not dir_exists(Root, filename:join(Base, Name))],
+    KeyCounts =
+        lists:foldl(
+            fun({_Name, Key, _Report}, Counts) ->
+                maps:update_with(Key, fun(N) -> N + 1 end, 1, Counts)
+            end,
+            #{},
+            Entries),
+    maps:from_list(
+        [{acpi_path_key(Name, Key, KeyCounts), Report}
+         || {Name, Key, Report} <- Entries]).
+
+acpi_tables_namespace(Tables, DynamicTables) ->
+    #{
+        <<"sys">> => #{
+            <<"firmware">> => #{
+                <<"acpi">> => #{
+                    <<"tables">> => Tables#{
+                        <<"dynamic">> => DynamicTables
+                    }
+                }
+            }
+        }
+    }.
+
+acpi_table_report(Root, Path, Name) ->
+    case read_file(Root, Path) of
+        {ok, Bin} ->
+            Header = acpi_table_header(Name, Bin),
+            Report0 = #{
+                <<"source">> => <<"sysfs-acpi-table">>,
+                <<"source-path">> => to_bin(Path),
+                <<"sysfs-name">> => to_bin(Name),
+                <<"length-bytes">> => byte_size(Bin),
+                <<"table-sha256">> =>
+                    hb_util:encode(crypto:hash(sha256, Bin)),
+                <<"header">> => Header
+            },
+            maps:merge(
+                Report0,
+                acpi_table_validation(Header, Bin));
+        error ->
+            #{
+                <<"source">> => <<"sysfs-acpi-table">>,
+                <<"source-path">> => to_bin(Path),
+                <<"sysfs-name">> => to_bin(Name),
+                <<"status">> => <<"unreadable">>
+            }
+    end.
+
+acpi_path_key(Name, Key, KeyCounts) ->
+    case maps:get(Key, KeyCounts) of
+        1 -> Key;
+        _ -> <<Key/binary, "-b32-", (acpi_base32_key(Name))/binary>>
+    end.
+
+acpi_path_key_base(Name) ->
+    Key = iolist_to_binary([acpi_key_byte(B) || <<B:8>> <= to_bin(Name)]),
+    case Key of
+        <<>> -> <<"empty">>;
+        _ -> Key
+    end.
+
+acpi_key_byte(B) when B >= $A, B =< $Z -> B + 32;
+acpi_key_byte(B) when B >= $a, B =< $z -> B;
+acpi_key_byte(B) when B >= $0, B =< $9 -> B;
+acpi_key_byte(B) -> [<<"-x">>, byte_hex(B)].
+
+byte_hex(B) ->
+    iolist_to_binary(io_lib:format("~2.16.0b", [B])).
+
+acpi_base32_key(Name) ->
+    string:lowercase(
+        binary:replace(base32:encode(to_bin(Name)), <<"=">>, <<>>, [global])).
+
+acpi_table_header("RSDP", Bin) ->
+    lib_lapee_tpm_tcg:parse_acpi_rsdp(Bin);
+acpi_table_header("FACS", _Bin) ->
+    #{
+        <<"table-signature">> => <<"FACS">>
+    };
+acpi_table_header(_Name, Bin) ->
+    lib_lapee_tpm_tcg:parse_acpi_table(Bin).
+
+acpi_table_validation(Header, Bin) ->
+    Length = maps:get(<<"length">>, Header, null),
+    Matches = acpi_declared_length_matches(Length, Bin),
+    Checksum = acpi_checksum_valid(Length, Bin),
+    #{
+        <<"declared-length-matches-file">> => Matches,
+        <<"checksum-valid">> => Checksum,
+        <<"status">> => acpi_table_status(Header, Matches, Checksum)
+    }.
+
+acpi_declared_length_matches(Length, Bin) when is_integer(Length) ->
+    Length =:= byte_size(Bin);
+acpi_declared_length_matches(_, _Bin) ->
+    null.
+
+acpi_checksum_valid(Length, Bin)
+  when is_integer(Length), Length > 0, Length =< byte_size(Bin) ->
+    (lists:sum(binary_to_list(binary:part(Bin, 0, Length))) band 16#ff) =:= 0;
+acpi_checksum_valid(_, _Bin) ->
+    null.
+
+acpi_table_status(Header, _Matches, _Checksum)
+  when is_map_key(<<"error">>, Header) ->
+    <<"unparsed">>;
+acpi_table_status(_Header, false, _Checksum) ->
+    <<"length-mismatch">>;
+acpi_table_status(_Header, _Matches, false) ->
+    <<"checksum-invalid">>;
+acpi_table_status(_Header, _Matches, _Checksum) ->
+    <<"observed">>.
+
+acpi_override_provenance(Root, DynamicTables) ->
+    #{
+        <<"dynamic-tables-present">> => maps:size(DynamicTables) > 0,
+        <<"initrd-override-directory-present">> =>
+            dir_exists(Root, "/kernel/firmware/acpi"),
+        <<"initrd-override-files">> =>
+            [to_bin(F) ||
+                F <- sorted_list_dir(Root, "/kernel/firmware/acpi")],
+        <<"kernel-config">> =>
+            kernel_config_options(
+                Root,
+                ["CONFIG_ACPI_TABLE_UPGRADE",
+                 "CONFIG_ACPI_TABLE_OVERRIDE_VIA_BUILTIN_INITRD",
+                 "CONFIG_ACPI_CUSTOM_DSDT",
+                 "CONFIG_ACPI_CUSTOM_DSDT_FILE"])
+    }.
+
+efi_report(Root) ->
+    #{
+        <<"available">> => dir_exists(Root, "/sys/firmware/efi"),
+        <<"efivars-mounted">> =>
+            dir_exists(Root, "/sys/firmware/efi/efivars"),
+        <<"global-variables">> => #{
+            <<"secure-boot">> => efi_byte_var(Root, "SecureBoot"),
+            <<"setup-mode">> => efi_byte_var(Root, "SetupMode"),
+            <<"audit-mode">> => efi_byte_var(Root, "AuditMode"),
+            <<"deployed-mode">> => efi_byte_var(Root, "DeployedMode"),
+            <<"vendor-keys">> => efi_byte_var(Root, "VendorKeys")
+        }
+    }.
+
+efi_byte_var(Root, Name) ->
+    Path =
+        "/sys/firmware/efi/efivars/" ++ Name ++ "-" ++
+            ?EFI_GLOBAL_VARIABLE_GUID,
+    case read_file(Root, Path) of
+        {ok, <<_Attrs:4/binary, Byte:8, _/binary>>} ->
+            #{
+                <<"readable">> => true,
+                <<"raw">> => Byte,
+                <<"state">> => efi_byte_state(Name, Byte)
+            };
+        {ok, _} ->
+            #{<<"readable">> => true,
+              <<"raw">> => null,
+              <<"state">> => <<"malformed">>};
+        error ->
+            #{<<"readable">> => false,
+              <<"raw">> => null,
+              <<"state">> => <<"not-readable">>}
+    end.
+
+efi_byte_state("SecureBoot", 1) -> <<"enabled">>;
+efi_byte_state("SecureBoot", 0) -> <<"disabled">>;
+efi_byte_state("SetupMode", 1) -> <<"setup">>;
+efi_byte_state("SetupMode", 0) -> <<"user">>;
+efi_byte_state("AuditMode", 1) -> <<"audit">>;
+efi_byte_state("AuditMode", 0) -> <<"normal">>;
+efi_byte_state("DeployedMode", 1) -> <<"deployed">>;
+efi_byte_state("DeployedMode", 0) -> <<"not-deployed">>;
+efi_byte_state("VendorKeys", 1) -> <<"factory">>;
+efi_byte_state("VendorKeys", 0) -> <<"modified">>;
+efi_byte_state(_, _) -> <<"unknown">>.
+
+boot_guard_report(Root) ->
+    Path = "/dev/cpu/0/msr",
+    case read_uint_le_at(Root, Path, ?MSR_BOOT_GUARD_SACM_INFO, 8) of
+        {ok, Raw} ->
+            #{
+                <<"available">> => true,
+                <<"source">> => <<"dev-cpu-msr">>,
+                <<"interface">> => to_bin(Path),
+                <<"msr-offset">> => u64_hex(?MSR_BOOT_GUARD_SACM_INFO),
+                <<"raw-hex">> => u64_hex(Raw),
+                <<"decoded">> => boot_guard_decode(Raw)
+            };
+        {error, Reason} ->
+            boot_guard_unavailable(Reason)
+    end.
+
+boot_guard_unavailable(Reason) ->
+    #{
+        <<"available">> => false,
+        <<"source">> => <<"dev-cpu-msr">>,
+        <<"interface">> => <<"/dev/cpu/0/msr">>,
+        <<"msr-offset">> => u64_hex(?MSR_BOOT_GUARD_SACM_INFO),
+        <<"error">> => to_bin(Reason)
+    }.
+
+boot_guard_decode(Raw) ->
+    #{
+        <<"nem-enabled">> => bit_set(Raw, 0),
+        <<"tpm-type-code">> => bit_range(Raw, 1, 2),
+        <<"tpm-type">> => boot_guard_tpm_type(bit_range(Raw, 1, 2)),
+        <<"tpm-success">> => bit_set(Raw, 3),
+        <<"force-anchor-boot">> => bit_set(Raw, 4),
+        <<"measured">> => bit_set(Raw, 5),
+        <<"verified">> => bit_set(Raw, 6),
+        <<"module-revoked">> => bit_set(Raw, 7),
+        <<"boot-guard-capability">> => bit_set(Raw, 32),
+        <<"server-txt-capability">> => bit_set(Raw, 34),
+        <<"no-reset-secrets-protection">> => bit_set(Raw, 35)
+    }.
+
+boot_guard_tpm_type(0) -> <<"none">>;
+boot_guard_tpm_type(1) -> <<"discrete">>;
+boot_guard_tpm_type(2) -> <<"firmware">>;
+boot_guard_tpm_type(3) -> <<"reserved">>;
+boot_guard_tpm_type(_) -> <<"unknown">>.
+
+bit_set(Raw, Bit) ->
+    (Raw band (1 bsl Bit)) =/= 0.
+
+tpm_devices(Root) ->
+    Base = "/sys/class/tpm",
+    [#{
+        <<"name">> => to_bin(T),
+        <<"version-major">> =>
+            read_trim(Root, filename:join([Base, T, "tpm_version_major"])),
+        <<"device-path">> =>
+            read_link_basename(Root, filename:join([Base, T, "device"]))
+    } || T <- sorted_list_dir(Root, Base),
+         is_tpm_name(T)].
+
+%%%============================================================================
+%%% Small filesystem/parsing helpers
+%%%============================================================================
+
+root() ->
+    case os:getenv("LAPEE_SYSTEM_ROOT") of
+        false -> "/";
+        "" -> "/";
+        R -> R
+    end.
+
+normalise_root(Root) when is_binary(Root) ->
+    normalise_root(binary_to_list(Root));
+normalise_root([]) ->
+    "/";
+normalise_root(Root) ->
+    Root.
+
+root_path("/", Abs) ->
+    Abs;
+root_path(Root, Abs) ->
+    filename:join(Root, relative_path(Abs)).
+
+relative_path([$/ | Rest]) -> Rest;
+relative_path(Path) -> Path.
+
+read_file(Root, Abs) ->
+    case file:read_file(root_path(Root, Abs)) of
+        {ok, Bin} -> {ok, Bin};
+        _ -> error
+    end.
+
+read_trim(Root, Abs) ->
+    case read_file(Root, Abs) of
+        {ok, Bin} -> trim(Bin);
+        error -> null
+    end.
+
+read_kernel_config(Root) ->
+    OsRelease = read_trim(Root, "/proc/sys/kernel/osrelease"),
+    Paths0 = ["/proc/config.gz", "/boot/config"],
+    Paths =
+        case OsRelease of
+            null ->
+                Paths0;
+            _ ->
+                ["/proc/config.gz",
+                 binary_to_list(<<"/boot/config-", OsRelease/binary>>),
+                 binary_to_list(
+                    <<"/lib/modules/", OsRelease/binary, "/config">>),
+                 "/boot/config"]
+        end,
+    read_kernel_config_paths(Root, Paths).
+
+read_kernel_config_paths(_Root, []) ->
+    unavailable;
+read_kernel_config_paths(Root, [Path | Rest]) ->
+    case read_file(Root, Path) of
+        {ok, Bin} ->
+            {ok, to_bin(Path), maybe_gunzip(Path, Bin)};
+        error ->
+            read_kernel_config_paths(Root, Rest)
+    end.
+
+maybe_gunzip(Path, Bin) ->
+    case filename:extension(Path) of
+        ".gz" ->
+            try zlib:gunzip(Bin)
+            catch _:_ -> Bin
+            end;
+        _ ->
+            Bin
+    end.
+
+kernel_config_options(Root, Names) ->
+    case read_kernel_config(Root) of
+        {ok, Source, Bin} ->
+            #{
+                <<"available">> => true,
+                <<"source">> => Source,
+                <<"options">> =>
+                    [kernel_config_option(Bin, Name) || Name <- Names]
+            };
+        unavailable ->
+            #{
+                <<"available">> => false,
+                <<"source">> => null,
+                <<"options">> =>
+                    [#{
+                        <<"name">> => to_bin(Name),
+                        <<"state">> => <<"unknown">>,
+                        <<"value">> => null
+                    } || Name <- Names]
+            }
+    end.
+
+kernel_config_option(Bin, Name0) ->
+    Name = to_bin(Name0),
+    Lines = binary:split(Bin, <<"\n">>, [global]),
+    Prefix = <<Name/binary, "=">>,
+    Disabled = <<"# ", Name/binary, " is not set">>,
+    Match =
+        lists:filter(
+            fun(Line) ->
+                Line =:= Disabled orelse binary_has_prefix(Line, Prefix)
+            end,
+            Lines),
+    {State, Value} =
+        case Match of
+            [Disabled | _] ->
+                {<<"disabled">>, null};
+            [Line | _] ->
+                ConfigValue = binary:part(
+                    Line, byte_size(Prefix),
+                    byte_size(Line) - byte_size(Prefix)),
+                {kernel_config_value_state(ConfigValue), ConfigValue};
+            [] ->
+                {<<"unknown">>, null}
+        end,
+    #{
+        <<"name">> => Name,
+        <<"state">> => State,
+        <<"value">> => Value
+    }.
+
+kernel_config_value_state(<<"y">>) -> <<"enabled">>;
+kernel_config_value_state(<<"m">>) -> <<"module">>;
+kernel_config_value_state(_) -> <<"value">>.
+
+binary_has_prefix(Bin, Prefix) when byte_size(Bin) >= byte_size(Prefix) ->
+    binary:part(Bin, 0, byte_size(Prefix)) =:= Prefix;
+binary_has_prefix(_, _) ->
+    false.
+
+read_uint_le_at(Root, Abs, Offset, Bytes) ->
+    Bits = Bytes * 8,
+    case read_exact_at(Root, Abs, Offset, Bytes) of
+        {ok, <<Value:Bits/little-unsigned-integer>>} -> {ok, Value};
+        Error -> Error
+    end.
+
+read_exact_at(Root, Abs, Offset, Bytes) ->
+    case file:open(root_path(Root, Abs), [read, raw, binary]) of
+        {ok, Io} ->
+            try
+                case file:pread(Io, Offset, Bytes) of
+                    {ok, Bin} when byte_size(Bin) =:= Bytes ->
+                        {ok, Bin};
+                    {ok, _} ->
+                        {error, 'short-read'};
+                    eof ->
+                        {error, eof};
+                    {error, Reason} ->
+                        {error, Reason}
+                end
+            after
+                file:close(Io)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+read_cpuid_leaf(Root, Abs, Leaf, Subleaf) ->
+    Offset = (Subleaf bsl 32) bor Leaf,
+    case read_exact_at(Root, Abs, Offset, 16) of
+        {ok, <<Eax:32/little-unsigned-integer,
+               Ebx:32/little-unsigned-integer,
+               Ecx:32/little-unsigned-integer,
+               Edx:32/little-unsigned-integer>>} ->
+            {ok, #{eax => Eax, ebx => Ebx, ecx => Ecx, edx => Edx}};
+        Error ->
+            Error
+    end.
+
+sha256_hex_to_id(Hex0) ->
+    Hex = trim(to_bin(Hex0)),
+    case byte_size(Hex) =:= 64 andalso hex_binary(Hex) of
+        Bin when is_binary(Bin), byte_size(Bin) =:= 32 ->
+            {ok, hb_util:human_id(Bin)};
+        _ ->
+            error
+    end.
+
+lines_kv(Bin) when is_binary(Bin) ->
+    lists:foldl(
+        fun(Line, Acc) ->
+            case binary:split(Line, <<"=">>) of
+                [Key, Value] when Key =/= <<>> ->
+                    Acc#{normalise_key(Key) => trim(Value)};
+                _ ->
+                    Acc
+            end
+        end,
+        #{},
+        binary:split(Bin, <<"\n">>, [global])).
+
+hex_binary(Hex) ->
+    try
+        << <<(hex_pair_to_int(A, B))>> ||
+            <<A:8, B:8>> <= lowercase(Hex) >>
+    catch
+        _:_ -> error
+    end.
+
+hex_pair_to_int(A, B) ->
+    (hex_digit(A) bsl 4) bor hex_digit(B).
+
+hex_digit(C) when C >= $0, C =< $9 -> C - $0;
+hex_digit(C) when C >= $a, C =< $f -> C - $a + 10;
+hex_digit(_) -> error(invalid_hex_digit).
+
+lowercase(Bin) ->
+    << <<(lower_char(C))>> || <<C:8>> <= Bin >>.
+
+lower_char(C) when C >= $A, C =< $Z -> C + 32;
+lower_char(C) -> C.
+
+read_attr_map(Root, Abs, Names) ->
+    maps:from_list(
+        [{normalise_key(to_bin(Name)), Value}
+         || Name <- Names,
+            Value <- [read_trim(Root, filename:join(Abs, Name))],
+            Value =/= null]).
+
+trim(Bin) when is_binary(Bin) ->
+    string:trim(Bin, both, "\r\n \t").
+
+sorted_list_dir(Root, Abs) ->
+    case file:list_dir(root_path(Root, Abs)) of
+        {ok, Entries} -> lists:sort(Entries);
+        _ -> []
+    end.
+
+file_exists(Root, Abs) ->
+    case file:read_file_info(root_path(Root, Abs)) of
+        {ok, _} -> true;
+        _ -> false
+    end.
+
+dir_exists(Root, Abs) ->
+    case file:read_file_info(root_path(Root, Abs)) of
+        {ok, #file_info{type = directory}} -> true;
+        _ -> false
+    end.
+
+read_link_basename(Root, Abs) ->
+    case file:read_link(root_path(Root, Abs)) of
+        {ok, Target} -> to_bin(filename:basename(Target));
+        _ -> null
+    end.
+
+digit_dirs(Root, Abs) ->
+    [E || E <- sorted_list_dir(Root, Abs),
+          is_digit_string(E),
+          dir_exists(Root, filename:join(Abs, E))].
+
+is_digit_string([]) -> false;
+is_digit_string(S) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, S).
+
+is_tpm_name("tpm" ++ Rest) ->
+    is_digit_string(Rest);
+is_tpm_name(_) ->
+    false.
+
+is_drm_card_name("card" ++ Rest) ->
+    is_digit_string(Rest);
+is_drm_card_name(_) ->
+    false.
+
+line_to_kv(Line, Acc) ->
+    case binary:split(Line, <<":">>, []) of
+        [Key, Val] ->
+            K = normalise_key(Key),
+            case maps:is_key(K, Acc) of
+                true -> Acc;
+                false -> Acc#{K => trim(Val)}
+            end;
+        _ ->
+            Acc
+    end.
+
+normalise_key(Bin0) ->
+    Bin1 = string:lowercase(trim(Bin0)),
+    Bin2 = binary:replace(Bin1, <<" ">>, <<"-">>, [global]),
+    binary:replace(Bin2, <<"_">>, <<"-">>, [global]).
+
+split_words(null) ->
+    [];
+split_words(Bin) when is_binary(Bin) ->
+    Spacey = binary:replace(trim(Bin), <<"\t">>, <<" ">>, [global]),
+    [W || W <- binary:split(Spacey, <<" ">>, [global]), W =/= <<>>].
+
+parse_int(null) ->
+    null;
+parse_int(Bin) when is_binary(Bin) ->
+    try binary_to_integer(Bin)
+    catch _:_ -> null
+    end.
+
+parse_bool_01(<<"1">>, _Default) -> true;
+parse_bool_01(<<"0">>, _Default) -> false;
+parse_bool_01(_, Default) -> Default.
+
+u32_hex(N) when is_integer(N), N >= 0 ->
+    hex(N, 8).
+
+u64_hex(N) when is_integer(N), N >= 0 ->
+    hex(N, 16).
+
+hex(N, Width) ->
+    Hex = string:uppercase(integer_to_binary(N, 16)),
+    Padding = lists:duplicate(erlang:max(0, Width - byte_size(Hex)), $0),
+    to_bin(["0x", Padding, Hex]).
+
+bit_range(Raw, First, Last) ->
+    (Raw bsr First) band ((1 bsl (Last - First + 1)) - 1).
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L) -> unicode:characters_to_binary(L);
+to_bin(A) when is_atom(A) -> atom_to_binary(A);
+to_bin(T) -> iolist_to_binary(io_lib:format("~p", [T])).
+
+non_empty(Items) ->
+    [I || I <- Items, trim(I) =/= <<>>].
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+loaded_uki_is_scan_only_test() ->
+    Hex = <<"000102030405060708090a0b0c0d0e0f",
+            "101112131415161718191a1b1c1d1e1f">>,
+    with_tmp_root(
+        fun(Root) ->
+            write_root(Root, "/run/lapee/boot-uki-sha256", <<Hex/binary, "\n">>),
+            write_root(
+                Root,
+                "/run/lapee/boot-uki-source",
+                <<"source=boot-media-scan\n">>),
+            Boot = maps:get(<<"boot">>, report_from_root(Root)),
+            Loaded = maps:get(<<"loaded-uki">>, Boot),
+            ?assertEqual(true, maps:get(<<"available">>, Loaded)),
+            ?assertEqual(
+                <<"boot-media-scan">>,
+                maps:get(<<"status">>, Loaded))
+        end).
+
+with_tmp_root(Fun) ->
+    Tmp =
+        case os:getenv("TMPDIR") of
+            false -> "/tmp";
+            Value -> Value
+        end,
+    Root = filename:join(
+        Tmp,
+        "lapee-dev-system-" ++ integer_to_list(erlang:unique_integer([positive]))),
+    ok = filelib:ensure_dir(filename:join(Root, ".keep")),
+    try Fun(Root)
+    after file:del_dir_r(Root)
+    end.
+
+write_root(Root, Path, Bin) ->
+    Abs = root_path(Root, Path),
+    ok = filelib:ensure_dir(Abs),
+    ok = file:write_file(Abs, Bin).
+
+-endif.

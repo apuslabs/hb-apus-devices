@@ -1,0 +1,1794 @@
+%%% @doc LapEE AMD SEV-SNP measurement engine.
+%%%
+%%% This device implements the `~measurement@1.0' engine protocol for
+%%% SEV-SNP guests. The native boundary is intentionally small: the NIF only
+%%% asks `/dev/sev-guest' for raw report material. Message construction,
+%%% report-data binding, policy-neutral checks, endorsement handling, and
+%%% secret wrapping live in Erlang.
+%%%
+%%% SNP has no TPM-style ActivateCredential primitive. The equivalent LapEE
+%%% construction is to generate a boot-local X25519 recipient key inside the
+%%% measured guest, bind that public key into SNP `report_data', and let peers
+%%% encrypt admission material to it.
+-module(dev_lapee_snp).
+-implements(<<"snp@1.0">>).
+-export([info/1, info/3, supported/3, subject/3, measure/3, verify/3,
+         unwrap_secret/3]).
+-export([wrap_secret_for_subject/3, unwrap_secret_value/2,
+         ensure_secret_activation/5]).
+
+-include_lib("hb/include/hb.hrl").
+-include_lib("public_key/include/public_key.hrl").
+
+-define(VERSION, <<"1.0">>).
+-define(REPORT_CONTEXT, <<"lapee-measurement-v1">>).
+-define(METHOD, <<"snp-report-data-x25519-hkdf-sha256-aes-256-gcm">>).
+-define(ID_RSASSA_PSS, {1,2,840,113549,1,1,10}).
+-define(ID_MGF1, {1,2,840,113549,1,1,8}).
+-define(ID_SHA384, {2,16,840,1,101,3,4,2,2}).
+
+info(_) ->
+    #{
+        exports => [
+            <<"info">>,
+            <<"supported">>,
+            <<"subject">>,
+            <<"measure">>,
+            <<"verify">>,
+            <<"unwrap-secret">>
+        ]
+    }.
+
+info(_Base, _Req, Opts) ->
+    {ok, #{
+        <<"status">> => 200,
+        <<"body">> => #{
+            <<"version">> => ?VERSION,
+            <<"supported">> => snp_supported(Opts)
+        }
+    }}.
+
+supported(_Base, _Req, Opts) ->
+    {ok, snp_supported(Opts)}.
+
+subject(_Base, Req, Opts) ->
+    case internal_measurement_request(Req, Opts) of
+        true ->
+            case trusted_body_id(Req, Opts) of
+                undefined ->
+                    error_resp(400, <<"missing-measurement-body-id">>,
+                               <<"Internal SNP subject request lacks body-id.">>);
+                BodyID ->
+                    {ok, #{
+                        <<"status">> => 200,
+                        <<"body">> => secret_recipient(#{}, BodyID, Opts)
+                    }}
+            end;
+        false ->
+            error_resp(403, <<"measurement-engine-internal-only">>,
+                       <<"Use ~measurement@1.0 for SNP measurement generation.">>)
+    end.
+
+measure(_Base, Req, Opts) ->
+    case internal_measurement_request(Req, Opts) of
+        true ->
+            try
+                Body = hb_maps:get(<<"body">>, Req, #{}, Opts),
+                case trusted_body_id(Req, Opts) of
+                    undefined ->
+                        error_resp(400, <<"missing-measurement-body-id">>,
+                                   <<"Internal SNP measurement request lacks body-id.">>);
+                    BodyID ->
+                        Recipient = hb_maps:get(
+                            <<"secret-recipient">>,
+                            Req,
+                            secret_recipient(Body, BodyID, Opts),
+                            Opts),
+                        Nonce = measurement_nonce(Req, Opts),
+                        ReportData = report_data(Body, Nonce, Recipient, Req, Opts),
+                        case snp_nif() of
+                            {error, Reason} ->
+                                error_resp(500, <<"snp-nif-not-loaded">>,
+                                           reason_to_text(Reason));
+                            Nif ->
+                                case Nif:report(ReportData, vmpl(Opts)) of
+                                    {ok, ReportRaw, Certs} ->
+                                        Report = decode_report(ReportRaw),
+                                        {ok, #{
+                                            <<"status">> => 200,
+                                            <<"body">> =>
+                                                evidence(
+                                                    ReportRaw,
+                                                    Certs,
+                                                    Body,
+                                                    Report,
+                                                    Nonce,
+                                                    ReportData,
+                                                    Recipient,
+                                                    Opts)
+                                        }};
+                                    {error, Reason} ->
+                                        error_resp(
+                                            500,
+                                            <<"snp-report-failed">>,
+                                            Reason)
+                                end
+                        end
+                end
+            catch
+                Class:CatchReason ->
+                    error_resp(500, <<"snp-measure-failed">>,
+                               #{<<"class">> => hb_util:bin(Class),
+                                 <<"reason">> => reason_to_text(CatchReason)})
+            end;
+        false ->
+            error_resp(403, <<"measurement-engine-internal-only">>,
+                       <<"Use ~measurement@1.0 for SNP measurement generation.">>)
+    end.
+
+verify(Base, Req, Opts) ->
+    Measurement = hb_link:decode_all_links(
+        response_body(resolve_envelope(Base, Req, Opts), Opts)),
+    Evidence = measurement_part(<<"evidence">>, Measurement, Opts),
+    Body = hb_maps:get(<<"body">>, Measurement, #{}, Opts),
+    Recipient = hb_maps:get(<<"secret-recipient">>, Measurement, #{}, Opts),
+    ReportDataCheck = check_report_data(Body, Recipient, Evidence, Req, Opts),
+    SignatureCheck = check_report_signature(Body, Evidence, Opts),
+    PublisherCheck = check_publisher_signal(Body, Evidence, Opts),
+    Checks = [
+        ReportDataCheck,
+        SignatureCheck,
+        PublisherCheck
+    ],
+    Verified = lists:all(
+        fun(#{<<"ok">> := Ok, <<"severity">> := Severity}) ->
+            Ok orelse Severity =:= <<"informational">>
+        end,
+        Checks),
+    {ok, #{
+        <<"status">> => 200,
+        <<"body">> => #{
+            <<"verified">> => Verified,
+            <<"verdict">> =>
+                case Verified of true -> <<"accepted">>; false -> <<"rejected">> end,
+            <<"checks">> => Checks
+        }
+    }}.
+
+unwrap_secret(_Base, Req, Opts) ->
+    try
+        Credential = activation_credential(Req, Opts),
+        {ok, Secret} = unwrap_secret_value(Credential, Opts),
+        Msg = hb_message:commit(
+            secret_activation_public_body(Secret, Credential, Opts),
+            Opts),
+        {ok, #{<<"status">> => 200, <<"body">> => Msg}}
+    catch
+        Class:CatchReason ->
+            error_resp(500, <<"snp-unwrap-secret-failed">>,
+                       #{<<"class">> => hb_util:bin(Class),
+                         <<"reason">> => reason_to_text(CatchReason)})
+    end.
+
+snp_supported(_Opts) ->
+    try
+        case snp_nif() of
+            {error, Reason} ->
+                io:format(
+                    standard_error,
+                    "[lapee_snp_nif] SNP NIF unavailable: ~p~n",
+                    [Reason]
+                ),
+                false;
+            Nif ->
+                case Nif:supported() of
+                    {ok, true} -> true;
+                    {error, Reason} ->
+                        io:format(
+                            standard_error,
+                            "[lapee_snp_nif] SNP support probe failed: ~p~n",
+                            [Reason]
+                        ),
+                        false;
+                    _ -> false
+                end
+        end
+    catch Class:CatchReason ->
+        io:format(
+            standard_error,
+            "[lapee_snp_nif] SNP support probe crashed: ~p:~p~n",
+            [Class, CatchReason]
+        ),
+        false
+    end.
+
+internal_measurement_request(Req, Opts) ->
+    case persistent_term:get(
+        {permawebos_measurement, internal_request_token},
+        undefined) of
+        undefined ->
+            false;
+        Token ->
+            is_map(Req) andalso
+                hb_maps:get(
+                    <<"measurement-internal-token">>,
+                    Req,
+                    undefined,
+                    Opts) =:= Token
+    end.
+
+snp_nif() ->
+    case code:is_loaded(lapee_snp_nif) of
+        {file, _} ->
+            lapee_snp_nif;
+        false ->
+            case load_priv_module(lapee_snp_nif) of
+                lapee_snp_nif ->
+                    lapee_snp_nif;
+                _ ->
+                    case code:ensure_loaded(lapee_snp_nif) of
+                        {module, _} -> lapee_snp_nif;
+                        {error, Reason} -> {error, {ensure_loaded, Reason}}
+                    end
+            end
+    end.
+
+load_priv_module(Module) ->
+    try
+        PrivDir = hb_device_archive:implementation_dir(?MODULE),
+        os:putenv("LAPEE_SNP_NIF_DIR", PrivDir),
+        Path = filename:join(PrivDir, atom_to_list(Module)),
+        case code:load_abs(Path) of
+            {module, Module} -> Module;
+            {error, Reason} -> {error, {load_abs, Path, Reason}}
+        end
+    catch Class:CatchReason ->
+        {error, {load_priv_module, Class, CatchReason}}
+    end.
+
+secret_recipient(Body, undefined, Opts) ->
+    secret_recipient(Body, body_id(Body, Opts), Opts);
+secret_recipient(_Body, BodyID, Opts) ->
+    {Public, _Private} = recipient_keypair(),
+    Context = device_context(Opts),
+    #{
+        <<"type">> => <<"lapee-secret-recipient">>,
+        <<"version">> => ?VERSION,
+        <<"measurement-device">> => <<"snp@1.0">>,
+        <<"method">> => ?METHOD,
+        <<"key-id">> => hb_util:encode(crypto:hash(sha256, Public)),
+        <<"public-material">> => #{
+            <<"x25519-public-key">> => hb_util:encode(Public)
+        },
+        <<"binding">> => #{
+            <<"report-data-context">> => ?REPORT_CONTEXT,
+            <<"body-id">> => BodyID,
+            <<"device-context">> => Context,
+            <<"device-context-digest">> => device_context_digest(Context, Opts)
+        }
+    }.
+
+recipient_keypair() ->
+    case persistent_term:get({dev_lapee_snp, x25519_keypair}, undefined) of
+        {Public, Private} ->
+            {Public, Private};
+        undefined ->
+            {Public, Private} = crypto:generate_key(ecdh, x25519),
+            persistent_term:put({dev_lapee_snp, x25519_keypair}, {Public, Private}),
+            {Public, Private}
+    end.
+
+wrap_secret_for_subject(Subject, Secret, Opts) when is_map(Subject) ->
+    PeerPublic = decode_required(
+        <<"x25519-public-key">>,
+        hb_maps:get(<<"public-material">>, Subject, #{}, Opts),
+        Opts),
+    {EphemeralPublic, EphemeralPrivate} = crypto:generate_key(ecdh, x25519),
+    Shared = crypto:compute_key(ecdh, PeerPublic, EphemeralPrivate, x25519),
+    Salt = crypto:strong_rand_bytes(32),
+    IV = crypto:strong_rand_bytes(12),
+    SubjectID = stable_id(Subject, Opts),
+    Info = <<"lapee-snp-wrap-secret-v1:", SubjectID/binary>>,
+    Key = hkdf_sha256(Shared, Salt, Info, 32),
+    AAD = secret_aad(SubjectID),
+    {Ciphertext, Tag} =
+        crypto:crypto_one_time_aead(
+            aes_256_gcm, Key, IV, Secret, AAD, 16, true),
+    #{
+        <<"type">> => <<"lapee-wrapped-secret">>,
+        <<"version">> => ?VERSION,
+        <<"measurement-device">> => <<"snp@1.0">>,
+        <<"method">> => ?METHOD,
+        <<"subject-id">> => SubjectID,
+        <<"ephemeral-public-key">> => hb_util:encode(EphemeralPublic),
+        <<"salt">> => hb_util:encode(Salt),
+        <<"iv">> => hb_util:encode(IV),
+        <<"ciphertext">> => hb_util:encode(Ciphertext),
+        <<"tag">> => hb_util:encode(Tag)
+    }.
+
+unwrap_secret_value(Credential, Opts) when is_map(Credential) ->
+    {_Public, Private} = recipient_keypair(),
+    PeerPublic = decode_required(<<"ephemeral-public-key">>, Credential, Opts),
+    Shared = crypto:compute_key(ecdh, PeerPublic, Private, x25519),
+    SubjectID = hb_maps:get(<<"subject-id">>, Credential, <<>>, Opts),
+    Info = <<"lapee-snp-wrap-secret-v1:", SubjectID/binary>>,
+    Key = hkdf_sha256(
+        Shared,
+        decode_required(<<"salt">>, Credential, Opts),
+        Info,
+        32),
+    Plain =
+        crypto:crypto_one_time_aead(
+            aes_256_gcm,
+            Key,
+            decode_required(<<"iv">>, Credential, Opts),
+            decode_required(<<"ciphertext">>, Credential, Opts),
+            secret_aad(SubjectID),
+            decode_required(<<"tag">>, Credential, Opts),
+            false),
+    case Plain of
+        error -> {error, decrypt_failed};
+        B when is_binary(B) -> {ok, B}
+    end.
+
+ensure_secret_activation(Activation, Credential, Expected, _Subject, Opts) ->
+    ExpectedHash = hb_util:encode(crypto:hash(sha256, Expected)),
+    GotHash = hb_maps:get(
+        <<"credential-secret-sha256">>, Activation, undefined, Opts),
+    Proof = hb_maps:get(<<"credential-secret-proof">>, Activation, <<>>, Opts),
+    IssuedAt = hb_maps:get(<<"issued-at-unix">>, Activation, 0, Opts),
+    ExpectedProof = hb_util:encode(
+        crypto:mac(
+            hmac,
+            sha256,
+            Expected,
+            secret_activation_context(Credential, IssuedAt, Opts))),
+    case {GotHash, Proof} of
+        {ExpectedHash, ExpectedProof} ->
+            ok;
+        _ ->
+            throw({snp_error,
+                   #{<<"secret-activation">> =>
+                        <<"activation proof did not match challenge">>}})
+    end.
+
+evidence(ReportRaw, Certs, Body, Report, Nonce, ReportData, Recipient, Opts) ->
+    Evidence0 = #{
+        <<"type">> => <<"lapee-snp-evidence">>,
+        <<"version">> => ?VERSION,
+        <<"nonce">> => hb_util:encode(Nonce),
+        <<"report-data">> => hb_util:encode(ReportData),
+        <<"report-raw">> => hb_util:encode(ReportRaw),
+        <<"report">> => parsed_report_summary(Report),
+        <<"certificates">> => certificates(Certs, Body, Report, Opts),
+        <<"snp-product">> => snp_product(Body, Opts),
+        <<"secret-recipient-id">> => recipient_id(Recipient, #{}, Opts),
+        <<"device-context">> => device_context(Opts)
+    },
+    Evidence0#{
+        <<"signals">> => #{
+            <<"publisher">> => publisher_signal(Body, Evidence0, Report, Opts)
+        }
+    }.
+
+certificates(Certs, Body, Report, Opts) ->
+    Embedded = certificates_from_table(Certs),
+    Configured = configured_certificates(Opts),
+    Available = unique_certificate_entries(Embedded ++ Configured, Opts),
+    Missing = [Type || Type <- [<<"ark">>, <<"ask">>, <<"vcek">>, <<"crl">>],
+                       not certificate_type_present(Type, Available, Opts)],
+    certificate_entry_map(
+        Available ++ fetched_certificates(Missing, Body, Report, Opts),
+        Opts).
+
+certificates_from_table(Certs) when is_list(Certs) ->
+    [certificate_entry(Guid, Data, <<"platform-certificate-table">>)
+     || {Guid, Data} <- Certs];
+certificates_from_table(_) ->
+    [].
+
+certificate_entry(Guid, Data, Source) ->
+    #{
+        <<"type">> => certificate_type(Guid),
+        <<"guid">> => Guid,
+        <<"source">> => Source,
+        <<"data">> => hb_util:encode(Data)
+    }.
+
+fetched_certificates([], _Body, _Report, _Opts) ->
+    [];
+fetched_certificates(Missing, Body, Report, Opts) ->
+    try
+        Product = snp_product(Body, Opts),
+        Chain =
+            case lists:any(
+                fun(Type) -> lists:member(Type, Missing) end,
+                [<<"ark">>, <<"ask">>]) of
+                true ->
+                    {Ask, Ark} = fetch_amd_cert_chain(Product),
+                    [{<<"ark">>, Ark}, {<<"ask">>, Ask}];
+                false ->
+                    []
+            end,
+        VCEK =
+            case lists:member(<<"vcek">>, Missing) of
+                true -> [{<<"vcek">>, fetch_vcek(Product, Report)}];
+                false -> []
+            end,
+        CRL =
+            case lists:member(<<"crl">>, Missing) of
+                true -> [{<<"crl">>, fetch_amd_crl(Product)}];
+                false -> []
+            end,
+        [fetched_certificate(Type, Data) || {Type, Data} <- Chain ++ VCEK ++ CRL]
+    catch
+        Class:Reason ->
+            [#{
+                <<"type">> => <<"endorsement-fetch-error">>,
+                <<"source">> => <<"amd-kds">>,
+                <<"class">> => hb_util:bin(Class),
+                <<"reason">> => reason_to_text(Reason)
+            }]
+    end.
+
+fetched_certificate(Type, Data) ->
+    #{
+        <<"type">> => Type,
+        <<"source">> => <<"amd-kds">>,
+        <<"data">> => hb_util:encode(Data)
+    }.
+
+certificate_type_present(Type, Certs, Opts) ->
+    lists:any(
+        fun(Cert) ->
+            hb_maps:get(<<"type">>, Cert, undefined, Opts) =:= Type
+        end,
+        Certs).
+
+certificate_type(<<"c0b406a4-a803-4952-9743-3fb6014cd0ae">>) -> <<"ark">>;
+certificate_type(<<"4ab7b379-bbac-4fe4-a02f-05aef327c782">>) -> <<"ask">>;
+certificate_type(<<"63da758d-e664-4564-adc5-f4b93be8accd">>) -> <<"vcek">>;
+certificate_type(<<"a8074bc2-a25a-483e-aae6-39c045a0b8a1">>) -> <<"vlek">>;
+certificate_type(<<"92f81bc3-5811-4d3d-97ff-d19f88dc67ea">>) -> <<"crl">>;
+certificate_type(_) -> <<"other">>.
+
+parsed_report_summary(Report) ->
+    #{
+        <<"version">> => report_get(<<"version">>, Report, null),
+        <<"guest-svn">> => report_get(<<"guest-svn">>, Report, null),
+        <<"policy">> => report_get(<<"policy">>, Report, null),
+        <<"family-id">> => encode_array_field(<<"family-id">>, Report),
+        <<"image-id">> => encode_array_field(<<"image-id">>, Report),
+        <<"vmpl">> => report_get(<<"vmpl">>, Report, null),
+        <<"signature-algorithm">> =>
+            report_get(<<"signature-algorithm">>, Report, null),
+        <<"platform-info">> => report_get(<<"platform-info">>, Report, null),
+        <<"measurement">> => encode_array_field(<<"measurement">>, Report),
+        <<"host-data">> => encode_array_field(<<"host-data">>, Report),
+        <<"id-key-digest">> => encode_array_field(<<"id-key-digest">>, Report),
+        <<"author-key-digest">> =>
+            encode_array_field(<<"author-key-digest">>, Report),
+        <<"reported-tcb">> =>
+            report_get(<<"reported-tcb">>, Report, null),
+        <<"committed-tcb">> =>
+            report_get(<<"committed-tcb">>, Report, null),
+        <<"launch-tcb">> =>
+            report_get(<<"launch-tcb">>, Report, null),
+        <<"chip-id">> => encode_array_field(<<"chip-id">>, Report),
+        <<"report-id">> => encode_array_field(<<"report-id">>, Report),
+        <<"report-id-ma">> => encode_array_field(<<"report-id-ma">>, Report)
+    }.
+
+check_report_data(Body, Recipient, Evidence, Req, Opts) ->
+    safely_check(
+        <<"SNP report_data binds body, nonce, and secret recipient">>,
+        <<"core">>,
+        fun() ->
+            Nonce = decode_required(<<"nonce">>, Evidence, Opts),
+            case expected_nonce(Req, Opts) of
+                undefined -> ok;
+                Nonce -> ok;
+                _ -> throw(<<"fresh nonce does not match verifier challenge">>)
+            end,
+            RecipientID = recipient_id(Recipient, Evidence, Opts),
+            BodyID = measured_body_id(Body, Recipient, Opts),
+            ContextDigest = measurement_context_digest(Recipient, Opts),
+            Expected = report_data_for_ids(
+                BodyID,
+                Nonce,
+                RecipientID,
+                ContextDigest),
+            Got = decode_required(<<"report-data">>, Evidence, Opts),
+            Report = evidence_report(Evidence, Opts),
+            ReportData = array_binary(
+                report_get(<<"report-data">>, Report, <<>>)),
+            case {Got, ReportData} of
+                {Expected, Expected} -> ok;
+                _ -> throw(<<"report_data mismatch">>)
+            end
+        end).
+
+check_report_signature(Body, Evidence, Opts) ->
+    safely_check(
+        <<"SNP report signature and endorsement chain verify">>,
+        <<"core">>,
+        fun() ->
+            assert_report_signature(Body, Evidence, Opts)
+        end).
+
+check_publisher_signal(Body, Evidence, Opts) ->
+    safely_check(
+        <<"publisher signer signal matches SNP report identity">>,
+        <<"core">>,
+        fun() ->
+            Report = evidence_report(Evidence, Opts),
+            Expected = publisher_signal(Body, Evidence, Report, Opts),
+            Signals = hb_maps:get(<<"signals">>, Evidence, #{}, Opts),
+            case hb_maps:get(<<"publisher">>, Signals, undefined, Opts) of
+                undefined -> throw(<<"missing publisher signal">>);
+                Reported ->
+                    case {publisher_signal_id(Expected, Opts),
+                          publisher_signal_id(Reported, Opts)} of
+                        {ID, ID} -> ok;
+                        {ExpectedID, ReportedID} ->
+                            throw(#{
+                                <<"expected-id">> => ExpectedID,
+                                <<"reported-id">> => ReportedID,
+                                <<"expected">> => Expected,
+                                <<"reported">> => Reported
+                            })
+                    end
+            end
+        end).
+
+publisher_signal(Body, Evidence, Report, Opts) ->
+    Signers = indexed_publisher_signers(snp_publisher_entries(Report)),
+    #{
+        <<"source">> => <<"snp-report">>,
+        <<"source-status">> =>
+            case map_size(Signers) of
+                0 -> <<"unavailable">>;
+                _ -> <<"reported">>
+            end,
+        <<"signers">> => Signers,
+        <<"signer-count">> => map_size(Signers),
+        <<"signers-digest">> => publisher_digest(Signers, Opts),
+        <<"signers-digest-algorithm">> =>
+            <<"ao-core-uncommitted-message-id-v1">>,
+        <<"artifact">> => snp_publisher_artifact(Body, Evidence, Report, Opts)
+    }.
+
+snp_publisher_entries(Report) ->
+    AuthorKeyEnabled =
+        report_get(<<"author-key-enabled">>, Report, false),
+    AuthorKeyDigest =
+        array_binary(report_get(<<"author-key-digest">>, Report, <<>>)),
+    IDKeyDigest =
+        array_binary(report_get(<<"id-key-digest">>, Report, <<>>)),
+    Entries0 =
+        case {AuthorKeyEnabled, nonzero_binary(AuthorKeyDigest)} of
+            {true, true} ->
+                [#{
+                    <<"type">> => <<"snp-author-key-digest">>,
+                    <<"role">> => <<"author-key">>,
+                    <<"sha384">> => hb_util:encode(AuthorKeyDigest)
+                }];
+            _ ->
+                []
+        end,
+    Entries1 =
+        case nonzero_binary(IDKeyDigest) of
+            true ->
+                Entries0 ++ [#{
+                    <<"type">> => <<"snp-id-key-digest">>,
+                    <<"role">> => <<"id-key">>,
+                    <<"sha384">> => hb_util:encode(IDKeyDigest)
+                }];
+            false ->
+                Entries0
+        end,
+    Entries1.
+
+indexed_publisher_signers(Entries) ->
+    maps:from_list(
+        [
+            {publisher_signer_key(I), Entry#{<<"source">> => <<"snp-report">>}}
+         || {I, Entry} <- lists:zip(lists:seq(1, length(Entries)), Entries)
+        ]).
+
+publisher_signer_key(I) ->
+    iolist_to_binary([<<"signer-">>, integer_to_binary(I)]).
+
+snp_publisher_artifact(Body, Evidence, Report, Opts) ->
+    #{
+        <<"measurement">> => encode_array_field(<<"measurement">>, Report),
+        <<"family-id">> => encode_array_field(<<"family-id">>, Report),
+        <<"image-id">> => encode_array_field(<<"image-id">>, Report),
+        <<"guest-svn">> => report_get(<<"guest-svn">>, Report, null),
+        <<"policy">> => report_get(<<"policy">>, Report, null),
+        <<"vmpl">> => report_get(<<"vmpl">>, Report, null),
+        <<"author-key-enabled">> =>
+            report_get(<<"author-key-enabled">>, Report, false),
+        <<"id-key-digest">> => encode_array_field(<<"id-key-digest">>, Report),
+        <<"author-key-digest">> =>
+            encode_array_field(<<"author-key-digest">>, Report),
+        <<"reported-tcb">> => report_get(<<"reported-tcb">>, Report, null),
+        <<"committed-tcb">> => report_get(<<"committed-tcb">>, Report, null),
+        <<"launch-tcb">> => report_get(<<"launch-tcb">>, Report, null),
+        <<"snp-product">> => snp_product(Body, Evidence, Opts),
+        <<"signature-algorithm">> =>
+            report_get(<<"signature-algorithm">>, Report, null),
+        <<"platform-info">> =>
+            report_get(<<"platform-info">>, Report, null)
+    }.
+
+nonzero_binary(Bin) when is_binary(Bin), byte_size(Bin) > 0 ->
+    lists:any(fun(Byte) -> Byte =/= 0 end, binary_to_list(Bin));
+nonzero_binary(_Other) ->
+    false.
+
+-ifdef(TEST).
+publisher_digest(Msg, Opts) when map_size(Opts) =:= 0 ->
+    hb_util:encode(crypto:hash(sha256, term_to_binary(Msg)));
+publisher_digest(Msg, Opts) ->
+    stable_id(Msg, Opts).
+-else.
+publisher_digest(Msg, Opts) ->
+    stable_id(Msg, Opts).
+-endif.
+
+-ifdef(TEST).
+publisher_signal_id(Msg, Opts) when map_size(Opts) =:= 0 ->
+    hb_util:encode(
+        crypto:hash(sha256, term_to_binary(canonical_payload(Msg, Opts))));
+publisher_signal_id(Msg, Opts) ->
+    hb_message:id(
+        hb_message:uncommitted_deep(canonical_payload(Msg, Opts), Opts),
+        uncommitted,
+        Opts).
+-else.
+publisher_signal_id(Msg, Opts) ->
+    hb_message:id(
+        hb_message:uncommitted_deep(canonical_payload(Msg, Opts), Opts),
+        uncommitted,
+        Opts).
+-endif.
+
+assert_report_signature(Body, Evidence, Opts) ->
+    Raw = decode_required(<<"report-raw">>, Evidence, Opts),
+    Report = decode_report(Raw),
+    assert_signature_algorithm(Report),
+    Certs = resolved_certificates(Report, Body, Evidence, Opts),
+    assert_certificate_chain(Certs),
+    Signed = binary:part(Raw, 0, 672),
+    Signature = ecdsa_signature_der(report_get(<<"signature">>, Report, #{})),
+    case public_key:verify(
+        Signed, sha384, Signature, cert_public_key(maps:get(vcek, Certs))) of
+        true -> ok;
+        false -> throw(<<"SNP report signature rejected">>)
+    end.
+
+assert_signature_algorithm(Report) ->
+    case report_get(<<"signature-algorithm">>, Report, undefined) of
+        1 -> ok;
+        Other ->
+            throw(#{<<"unsupported-signature-algorithm">> => Other})
+    end.
+
+resolved_certificates(Report, Body, Evidence, Opts) ->
+    Embedded = evidence_certificates(Evidence, Opts),
+    Product = snp_product(Body, Evidence, Opts),
+    {Ask, Ark, ChainSource} =
+        case {maps:get(ask, Embedded, undefined),
+              maps:get(ark, Embedded, undefined)} of
+            {Ask0, Ark0} when is_binary(Ask0), is_binary(Ark0) ->
+                {Ask0, Ark0, <<"platform-certificate-table">>};
+            _ ->
+                {Ask1, Ark1} = fetch_amd_cert_chain(Product),
+                {Ask1, Ark1, <<"amd-kds">>}
+        end,
+    VCEK =
+        case maps:get(vcek, Embedded, undefined) of
+            VCEK0 when is_binary(VCEK0) -> VCEK0;
+            _ -> fetch_vcek(Product, Report)
+        end,
+    CRL =
+        case maps:get(crl, Embedded, undefined) of
+            CRL0 when is_binary(CRL0) -> CRL0;
+            _ -> fetch_amd_crl(Product)
+        end,
+    #{ask => Ask, ark => Ark, vcek => VCEK,
+      crl => CRL, source => ChainSource}.
+
+evidence_certificates(Evidence, Opts) ->
+    Certs = evidence_certificate_map(Evidence, Opts),
+    maps:from_list(
+        [
+            {binary_to_atom(Type, utf8), decode_required(<<"data">>, Cert, Opts)}
+         || {Type, Cert} <- hb_maps:to_list(Certs, Opts),
+            is_map(Cert),
+            lists:member(Type, [<<"ark">>, <<"ask">>, <<"vcek">>, <<"crl">>])
+        ]).
+
+evidence_certificate_map(Evidence0, Opts) ->
+    Evidence = hb_link:decode_all_links(Evidence0),
+    case hb_maps:get(<<"certificates">>, Evidence, undefined, Opts) of
+        undefined -> #{};
+        Certs -> certificate_map_value(Certs, Opts)
+    end.
+
+certificate_map_value(Link, Opts) when ?IS_LINK(Link) ->
+    certificate_map_value(hb_cache:ensure_loaded(Link, Opts), Opts);
+certificate_map_value({ok, Msg}, Opts) ->
+    certificate_map_value(Msg, Opts);
+certificate_map_value(Msg, Opts) when is_map(Msg) ->
+    Decoded = hb_link:decode_all_links(Msg),
+    Entries =
+        [
+            {Type, certificate_entry_value(Cert, Opts)}
+         || {Type, Cert} <- hb_maps:to_list(Decoded, Opts),
+            lists:member(Type, [<<"ark">>, <<"ask">>, <<"vcek">>, <<"crl">>])
+        ],
+    case Entries of
+        [] ->
+            case hb_maps:get(<<"body">>, Decoded, undefined, Opts) of
+                Body when is_map(Body) -> certificate_map_value(Body, Opts);
+                _ -> #{}
+            end;
+        _ ->
+            maps:from_list(Entries)
+    end;
+certificate_map_value(_Other, _Opts) ->
+    #{}.
+
+certificate_entry_value(Link, Opts) when ?IS_LINK(Link) ->
+    certificate_entry_value(hb_cache:ensure_loaded(Link, Opts), Opts);
+certificate_entry_value({ok, Msg}, Opts) ->
+    certificate_entry_value(Msg, Opts);
+certificate_entry_value(Msg, Opts) when is_map(Msg) ->
+    Decoded = hb_link:decode_all_links(Msg),
+    case hb_maps:get(<<"body">>, Decoded, undefined, Opts) of
+        Body when is_map(Body) -> Body;
+        _ -> Decoded
+    end;
+certificate_entry_value(Other, _Opts) ->
+    Other.
+
+configured_certificates(Opts) ->
+    unique_certificate_entries(
+        configured_cert_chain(Opts) ++
+            [Cert || Cert <- [
+                configured_certificate(
+                    <<"ark">>, <<"snp-ark-der">>, <<"snp-ark-pem">>, Opts),
+                configured_certificate(
+                    <<"ask">>, <<"snp-ask-der">>, <<"snp-ask-pem">>, Opts),
+                configured_certificate(
+                    <<"vcek">>, <<"snp-vcek-der">>, <<"snp-vcek-pem">>, Opts),
+                configured_crl(Opts)
+            ], Cert =/= undefined],
+        Opts).
+
+configured_cert_chain(Opts) ->
+    case hb_opts:get(<<"snp-cert-chain-pem">>, undefined, Opts) of
+        Pem when is_binary(Pem), byte_size(Pem) > 0 ->
+            case pem_certificates(Pem) of
+                [Ask, Ark] ->
+                    [configured_certificate_entry(<<"ask">>, Ask),
+                     configured_certificate_entry(<<"ark">>, Ark)];
+                _ ->
+                    throw(#{<<"snp-cert-chain-pem">> =>
+                        <<"expected AMD ASK and ARK certificates">>})
+            end;
+        _ ->
+            []
+    end.
+
+configured_certificate(Type, DerKey, PemKey, Opts) ->
+    case hb_opts:get(DerKey, undefined, Opts) of
+        Der when is_binary(Der), byte_size(Der) > 0 ->
+            configured_certificate_entry(Type, config_binary(Der));
+        _ ->
+            case hb_opts:get(PemKey, undefined, Opts) of
+                Pem when is_binary(Pem), byte_size(Pem) > 0 ->
+                    case pem_certificates(Pem) of
+                        [Cert] ->
+                            configured_certificate_entry(Type, Cert);
+                        _ ->
+                            throw(#{PemKey =>
+                                <<"expected one PEM certificate">>})
+                    end;
+                _ ->
+                    undefined
+            end
+    end.
+
+configured_certificate_entry(Type, Data) ->
+    #{
+        <<"type">> => Type,
+        <<"source">> => <<"config">>,
+        <<"data">> => hb_util:encode(Data)
+    }.
+
+configured_crl(Opts) ->
+    case hb_opts:get(<<"snp-crl-der">>, undefined, Opts) of
+        Der when is_binary(Der), byte_size(Der) > 0 ->
+            configured_certificate_entry(<<"crl">>, config_binary(Der));
+        _ ->
+            case hb_opts:get(<<"snp-crl-pem">>, undefined, Opts) of
+                Pem when is_binary(Pem), byte_size(Pem) > 0 ->
+                    case pem_crls(Pem) of
+                        [CRL] ->
+                            configured_certificate_entry(<<"crl">>, CRL);
+                        _ ->
+                            throw(#{<<"snp-crl-pem">> =>
+                                <<"expected one PEM CRL">>})
+                    end;
+                _ ->
+                    undefined
+            end
+    end.
+
+unique_certificate_entries(Entries, Opts) ->
+    [Entry
+     || Type <- [<<"ark">>, <<"ask">>, <<"vcek">>,
+                 <<"vlek">>, <<"crl">>, <<"other">>],
+        Entry <- take_certificate_type(Type, Entries, Opts)].
+
+certificate_entry_map(Entries, Opts) ->
+    maps:from_list(
+        [
+            {hb_maps:get(<<"type">>, Entry, undefined, Opts), Entry}
+         || Entry <- Entries,
+            lists:member(
+                hb_maps:get(<<"type">>, Entry, undefined, Opts),
+                [<<"ark">>, <<"ask">>, <<"vcek">>, <<"vlek">>,
+                 <<"crl">>, <<"other">>])
+        ]).
+
+take_certificate_type(Type, Entries, Opts) ->
+    case [Entry || Entry <- Entries,
+                   hb_maps:get(<<"type">>, Entry, undefined, Opts) =:= Type] of
+        [Entry | _] -> [Entry];
+        [] -> []
+    end.
+
+config_binary(Bin) ->
+    try hb_util:decode(Bin)
+    catch _:_ -> Bin
+    end.
+
+pem_certificates(Pem) ->
+    [Der || {'Certificate', Der, _} <- public_key:pem_decode(Pem)].
+
+pem_crls(Pem) ->
+    [Der || {'CertificateList', Der, _} <- public_key:pem_decode(Pem)].
+
+fetch_amd_cert_chain(Product) ->
+    URL = <<"https://kdsintf.amd.com/vcek/v1/", Product/binary,
+            "/cert_chain">>,
+    PEM = http_get(URL),
+    Certs = pem_certificates(PEM),
+    case Certs of
+        [Ask, Ark] -> {Ask, Ark};
+        _ -> throw(#{<<"amd-kds-cert-chain">> => <<"unexpected certificate chain">>})
+    end.
+
+fetch_vcek(Product, Report) ->
+    TCB = report_get(<<"reported-tcb">>, Report, #{}),
+    URL = iolist_to_binary([
+        <<"https://kdsintf.amd.com/vcek/v1/">>,
+        Product,
+        <<"/">>,
+        hex_lower(report_get(<<"chip-id">>, Report, <<>>)),
+        <<"?blSPL=">>, decimal_param(hb_maps:get(<<"bootloader">>, TCB, 0, TCB)),
+        <<"&teeSPL=">>, decimal_param(hb_maps:get(<<"tee">>, TCB, 0, TCB)),
+        <<"&snpSPL=">>, decimal_param(hb_maps:get(<<"snp">>, TCB, 0, TCB)),
+        <<"&ucodeSPL=">>, decimal_param(hb_maps:get(<<"microcode">>, TCB, 0, TCB))
+    ]),
+    http_get(URL).
+
+fetch_amd_crl(Product) ->
+    http_get_uncached(
+        <<"https://kdsintf.amd.com/vcek/v1/", Product/binary, "/crl">>).
+
+http_get(URL) ->
+    case persistent_term:get({dev_lapee_snp, http_get, URL}, undefined) of
+        Body when is_binary(Body) ->
+            Body;
+        undefined ->
+            Body = http_get_uncached(URL),
+            persistent_term:put({dev_lapee_snp, http_get, URL}, Body),
+            Body
+    end.
+
+http_get_uncached(URL) ->
+    application:ensure_all_started(ssl),
+    application:ensure_all_started(inets),
+    case httpc:request(
+        get,
+        {binary_to_list(URL), []},
+        [{timeout, 15000}, {ssl, [{cacertfile, certifi:cacertfile()}]}],
+        [{body_format, binary}]) of
+        {ok, {{_, Code, _}, _Headers, Body}} when Code >= 200, Code < 300 ->
+            Body;
+        {ok, {{_, Code, _}, _Headers, Body}} ->
+            throw(#{<<"http-status">> => Code, <<"url">> => URL,
+                    <<"body">> => Body});
+        {error, Reason} ->
+            throw(#{<<"http-error">> => reason_to_text(Reason),
+                    <<"url">> => URL})
+    end.
+
+assert_certificate_chain(#{ark := Ark, ask := Ask, vcek := VCEK, crl := CRL}) ->
+    assert_certificate_chain(#{ark => Ark, ask => Ask, vcek => VCEK}),
+    assert_amd_crl(CRL, Ark, Ask);
+assert_certificate_chain(#{ark := Ark, ask := Ask, vcek := VCEK}) ->
+    assert_amd_ark(Ark),
+    case public_key:pkix_path_validation(Ark, [Ask, VCEK], []) of
+        {ok, _} -> ok;
+        {error, Reason} ->
+            throw(#{<<"snp-certificate-chain">> => reason_to_text(Reason)})
+    end.
+
+assert_amd_crl(CRLDER, ArkDER, AskDER) ->
+    CRL = public_key:der_decode('CertificateList', CRLDER),
+    assert_crl_issuer(CRL, ArkDER),
+    assert_crl_valid_now(CRL),
+    assert_crl_signature(CRL, ArkDER),
+    assert_not_revoked(CRL, AskDER).
+
+assert_crl_issuer(
+    #'CertificateList'{tbsCertList = #'TBSCertList'{issuer = Issuer}},
+    ArkDER) ->
+    case canonical_name(cert_subject(ArkDER)) =:= canonical_name(Issuer) of
+        true -> ok;
+        false -> throw(#{<<"snp-crl-issuer">> => <<"CRL issuer is not ARK">>})
+    end.
+
+assert_crl_valid_now(
+    #'CertificateList'{
+        tbsCertList =
+            #'TBSCertList'{thisUpdate = ThisUpdate, nextUpdate = NextUpdate}}) ->
+    This = x509_time_seconds(ThisUpdate),
+    Next = x509_time_seconds(NextUpdate),
+    case erlang:system_time(second) of
+        Now when This =< Now, Now < Next ->
+            ok;
+        _ ->
+            throw(#{<<"snp-crl-validity">> =>
+                #{<<"this-update">> => This, <<"next-update">> => Next}})
+    end.
+
+assert_not_revoked(
+    #'CertificateList'{
+        tbsCertList =
+            #'TBSCertList'{revokedCertificates = Revoked0}},
+    CertDER) ->
+    Serial = cert_serial(CertDER),
+    case lists:member(Serial, revoked_serials(Revoked0)) of
+        false -> ok;
+        true ->
+            throw(#{<<"snp-certificate-revoked">> =>
+                integer_to_binary(Serial, 16)})
+    end.
+
+assert_crl_signature(
+    #'CertificateList'{
+        tbsCertList = TBS,
+        signatureAlgorithm = Algorithm,
+        signature = Signature},
+    ArkDER) ->
+    Key = cert_public_key_only(ArkDER),
+    TbsDER = public_key:der_encode('TBSCertList', TBS),
+    Params = crl_signature_parameters(Algorithm),
+    case public_key:verify(
+        TbsDER,
+        crl_hash_algorithm(Params),
+        Signature,
+        Key,
+        crl_rsa_pss_options(Params)) of
+        true -> ok;
+        false -> throw(#{<<"snp-crl-signature">> => <<"rejected">>})
+    end;
+assert_crl_signature(_CRL, _ArkDER) ->
+    throw(#{<<"snp-crl-signature">> => <<"unsupported algorithm">>}).
+
+crl_signature_parameters({'AlgorithmIdentifier', ?ID_RSASSA_PSS, ParamsDER})
+        when is_binary(ParamsDER) ->
+    public_key:der_decode('RSASSA-PSS-params', ParamsDER);
+crl_signature_parameters({'CertificateList_algorithmIdentifier',
+                          ?ID_RSASSA_PSS, Params}) ->
+    Params;
+crl_signature_parameters(Algorithm) ->
+    throw(#{<<"snp-crl-signature">> => reason_to_text(Algorithm)}).
+
+crl_hash_algorithm(
+    {'RSASSA-PSS-params', {'HashAlgorithm', ?ID_SHA384, 'NULL'}, _, _, _}) ->
+    sha384;
+crl_hash_algorithm(Params) ->
+    throw(#{<<"snp-crl-hash-algorithm">> => reason_to_text(Params)}).
+
+crl_rsa_pss_options(
+    {'RSASSA-PSS-params',
+        _, {'MaskGenAlgorithm', ?ID_MGF1, {'HashAlgorithm', ?ID_SHA384, 'NULL'}},
+        SaltLength, _}) ->
+    [
+        {rsa_padding, rsa_pkcs1_pss_padding},
+        {rsa_pss_saltlen, SaltLength},
+        {rsa_mgf1_md, sha384}
+    ];
+crl_rsa_pss_options(Params) ->
+    throw(#{<<"snp-crl-mask-algorithm">> => reason_to_text(Params)}).
+
+revoked_serials(asn1_NOVALUE) ->
+    [];
+revoked_serials(Revoked) ->
+    [Serial || #'TBSCertList_revokedCertificates_SEQOF'{
+                   userCertificate = Serial} <- Revoked].
+
+x509_time_seconds({utcTime, Time}) ->
+    [Y1, Y2, M1, M2, D1, D2, H1, H2, I1, I2, S1, S2, $Z] = Time,
+    YY = digits(Y1, Y2),
+    Year =
+        case YY >= 50 of
+            true -> 1900 + YY;
+            false -> 2000 + YY
+        end,
+    calendar:datetime_to_gregorian_seconds(
+        {{Year, digits(M1, M2), digits(D1, D2)},
+         {digits(H1, H2), digits(I1, I2), digits(S1, S2)}}) -
+        calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}});
+x509_time_seconds({generalTime, Time}) ->
+    [Y1, Y2, Y3, Y4, M1, M2, D1, D2, H1, H2, I1, I2, S1, S2, $Z] = Time,
+    Year = digits4(Y1, Y2, Y3, Y4),
+    calendar:datetime_to_gregorian_seconds(
+        {{Year, digits(M1, M2), digits(D1, D2)},
+         {digits(H1, H2), digits(I1, I2), digits(S1, S2)}}) -
+        calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}});
+x509_time_seconds(Other) ->
+    throw(#{<<"x509-time">> => reason_to_text(Other)}).
+
+digits(A, B) ->
+    (digit(A) * 10) + digit(B).
+
+digits4(A, B, C, D) ->
+    (digits(A, B) * 100) + digits(C, D).
+
+digit(N) when is_integer(N), N >= $0, N =< $9 ->
+    N - $0.
+
+assert_amd_ark(Ark) ->
+    Hash = hb_util:encode(crypto:hash(sha256, Ark)),
+    case lists:member(Hash, amd_ark_fingerprints()) of
+        true -> ok;
+        false ->
+            throw(#{<<"unknown-amd-ark">> => Hash})
+    end.
+
+amd_ark_fingerprints() ->
+    [
+        <<"adBjtFNE0moulOH0IQ3knvVVMIKH1MF0RFyVY5pUC80">>,
+        <<"TGWY0ZwYcZxd_Up9M19nTlv-HY-ADOos8nDBDRA9svE">>,
+        <<"HwhBYaRLttk3eKkEh31IGcr6XQXvQZOy3tndnHPdP2o">>
+    ].
+
+cert_public_key(Der) ->
+    #'OTPCertificate'{
+        tbsCertificate =
+            #'OTPTBSCertificate'{
+                subjectPublicKeyInfo =
+                    #'OTPSubjectPublicKeyInfo'{
+                        algorithm =
+                            #'PublicKeyAlgorithm'{parameters = Parameters},
+                        subjectPublicKey = Key}}} =
+        public_key:pkix_decode_cert(Der, otp),
+    {Key, Parameters}.
+
+cert_public_key_only(Der) ->
+    {Key, _Parameters} = cert_public_key(Der),
+    Key.
+
+cert_subject(Der) ->
+    #'OTPCertificate'{tbsCertificate =
+        #'OTPTBSCertificate'{subject = Subject}} =
+            public_key:pkix_decode_cert(Der, otp),
+    Subject.
+
+canonical_name({rdnSequence, RDNs}) ->
+    {rdnSequence, [
+        [{OID, canonical_name_value(Value)}
+         || {'AttributeTypeAndValue', OID, Value} <- RDN]
+        || RDN <- RDNs
+    ]}.
+
+canonical_name_value({_, Value}) when is_binary(Value) ->
+    Value;
+canonical_name_value(Value) when is_binary(Value) ->
+    der_string_value(Value);
+canonical_name_value(Value) when is_list(Value) ->
+    unicode:characters_to_binary(Value);
+canonical_name_value(Value) ->
+    Value.
+
+der_string_value(<<_Tag, Length, Value:Length/binary>>)
+        when Length < 128 ->
+    Value;
+der_string_value(<<_Tag, 16#81, Length, Value:Length/binary>>) ->
+    Value;
+der_string_value(<<_Tag, 16#82, Length:16, Value:Length/binary>>) ->
+    Value;
+der_string_value(Value) ->
+    Value.
+
+cert_serial(Der) ->
+    #'OTPCertificate'{tbsCertificate =
+        #'OTPTBSCertificate'{serialNumber = Serial}} =
+            public_key:pkix_decode_cert(Der, otp),
+    Serial.
+
+ecdsa_signature_der(#{<<"r">> := R, <<"s">> := S}) ->
+    public_key:der_encode(
+        'ECDSA-Sig-Value',
+        #'ECDSA-Sig-Value'{r = snp_signature_integer(R),
+                           s = snp_signature_integer(S)}).
+
+snp_signature_integer(Padded) when is_binary(Padded), byte_size(Padded) >= 48 ->
+    binary:decode_unsigned(reverse_binary(binary:part(Padded, 0, 48)));
+snp_signature_integer(_) ->
+    throw(<<"invalid SNP ECDSA signature component">>).
+
+reverse_binary(Bin) ->
+    list_to_binary(lists:reverse(binary_to_list(Bin))).
+
+snp_product(Body, Opts) ->
+    snp_product(Body, #{}, Opts).
+
+snp_product(Body, Evidence, Opts) ->
+    case hb_opts:get(<<"snp-product">>, undefined, Opts) of
+        Product when is_binary(Product), byte_size(Product) > 0 ->
+            Product;
+        _ ->
+            case hb_maps:get(<<"snp-product">>, Evidence, undefined, Opts) of
+                Product when is_binary(Product), byte_size(Product) > 0 ->
+                    Product;
+                _ ->
+                    snp_product_from_body(Body, Opts)
+            end
+    end.
+
+snp_product_from_body(Body, Opts) when is_map(Body) ->
+    System = hb_maps:get(<<"system">>, Body, #{}, Opts),
+    CPU = hb_maps:get(<<"cpu">>, System, #{}, Opts),
+    CPUInfo = hb_maps:get(<<"cpuinfo">>, CPU, #{}, Opts),
+    Family = parse_integer(
+        hb_maps:get(<<"cpu-family">>, CPUInfo, undefined, Opts),
+        undefined),
+    Model = parse_integer(
+        hb_maps:get(<<"model">>, CPUInfo, undefined, Opts),
+        undefined),
+    snp_product_from_fms(Family, Model);
+snp_product_from_body(_Body, _Opts) ->
+    <<"Genoa">>.
+
+snp_product_from_fms(25, Model) when is_integer(Model), Model < 16 ->
+    <<"Milan">>;
+snp_product_from_fms(25, _Model) ->
+    <<"Genoa">>;
+snp_product_from_fms(26, _Model) ->
+    <<"Turin">>;
+snp_product_from_fms(_, _) ->
+    <<"Genoa">>.
+
+hex_lower(Bin) ->
+    << <<(hex_digit(N bsr 4)), (hex_digit(N band 15))>> || <<N:8>> <= Bin >>.
+
+hex_digit(N) when N < 10 -> $0 + N;
+hex_digit(N) -> $a + (N - 10).
+
+decimal_param(N) when is_integer(N) ->
+    integer_to_binary(N);
+decimal_param(B) when is_binary(B) ->
+    B;
+decimal_param(_) ->
+    <<"0">>.
+
+report_data(Body, Nonce, Recipient, Req, Opts) ->
+    report_data_for_ids(
+        measured_body_id(Body, Recipient, Req, Opts),
+        Nonce,
+        recipient_id(Recipient, #{}, Opts),
+        measurement_context_digest(Recipient, Opts)).
+
+report_data_for_ids(BodyID, Nonce, RecipientID, ContextDigest) ->
+    crypto:hash(
+        sha512,
+        <<?REPORT_CONTEXT/binary,
+          (hb_util:native_id(BodyID))/binary,
+          Nonce/binary,
+          (hb_util:native_id(RecipientID))/binary,
+          (hb_util:decode(ContextDigest))/binary>>).
+
+recipient_id(Link, _Evidence, _Opts) when ?IS_LINK(Link) ->
+    link_id(Link);
+recipient_id(Recipient, Evidence, Opts) ->
+    ID = recipient_identity_id(Recipient, Opts),
+    case hb_maps:get(<<"secret-recipient-id">>, Evidence, undefined, Opts) of
+        undefined ->
+            ID;
+        ID when is_binary(ID), byte_size(ID) > 0 ->
+            ID;
+        _ ->
+            throw(<<"evidence secret-recipient-id does not match recipient">>)
+    end.
+
+recipient_identity_id(Recipient, Opts) when is_map(Recipient) ->
+    Public = decode_required(
+        <<"x25519-public-key">>,
+        hb_maps:get(<<"public-material">>, Recipient, #{}, Opts),
+        Opts),
+    ExpectedKeyID = hb_util:encode(crypto:hash(sha256, Public)),
+    case hb_maps:get(<<"key-id">>, Recipient, ExpectedKeyID, Opts) of
+        ExpectedKeyID ->
+            ok;
+        _ ->
+            throw(<<"recipient key-id does not match public key">>)
+    end,
+    Method = hb_maps:get(<<"method">>, Recipient, ?METHOD, Opts),
+    Binding = load_part(hb_maps:get(<<"binding">>, Recipient, #{}, Opts), Opts),
+    ReportContext =
+        hb_maps:get(<<"report-data-context">>, Binding, ?REPORT_CONTEXT, Opts),
+    BodyID = hb_maps:get(<<"body-id">>, Binding, <<>>, Opts),
+    ContextDigest = measurement_context_digest(Recipient, Opts),
+    hb_util:encode(
+        crypto:hash(
+            sha256,
+            <<"lapee-snp-recipient-v1\n",
+              "method:", Method/binary, "\n",
+              "public-key:", Public/binary, "\n",
+              "key-id:", ExpectedKeyID/binary, "\n",
+              "report-data-context:", ReportContext/binary, "\n",
+              "body-id:", (hb_util:native_id(BodyID))/binary, "\n",
+              "device-context-digest:",
+                  (hb_util:decode(ContextDigest))/binary, "\n">>));
+recipient_identity_id(Recipient, Opts) ->
+    stable_id(Recipient, Opts).
+
+measured_body_id(Body, Recipient, Req, Opts) ->
+    case trusted_measurement_body_id(Recipient, Req, Opts) of
+        undefined ->
+            measured_body_id(Body, Recipient, Opts);
+        BodyID ->
+            BodyID
+    end.
+
+measured_body_id(Body, Recipient, Opts) ->
+    case recipient_body_id(Recipient, Opts) of
+        undefined ->
+            body_id(Body, Opts);
+        BodyID ->
+            ok = assert_body_id(Body, BodyID, Opts),
+            BodyID
+    end.
+
+recipient_body_id(Recipient, Opts) when is_map(Recipient) ->
+    Binding = load_part(hb_maps:get(<<"binding">>, Recipient, #{}, Opts), Opts),
+    case hb_maps:get(<<"body-id">>, Binding, undefined, Opts) of
+        ID when is_binary(ID), byte_size(ID) > 0 -> ID;
+        _ -> undefined
+    end;
+recipient_body_id(_Recipient, _Opts) ->
+    undefined.
+
+trusted_measurement_body_id(Recipient, Req, Opts) ->
+    case {internal_measurement_request(Req, Opts),
+          trusted_body_id(Req, Opts),
+          recipient_body_id(Recipient, Opts)} of
+        {true, BodyID, BodyID} when is_binary(BodyID) ->
+            BodyID;
+        {true, BodyID, undefined} when is_binary(BodyID) ->
+            BodyID;
+        _ ->
+            undefined
+    end.
+
+trusted_body_id(Req, Opts) ->
+    case hb_maps:get(<<"body-id">>, Req, undefined, Opts) of
+        ID when is_binary(ID), byte_size(ID) =:= 43 ->
+            try hb_util:native_id(ID) of
+                Digest when byte_size(Digest) =:= 32 ->
+                    ID;
+                _ ->
+                    undefined
+            catch
+                _:_ -> undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+measurement_context_digest(Recipient, Opts) ->
+    case recipient_binding_value(
+        <<"device-context-digest">>, Recipient, Opts) of
+        Digest when is_binary(Digest), byte_size(Digest) > 0 ->
+            Digest;
+        _ ->
+            device_context_digest(device_context(Opts), Opts)
+    end.
+
+recipient_binding_value(Key, Recipient, Opts) when is_map(Recipient) ->
+    Binding = load_part(hb_maps:get(<<"binding">>, Recipient, #{}, Opts), Opts),
+    hb_maps:get(Key, Binding, undefined, Opts);
+recipient_binding_value(_Key, _Recipient, _Opts) ->
+    undefined.
+
+assert_body_id(Link, BodyID, _Opts) when ?IS_LINK(Link) ->
+    case link_id(Link) of
+        BodyID -> ok;
+        _ -> throw(<<"recipient body-id does not match measurement body">>)
+    end;
+assert_body_id(Body, BodyID, Opts) when is_map(Body) ->
+    case body_id(Body, Opts) of
+        BodyID -> ok;
+        _ -> throw(<<"recipient body-id does not match measurement body">>)
+    end;
+assert_body_id(Body, BodyID, Opts) ->
+    case body_id(Body, Opts) of
+        BodyID -> ok;
+        _ -> throw(<<"recipient body-id does not match measurement body">>)
+    end.
+
+body_id(Body, Opts) when is_map(Body) ->
+    stable_id(Body, Opts);
+body_id(Link, _Opts) when ?IS_LINK(Link) ->
+    link_id(Link);
+body_id(Other, _Opts) ->
+    hb_util:encode(crypto:hash(sha256, term_to_binary(Other))).
+
+device_context(Opts) ->
+    #{
+        <<"vmpl">> => vmpl(Opts),
+        <<"report-data-context">> => ?REPORT_CONTEXT,
+        <<"secret-method">> => ?METHOD
+    }.
+
+device_context_digest(Context, Opts) ->
+    Vmpl = decimal_param(hb_maps:get(<<"vmpl">>, Context, 0, Opts)),
+    ReportContext =
+        hb_maps:get(<<"report-data-context">>, Context, ?REPORT_CONTEXT, Opts),
+    Method = hb_maps:get(<<"secret-method">>, Context, ?METHOD, Opts),
+    hb_util:encode(
+        crypto:hash(
+            sha256,
+            <<"lapee-snp-device-context-v1\n",
+              "vmpl:", Vmpl/binary, "\n",
+              "report-data-context:", ReportContext/binary, "\n",
+              "secret-method:", Method/binary, "\n">>)).
+
+vmpl(Opts) ->
+    parse_integer(hb_opts:get(<<"snp-vmpl">>, undefined, Opts), 0).
+
+measurement_nonce(Req, Opts) ->
+    case expected_nonce(Req, Opts) of
+        undefined -> crypto:strong_rand_bytes(32);
+        Nonce -> Nonce
+    end.
+
+expected_nonce(Req, Opts) ->
+    case hb_maps:get(<<"nonce">>, Req, undefined, Opts) of
+        undefined -> undefined;
+        B when is_binary(B) ->
+            try hb_util:decode(B)
+            catch _:_ -> B
+            end;
+        _ -> undefined
+    end.
+
+secret_activation_public_body(Secret, Credential, Opts) ->
+    Now = erlang:system_time(second),
+    #{
+        <<"type">> => <<"lapee-secret-activation">>,
+        <<"version">> => ?VERSION,
+        <<"measurement-device">> => <<"snp@1.0">>,
+        <<"method">> => ?METHOD,
+        <<"issued-at-unix">> => Now,
+        <<"credential-secret-sha256">> =>
+            hb_util:encode(crypto:hash(sha256, Secret)),
+        <<"proof-alg">> => <<"HMAC-SHA256">>,
+        <<"credential-secret-proof">> =>
+            hb_util:encode(
+                crypto:mac(
+                    hmac,
+                    sha256,
+                    Secret,
+                    secret_activation_context(Credential, Now, Opts)))
+    }.
+
+secret_activation_context(Credential, IssuedAt, Opts) ->
+    <<"lapee-secret-activation-v1\n",
+      "measurement-device:snp@1.0\n",
+      "method:", ?METHOD/binary, "\n",
+      "issued-at-unix:", (integer_to_binary(IssuedAt))/binary, "\n",
+      "credential-id:", (wrapped_secret_id(Credential, Opts))/binary>>.
+
+wrapped_secret_id(Credential, Opts) when is_map(Credential) ->
+    case hb_maps:get(<<"credential-id">>, Credential, undefined, Opts) of
+        ID when is_binary(ID), byte_size(ID) > 0 ->
+            ID;
+        _ ->
+            hb_message:id(
+                maps:from_list(
+                    [
+                        {Key, Value}
+                     || Key <- wrapped_secret_identity_keys(),
+                        (Value = hb_maps:get(Key, Credential, undefined, Opts))
+                            =/= undefined
+                    ]),
+                uncommitted,
+                Opts)
+    end;
+wrapped_secret_id(Credential, Opts) ->
+    stable_id(Credential, Opts).
+
+wrapped_secret_identity_keys() ->
+    [
+        <<"type">>,
+        <<"version">>,
+        <<"measurement-device">>,
+        <<"method">>,
+        <<"subject-id">>,
+        <<"ephemeral-public-key">>,
+        <<"salt">>,
+        <<"iv">>,
+        <<"ciphertext">>,
+        <<"tag">>
+    ].
+
+activation_credential(Req, Opts) when is_map(Req) ->
+    first_defined([
+        hb_maps:get(<<"credential">>, Req, undefined, Opts),
+        hb_maps:get(<<"wrapped-secret">>, Req, undefined, Opts),
+        Req
+    ]);
+activation_credential(Req, _Opts) ->
+    Req.
+
+secret_aad(SubjectID) ->
+    <<"lapee-snp-wrap-secret-v1:", SubjectID/binary>>.
+
+hkdf_sha256(IKM, Salt, Info, Length) ->
+    PRK = crypto:mac(hmac, sha256, Salt, IKM),
+    hkdf_expand(PRK, Info, Length, <<>>, <<>>, 1).
+
+hkdf_expand(_PRK, _Info, Length, Acc, _Prev, _N)
+        when byte_size(Acc) >= Length ->
+    binary:part(Acc, 0, Length);
+hkdf_expand(PRK, Info, Length, Acc, Prev, N) ->
+    Block = crypto:mac(hmac, sha256, PRK, <<Prev/binary, Info/binary, N>>),
+    hkdf_expand(PRK, Info, Length, <<Acc/binary, Block/binary>>, Block, N + 1).
+
+evidence_report(Evidence, Opts) ->
+    case hb_maps:get(<<"report-raw">>, Evidence, undefined, Opts) of
+        Raw when is_binary(Raw), byte_size(Raw) > 0 ->
+            decode_report(decode_secret(Raw));
+        _ ->
+            decode_report(hb_maps:get(<<"report-json">>, Evidence, <<>>, Opts))
+    end.
+
+decode_report(Raw) when is_binary(Raw), byte_size(Raw) =:= 1184 ->
+    parse_raw_report(Raw);
+decode_report(ReportJSON) when is_binary(ReportJSON) ->
+    hb_json:decode(ReportJSON);
+decode_report(Report) when is_map(Report) ->
+    Report.
+
+parse_raw_report(
+    <<Version:32/little, GuestSVN:32/little, Policy:64/little,
+      FamilyID:16/binary, ImageID:16/binary, VMPL:32/little,
+      SigAlgo:32/little, CurrentTCB:8/binary, PlatformInfo:64/little,
+      AuthorKeyEn:32/little, _Reserved0:32/little,
+      ReportData:64/binary, Measurement:48/binary, HostData:32/binary,
+      IDKeyDigest:48/binary, AuthorKeyDigest:48/binary,
+      ReportID:32/binary, ReportIDMA:32/binary, ReportedTCB:8/binary,
+      _Reserved1:24/binary, ChipID:64/binary, CommittedTCB:8/binary,
+      CurrentBuild:8, CurrentMinor:8, CurrentMajor:8, _Reserved2:8,
+      CommittedBuild:8, CommittedMinor:8, CommittedMajor:8, _Reserved3:8,
+      LaunchTCB:8/binary, _Reserved4:168/binary,
+      SigR:72/binary, SigS:72/binary, SigReserved:368/binary>>) ->
+    #{
+        <<"version">> => Version,
+        <<"guest-svn">> => GuestSVN,
+        <<"policy">> => Policy,
+        <<"family-id">> => FamilyID,
+        <<"image-id">> => ImageID,
+        <<"vmpl">> => VMPL,
+        <<"signature-algorithm">> => SigAlgo,
+        <<"current-tcb">> => parse_tcb(CurrentTCB),
+        <<"platform-info">> => PlatformInfo,
+        <<"author-key-enabled">> => AuthorKeyEn =:= 1,
+        <<"report-data">> => ReportData,
+        <<"measurement">> => Measurement,
+        <<"host-data">> => HostData,
+        <<"id-key-digest">> => IDKeyDigest,
+        <<"author-key-digest">> => AuthorKeyDigest,
+        <<"report-id">> => ReportID,
+        <<"report-id-ma">> => ReportIDMA,
+        <<"reported-tcb">> => parse_tcb(ReportedTCB),
+        <<"chip-id">> => ChipID,
+        <<"committed-tcb">> => parse_tcb(CommittedTCB),
+        <<"current-version">> => #{
+            <<"major">> => CurrentMajor,
+            <<"minor">> => CurrentMinor,
+            <<"build">> => CurrentBuild
+        },
+        <<"committed-version">> => #{
+            <<"major">> => CommittedMajor,
+            <<"minor">> => CommittedMinor,
+            <<"build">> => CommittedBuild
+        },
+        <<"launch-tcb">> => parse_tcb(LaunchTCB),
+        <<"signature">> => #{
+            <<"r">> => SigR,
+            <<"s">> => SigS,
+            <<"reserved">> => SigReserved
+        }
+    }.
+
+parse_tcb(
+    <<Bootloader:8, Tee:8, _Reserved:4/binary, SNP:8, Microcode:8>>) ->
+    #{
+        <<"bootloader">> => Bootloader,
+        <<"tee">> => Tee,
+        <<"snp">> => SNP,
+        <<"microcode">> => Microcode
+    }.
+
+encode_array_field(Key, Report) ->
+    hb_util:encode(array_binary(report_get(Key, Report, <<>>))).
+
+report_get(Key, Report, Default) ->
+    report_get(Key, Report, Default, Report).
+
+report_get(Key, Report, Default, Opts) ->
+    case hb_maps:get(Key, Report, undefined, Opts) of
+        undefined -> hb_maps:get(underscore_key(Key), Report, Default, Opts);
+        Value -> Value
+    end.
+
+underscore_key(Key) ->
+    binary:replace(Key, <<"-">>, <<"_">>, [global]).
+
+array_binary(L) when is_list(L) ->
+    iolist_to_binary([<<N:8>> || N <- L, is_integer(N), N >= 0, N =< 255]);
+array_binary(B) when is_binary(B) ->
+    B;
+array_binary(_) ->
+    <<>>.
+
+decode_required(Key, Msg, Opts) ->
+    case hb_maps:get(Key, Msg, undefined, Opts) of
+        B when is_binary(B), byte_size(B) > 0 ->
+            try hb_util:decode(B)
+            catch _:_ -> B
+            end;
+        _ ->
+            throw(<<Key/binary, " missing">>)
+    end.
+
+decode_secret(B) when is_binary(B) ->
+    try hb_util:decode(B)
+    catch _:_ -> B
+    end;
+decode_secret(_) ->
+    throw(<<"secret must be binary/base64url">>).
+
+stable_id(Msg, Opts) when is_map(Msg) ->
+    hb_message:id(
+        hb_message:uncommitted_deep(canonical_payload(Msg, Opts), Opts),
+        uncommitted,
+        Opts);
+stable_id(Link, _Opts) when ?IS_LINK(Link) ->
+    link_id(Link);
+stable_id(Bin, _Opts) when is_binary(Bin), byte_size(Bin) =:= 32 ->
+    hb_util:human_id(Bin);
+stable_id(Bin, _Opts) when is_binary(Bin), byte_size(Bin) =:= 43 ->
+    Bin;
+stable_id(Bin, _Opts) when is_binary(Bin) ->
+    hb_util:encode(hb_crypto:sha256(Bin));
+stable_id(Value, _Opts) ->
+    hb_util:encode(crypto:hash(sha256, term_to_binary(Value))).
+
+link_id({link, ID, _LinkOpts}) ->
+    ID.
+
+canonical_payload(Link, Opts) when ?IS_LINK(Link) ->
+    canonical_payload(response_body(Link, Opts), Opts);
+canonical_payload(Msg, Opts) when is_map(Msg) ->
+    Decoded = hb_link:decode_all_links(Msg),
+    maps:from_list(
+        [
+            {Key, canonical_payload(Value, Opts)}
+         || {Key, Value} <- hb_maps:to_list(Decoded, Opts),
+            Key =/= <<"commitments">>,
+            Key =/= <<"ao-types">>
+        ]);
+canonical_payload(List, Opts) when is_list(List) ->
+    [canonical_payload(Value, Opts) || Value <- List];
+canonical_payload(Value, _Opts) when is_atom(Value) ->
+    hb_util:bin(Value);
+canonical_payload(Value, _Opts) ->
+    Value.
+
+response_body(Link, Opts) when ?IS_LINK(Link) ->
+    response_body(hb_cache:ensure_loaded(Link, Opts), Opts);
+response_body({ok, Msg}, Opts) ->
+    response_body(Msg, Opts);
+response_body({error, Reason}, _Opts) ->
+    throw(Reason);
+response_body(#{<<"body">> := Body} = Msg, Opts) ->
+    case hb_maps:get(<<"type">>, Msg, undefined, Opts) of
+        <<"lapee-measurement">> -> Msg;
+        _ -> response_body(Body, Opts)
+    end;
+response_body(Body, _Opts) ->
+    Body.
+
+measurement_part(Key, Measurement, Opts) ->
+    load_part(hb_maps:get(Key, Measurement, #{}, Opts), Opts).
+
+load_part(Link, Opts) when ?IS_LINK(Link) ->
+    load_part(hb_cache:ensure_loaded(Link, Opts), Opts);
+load_part({ok, Msg}, Opts) ->
+    load_part(Msg, Opts);
+load_part(Msg, _Opts) when is_map(Msg) ->
+    hb_link:decode_all_links(Msg);
+load_part(Value, _Opts) ->
+    Value.
+
+resolve_envelope(Base, Req, Opts) when is_map(Base) ->
+    case hb_maps:get(<<"envelope">>, Req, undefined, Opts) of
+        E when is_map(E) -> E;
+        _ ->
+            case hb_maps:get(<<"type">>, Base, undefined, Opts) of
+                <<"lapee-measurement">> ->
+                    Base;
+                _ ->
+                    case hb_maps:get(<<"body">>, Base, undefined, Opts) of
+                        Inner when is_map(Inner) -> Inner;
+                        _ -> Base
+                    end
+            end
+    end;
+resolve_envelope(_Base, Req, Opts) ->
+    hb_maps:get(<<"envelope">>, Req, #{}, Opts).
+
+safely_check(Name, Severity, Fun) ->
+    try Fun() of
+        ok ->
+            #{<<"name">> => Name,
+              <<"ok">> => true,
+              <<"detail">> => <<"ok">>,
+              <<"severity">> => Severity}
+    catch
+        _Class:Reason:_Stack ->
+            #{<<"name">> => Name,
+              <<"ok">> => false,
+              <<"detail">> => reason_to_text(Reason),
+              <<"severity">> => Severity}
+    end.
+
+parse_integer(N, _Default) when is_integer(N) -> N;
+parse_integer(B, Default) when is_binary(B) ->
+    try binary_to_integer(B)
+    catch _:_ -> Default
+    end;
+parse_integer(_, Default) ->
+    Default.
+
+first_defined([]) -> undefined;
+first_defined([undefined | Rest]) -> first_defined(Rest);
+first_defined([V | _]) -> V.
+
+error_resp(Status, Err, Reason) ->
+    {error, #{
+        <<"status">> => Status,
+        <<"body">> => #{
+            <<"error">> => Err,
+            <<"reason">> => reason_to_text(Reason)
+        }
+    }}.
+
+reason_to_text(B) when is_binary(B) -> B;
+reason_to_text(M) when is_map(M) -> M;
+reason_to_text(A) when is_atom(A) -> atom_to_binary(A, utf8);
+reason_to_text(T) -> iolist_to_binary(io_lib:format("~0p", [T])).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+raw_measurement_generation_requires_internal_token_test() ->
+    ?assertMatch(
+        {error, #{<<"status">> := 403}},
+        subject(#{}, #{<<"body">> => #{}}, #{})),
+    ?assertMatch(
+        {error, #{<<"status">> := 403}},
+        measure(#{}, #{<<"body">> => #{}}, #{})).
+
+snp_certificate_maps_preserve_crls_test() ->
+    CRL = #{<<"type">> => <<"crl">>, <<"data">> => hb_util:encode(<<"crl">>)},
+    Certs = certificate_map_value(#{<<"crl">> => CRL}, #{}),
+    ?assertEqual(CRL, maps:get(<<"crl">>, Certs)),
+    ?assertEqual(#{crl => <<"crl">>}, evidence_certificates(
+        #{<<"certificates">> => #{<<"crl">> => CRL}},
+        #{})).
+
+revoked_serials_extracts_crl_entries_test() ->
+    Revoked = [
+        #'TBSCertList_revokedCertificates_SEQOF'{userCertificate = 16#20001},
+        #'TBSCertList_revokedCertificates_SEQOF'{userCertificate = 16#20002}
+    ],
+    ?assertEqual([16#20001, 16#20002], revoked_serials(Revoked)).
+
+crl_signature_parameters_supports_target_and_host_otp_test() ->
+    Params =
+        {'RSASSA-PSS-params',
+            {'HashAlgorithm', ?ID_SHA384, 'NULL'},
+            {'MaskGenAlgorithm', ?ID_MGF1,
+                {'HashAlgorithm', ?ID_SHA384, 'NULL'}},
+            48,
+            1},
+    ?assertEqual(Params, crl_signature_parameters(
+        {'CertificateList_algorithmIdentifier', ?ID_RSASSA_PSS, Params})),
+    ?assertEqual(Params, crl_signature_parameters(
+        {'AlgorithmIdentifier', ?ID_RSASSA_PSS,
+            public_key:der_encode('RSASSA-PSS-params', Params)})).
+
+canonical_name_matches_raw_and_decoded_x509_strings_test() ->
+    Raw =
+        {rdnSequence, [[
+            {'AttributeTypeAndValue', {2,5,4,3}, <<16#0C, 9, "ARK-Genoa">>}
+        ]]},
+    Decoded =
+        {rdnSequence, [[
+            {'AttributeTypeAndValue', {2,5,4,3}, {utf8String, <<"ARK-Genoa">>}}
+        ]]},
+    ?assertEqual(canonical_name(Decoded), canonical_name(Raw)).
+
+snp_publisher_signal_exposes_author_and_id_key_digests_test() ->
+    Report = #{
+        <<"author-key-enabled">> => true,
+        <<"author-key-digest">> => binary:copy(<<1>>, 48),
+        <<"id-key-digest">> => binary:copy(<<2>>, 48),
+        <<"measurement">> => binary:copy(<<3>>, 48),
+        <<"family-id">> => binary:copy(<<4>>, 16),
+        <<"image-id">> => binary:copy(<<5>>, 16)
+    },
+    Signal = publisher_signal(#{}, #{}, Report, #{}),
+    ?assertEqual(<<"reported">>, hb_maps:get(<<"source-status">>, Signal)),
+    ?assertEqual(2, hb_maps:get(<<"signer-count">>, Signal)),
+    Signers = hb_maps:get(<<"signers">>, Signal),
+    ?assertEqual(
+        <<"author-key">>,
+        hb_maps:get(<<"role">>, hb_maps:get(<<"signer-1">>, Signers))),
+    ?assertEqual(
+        <<"id-key">>,
+        hb_maps:get(<<"role">>, hb_maps:get(<<"signer-2">>, Signers))).
+
+snp_publisher_signal_tamper_rejected_test() ->
+    Report = #{
+        <<"author-key-enabled">> => false,
+        <<"id-key-digest">> => binary:copy(<<2>>, 48),
+        <<"measurement">> => binary:copy(<<3>>, 48)
+    },
+    Evidence0 = #{<<"report-json">> => Report},
+    Signal = publisher_signal(#{}, Evidence0, Report, #{}),
+    Evidence = Evidence0#{
+        <<"signals">> => #{<<"publisher">> =>
+            Signal#{<<"signers-digest">> =>
+                <<"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">>}}
+    },
+    ?assertMatch(
+        #{<<"ok">> := false},
+        check_publisher_signal(#{}, Evidence, #{})).
+
+-endif.

@@ -1,4 +1,4 @@
-.PHONY: compile package verify test local publish setup-inference setup-cc check-nvat-deps clean-publish
+.PHONY: compile package verify test eunit-all local publish setup-inference setup-measurement setup-cc check-nvat-deps clean-publish
 
 HYPERBEAM_REF = 2c03978a3d201444bf7aada3eb35809153e41ef3
 WALLET ?= $(HOME)/.aos.json
@@ -13,31 +13,35 @@ NVAT_SDK_DIR = _build/attestation-sdk
 NVAT_BUILD_DIR = $(NVAT_SDK_DIR)/nv-attestation-sdk-cpp/build
 DEV_SEV_GPU_NIF_DIR = _build/dev_sev_gpu_nif
 DEV_SEV_GPU_PRIV = priv/dev_sev_gpu
+DEVICE_SOURCES = src,vendor/permaweb-os/src
 
 compile:
 	rebar3 compile
 
 package:
-	rebar3 device package
+	rebar3 device package --device-src=$(DEVICE_SOURCES)
 
 verify:
-	rebar3 device verify
+	rebar3 device verify --device-src=$(DEVICE_SOURCES)
+
+setup-measurement:
+	bash scripts/setup-measurement.sh
 
 test:
-	rebar3 device test --device-roots dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_apus_measurement,dev_inference_receipt
+	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt
 
 eunit-all:
 	rebar3 eunit-all
 
 local:
-	rebar3 device local --device-roots dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_apus_measurement,dev_inference_receipt
+	rebar3 device local --device-src=$(DEVICE_SOURCES)
 
 publish:
 	@test -f "$(WALLET)" || (echo "Missing wallet: $(WALLET)" && exit 1)
 	@TS=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
 	OUT=$$(mktemp); \
 	set -o pipefail; \
-	rebar3 device publish --key "$(WALLET)" 2>&1 | tee "$$OUT"; \
+	rebar3 device publish --device-src=$(DEVICE_SOURCES) --key "$(WALLET)" 2>&1 | tee "$$OUT"; \
 	{ \
 		echo "# Published Apus HyperBEAM Devices"; \
 		echo ""; \

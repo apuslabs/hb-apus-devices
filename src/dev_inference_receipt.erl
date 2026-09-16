@@ -150,7 +150,7 @@ resolve_inventory(Req, Opts) ->
 %% @doc Resolve the composed measurement used for this transcript.
 resolve_measurement(Req, Opts) ->
     case hb_ao:resolve(
-        #{<<"device">> => <<"apus_measurement@1.0">>},
+        #{<<"device">> => <<"inference_measurement@1.0">>},
         #{<<"path">> => <<"boot">>,
           <<"measurement-mode">> =>
               hb_ao:get(<<"measurement-mode">>, Req, <<"auto">>, Opts),
