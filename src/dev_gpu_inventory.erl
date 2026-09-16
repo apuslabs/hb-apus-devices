@@ -149,7 +149,9 @@ sysfs_row(PciDir, Bdf, Root) ->
 nvidia_inventory(Root) ->
     case nvidia_query([
         "index", "name", "pci.bus_id", "driver_version", "uuid",
-        "memory.total", "compute_cap"
+        "memory.total", "compute_cap", "vbios_version",
+        "pcie.link.gen.current", "pcie.link.width.current", "power.limit",
+        "persistence_mode", "ecc.mode.current", "mig.mode.current"
     ]) of
         {ok, Rows} ->
             {[
@@ -163,7 +165,9 @@ nvidia_inventory(Root) ->
 nvidia_snapshot(_Root) ->
     case nvidia_query([
         "index", "name", "pci.bus_id", "temperature.gpu", "power.draw",
-        "utilization.gpu", "utilization.memory", "memory.used", "memory.total"
+        "power.limit", "utilization.gpu", "utilization.memory", "memory.used",
+        "memory.total", "clocks.current.graphics", "clocks.current.sm",
+        "clocks.current.memory", "pstate", "fan.speed"
     ]) of
         {ok, Rows} ->
             {[nvidia_runtime_row(Row) || Row <- Rows], [<<"nvidia-smi">>], []};
@@ -195,6 +199,13 @@ nvidia_row(Row, _Root) ->
         <<"gpu-uuid">> => csv_value(Row, 5),
         <<"vram-bytes">> => mib_to_bytes(csv_value(Row, 6)),
         <<"compute-capability">> => csv_value(Row, 7),
+        <<"vbios-version">> => csv_value(Row, 8),
+        <<"pcie-link-gen">> => csv_value(Row, 9),
+        <<"pcie-link-width">> => csv_value(Row, 10),
+        <<"power-limit-watts">> => number_or_text(csv_value(Row, 11)),
+        <<"persistence-mode">> => csv_value(Row, 12),
+        <<"ecc-mode">> => csv_value(Row, 13),
+        <<"mig-mode">> => csv_value(Row, 14),
         <<"source">> => <<"nvidia-smi">>
     }.
 
@@ -205,10 +216,16 @@ nvidia_runtime_row(Row) ->
         <<"name">> => csv_value(Row, 2),
         <<"temperature-c">> => number_or_text(csv_value(Row, 4)),
         <<"power-watts">> => number_or_text(csv_value(Row, 5)),
-        <<"utilization-gpu-percent">> => number_or_text(csv_value(Row, 6)),
-        <<"utilization-memory-percent">> => number_or_text(csv_value(Row, 7)),
-        <<"memory-used-mib">> => number_or_text(csv_value(Row, 8)),
-        <<"memory-total-mib">> => number_or_text(csv_value(Row, 9))
+        <<"power-limit-watts">> => number_or_text(csv_value(Row, 6)),
+        <<"utilization-gpu-percent">> => number_or_text(csv_value(Row, 7)),
+        <<"utilization-memory-percent">> => number_or_text(csv_value(Row, 8)),
+        <<"memory-used-mib">> => number_or_text(csv_value(Row, 9)),
+        <<"memory-total-mib">> => number_or_text(csv_value(Row, 10)),
+        <<"graphics-clock-mhz">> => number_or_text(csv_value(Row, 11)),
+        <<"sm-clock-mhz">> => number_or_text(csv_value(Row, 12)),
+        <<"memory-clock-mhz">> => number_or_text(csv_value(Row, 13)),
+        <<"pstate">> => csv_value(Row, 14),
+        <<"fan-speed-percent">> => number_or_text(csv_value(Row, 15))
     }.
 
 %% @doc Parse comma-separated output while preserving empty fields.

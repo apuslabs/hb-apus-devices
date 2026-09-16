@@ -32,7 +32,14 @@ init() ->
                 %% Source-tree fallback for `rebar3 compile` before Forge packaging.
                 filename:absname("priv/dev_sev_gpu")
         end,
-    LibDir = filename:join(ImplDir, "lib"),
+    %% Device Forge stores the root device's `priv/dev_sev_gpu` resources
+    %% below the implementation directory. Keep the source-tree layout as a
+    %% fallback for local development.
+    DeviceRoot = case filelib:is_dir(filename:join(ImplDir, "dev_sev_gpu")) of
+        true -> filename:join(ImplDir, "dev_sev_gpu");
+        false -> ImplDir
+    end,
+    LibDir = filename:join(DeviceRoot, "lib"),
     ExistingLdPath = os:getenv("LD_LIBRARY_PATH"),
     case filelib:is_dir(LibDir) of
         true when ExistingLdPath =:= false ->
@@ -42,11 +49,13 @@ init() ->
         false ->
             ok
     end,
-    SoPath = filename:join(ImplDir, "dev_sev_gpu_nif"),
+    SoPath = filename:join(DeviceRoot, "dev_sev_gpu_nif"),
     case erlang:load_nif(SoPath, 0) of
         ok -> ok;
         {error, {reload, _}} -> ok;
-        {error, Reason} -> 
+        {error, Reason} ->
+            io:format(standard_error, "dev_sev_gpu NIF load failed (~ts): ~p~n",
+                [SoPath, Reason]),
             ?event({nif_load_error, Reason}),
             ok  %% Don't fail module load, but NIF calls will return not_loaded
     end.
@@ -74,7 +83,7 @@ generate(_M1, M2, Opts) ->
         {error, Reason} when is_binary(Reason) ->
             {error, {nvat_error, Reason}};
         {error, not_loaded} ->
-            {error, nif_not_loaded}
+            cli_attest(Nonce)
     end.
 
 %% @doc Verify GPU attestation evidence.
@@ -118,6 +127,49 @@ safe_verify_evidence(EvidenceJSON) ->
         error:not_loaded -> {error, not_loaded};
         error:{nif_not_loaded, _} -> {error, not_loaded}
     end.
+
+cli_attest(Nonce) when is_binary(Nonce) ->
+    case valid_nonce(Nonce) of
+        false -> {error, invalid_nonce};
+        true ->
+            NonceArg = binary_to_list(Nonce),
+            AttestOut = os:cmd("NVAT_LOG_LEVEL=off /usr/bin/nvattest --format json attest --nonce " ++ NonceArg),
+            CollectOut = os:cmd("NVAT_LOG_LEVEL=off /usr/bin/nvattest --format json collect-evidence --nonce " ++ NonceArg),
+            try
+                Attest = hb_json:decode(iolist_to_binary(AttestOut)),
+                Collect = hb_json:decode(iolist_to_binary(CollectOut)),
+                Claims = maps:get(<<"claims">>, Attest, []),
+                Evidences = maps:get(<<"evidences">>, Collect, []),
+                ResultCode = maps:get(<<"result_code">>, Attest, 1),
+                Verified = ResultCode =:= 0 andalso claims_verified(Claims),
+                {ok, hb_json:encode(#{
+                    <<"claims">> => Claims,
+                    <<"evidences">> => Evidences,
+                    <<"eat">> => maps:get(<<"detached_eat">>, Attest, #{}),
+                    <<"verified">> => Verified,
+                    <<"nonce">> => Nonce
+                })}
+            catch
+                _:_ -> {error, nvat_cli_invalid_response}
+            end
+    end;
+cli_attest(_) -> {error, invalid_nonce}.
+
+valid_nonce(Nonce) when byte_size(Nonce) > 0 ->
+    lists:all(fun is_hex/1, binary_to_list(Nonce));
+valid_nonce(_) -> false.
+
+is_hex(C) when C >= $0, C =< $9 -> true;
+is_hex(C) when C >= $a, C =< $f -> true;
+is_hex(C) when C >= $A, C =< $F -> true;
+is_hex(_) -> false.
+
+claims_verified(Claims) when is_list(Claims) ->
+    lists:any(fun(Claim) ->
+        is_map(Claim) andalso
+        maps:get(<<"x-nvidia-gpu-attestation-report-signature-verified">>, Claim, false) =:= true
+    end, Claims);
+claims_verified(_) -> false.
 
 %% ============================================================================
 %% Unit Tests
