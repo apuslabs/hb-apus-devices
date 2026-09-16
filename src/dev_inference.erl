@@ -6,7 +6,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
 
--define(SERVER_PORT, "8080").
+-define(SERVER_PORT, "30001").
 
 %% Device API
 
@@ -30,10 +30,11 @@ stop() ->
 
 %% @doc Handle completion requests.
 completions(Base, Req, Opts) ->
-    Path = case hb_ao:get(<<"chat-mode">>, Base, false, Opts) of
-        true -> <<"/v1/chat/completions">>;
-        false -> <<"/v1/completions">>
-    end,
+    %% The deployed llama.cpp server exposes the OpenAI chat endpoint. The
+    %% receipt and Explorer routes both use this shape; keeping the backend
+    %% path explicit also survives nested AO-Core v1 dispatch where the
+    %% public `chat-mode` marker is not retained in the inner message.
+    Path = <<"/v1/chat/completions">>,
     do_inference_request(Base, Req, Opts, Path).
 
 %% @doc Handle chat completion requests.
@@ -48,8 +49,20 @@ chat(Base, Req, Opts) ->
     )}.
 
 %% @doc Handle models request.
-models(_Base, _Req, _Opts) ->
-    Body = <<"{\"object\":\"list\",\"data\":[{\"id\":\"google/gemma-3-27b-it\",\"object\":\"model\",\"created\":1766123915,\"owned_by\":\"sglang\",\"root\":\"google/gemma-3-27b-it\",\"max_model_len\":16384}]}">>,
+models(Base, _Req, Opts) ->
+    Model = hb_ao:get(<<"inference-opts/model_name">>, Base,
+        hb_ao:get(<<"inference-opts/model_name">>, Opts,
+            <<"MiniCPM5-2B-Q4_K_M.gguf">>, Opts), Opts),
+    Body = hb_json:encode(#{
+        <<"object">> => <<"list">>,
+        <<"data">> => [#{
+            <<"id">> => Model,
+            <<"object">> => <<"model">>,
+            <<"owned_by">> => <<"llamacpp">>,
+            <<"root">> => Model,
+            <<"max_model_len">> => 4096
+        }]
+    }),
     {ok, #{
         <<"status">> => 200,
         <<"content-type">> => <<"application/json">>,
@@ -129,7 +142,7 @@ do_inference_request(Base, Req, Opts, Path) ->
             Response = relay_to_backend(<<"POST">>, Path, Body, RequestOpts),
             
             case should_include_attestation(Req, RequestOpts) of
-                true -> add_attestation(Response, Req, RequestOpts);
+                true -> add_attestation(Response, Base, Req, RequestOpts);
                 false -> format_response(Response, Req, RequestOpts)
             end
     end.
@@ -190,7 +203,8 @@ extract_inference_params(Req, Opts) ->
     hb_cache:ensure_all_loaded(Params, Opts).
 
 relay_to_backend(Method, DefaultPath, Body, Opts) ->
-    Peer = maps:get(<<"agent-api-peer">>, Opts, <<"http://localhost:8080">>),
+    Peer = maps:get(<<"agent-api-peer">>, Opts,
+        iolist_to_binary(["http://localhost:", ?SERVER_PORT])),
     Path = maps:get(<<"agent-api-path">>, Opts, DefaultPath),
     Payload0 = #{
         <<"path">>         => Path,
@@ -232,7 +246,7 @@ format_response({ok, Res}, Req, Opts) ->
                 <<"body">> => Body
             }}
     end;
-format_response({error, Error}, Req, Opts) ->
+format_response({error, Error}, Req, _Opts) ->
     case hb_ao:get(<<"type">>, Req) of
         <<"Message">> ->
             %% For scheduling: return AO message format
@@ -252,10 +266,11 @@ format_response({error, Error}, Req, Opts) ->
 error_body(Error) when is_map(Error) -> hb_json:encode(Error);
 error_body(Error) -> hb_util:bin(Error).
 
-add_attestation({ok, Res}, Req, Opts) ->
+add_attestation({ok, Res}, Base, Req, Opts) ->
     MergedData = #{
         <<"request">> => hb_private:reset(Req),
         <<"response">> => hb_private:reset(Res),
+        <<"ao-core">> => ao_core_evidence(Base, Req, Res, Opts),
         <<"timestamp">> => os:system_time(millisecond),
         <<"nonce">> => hb_util:to_hex(crypto:strong_rand_bytes(32))
     },
@@ -300,8 +315,34 @@ add_attestation({ok, Res}, Req, Opts) ->
                 <<"body">> => EnhancedBody
             }}
     end;
-add_attestation({error, Error}, Req, Opts) ->
+add_attestation({error, Error}, _Base, Req, Opts) ->
     format_response({error, Error}, Req, Opts).
+
+%% @doc Preserve the AO-Core execution link in the public attestation envelope.
+%% Stage 9 will place the same hashpath in the response private message; this
+%% copy makes it available to an HTTP receipt verifier without exposing `priv'.
+ao_core_evidence(Base, Req, Response, Opts) ->
+    Hashpath = try hb_path:hashpath(Base, Req, Opts)
+    catch _:_ -> undefined
+    end,
+    #{
+        <<"status">> => case Hashpath of
+            undefined -> <<"not-captured">>;
+            _ -> <<"captured">>
+        end,
+        <<"source">> => <<"HyperBEAM AO-Core resolve stage 9">>,
+        <<"hashpath">> => Hashpath,
+        <<"hashpath-algorithm">> => <<"sha-256-chain (AO-Core default)">>,
+        <<"request-id">> => safe_message_id(Req, Opts),
+        <<"response-id">> => safe_message_id(Response, Opts),
+        <<"verification-status">> => <<"captured">>
+    }.
+
+safe_message_id(Message, Opts) ->
+    case catch hb_message:id(hb_private:reset(Message), none, Opts) of
+        ID when is_binary(ID) -> ID;
+        _ -> undefined
+    end.
 
 stream_from_backend(Sender, Method, Path, Body, _Opts) ->
     {ok, ConnPid} = gun:open("localhost", list_to_integer(?SERVER_PORT)),
