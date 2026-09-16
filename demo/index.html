@@ -93,7 +93,7 @@
     <article class="panel span-6"><h2>Trust gradient</h2><div class="ladder">
       <div class="rung"><i class="dot"></i><strong>TEE / hardware</strong><span>Out of scope for consumer GPU v1.</span></div>
       <div class="rung"><i class="dot"></i><strong>TPM / SNP chain</strong><span>Existing host measurement remains the anchor.</span></div>
-      <div class="rung active"><i class="dot"></i><strong>host-measured-subject</strong><span>Only when measurement@1.0 consumes hook-body.</span></div>
+      <div class="rung active"><i class="dot"></i><strong>host-measured-subject</strong><span>System subject plus a fresh inventory nonce binding.</span></div>
       <div class="rung active"><i class="dot"></i><strong>host-observed</strong><span>PCI/sysfs/NVIDIA observation, spoofable by a compromised host.</span></div>
       <div class="rung"><i class="dot"></i><strong>runtime-observed</strong><span>Temperature, power, utilization, and memory usage.</span></div>
     </div></article>
@@ -101,10 +101,9 @@
   └─ inference_receipt@1.0 (opt-in)
        ├─ inference@1.0 → relay@1.0 → backend
        ├─ gpu_inventory@1.0 → report / digest
-       └─ apus_measurement@1.0
-            └─ measurement@1.0 (hook-body, when present)
-
-sev_gpu@1.0 stays independent.</pre></article>
+       └─ inference_measurement@1.0
+            ├─ measurement@1.0 (fresh nonce binding)
+            └─ sev_gpu@1.0 (optional GPU attestation)</pre></article>
     <article class="panel span-6"><h2>Inventory digest contract</h2><dl>
       <dt>type</dt><dd>apus-gpu-inventory</dd>
       <dt>provenance</dt><dd>host-observed</dd>
@@ -116,7 +115,7 @@ sev_gpu@1.0 stays independent.</pre></article>
       <dt>request</dt><dd>SHA-256 of canonical request</dd>
       <dt>response</dt><dd>SHA-256 of original response body/data</dd>
       <dt>links</dt><dd>GPU inventory digest + measurement ID</dd>
-      <dt>placement</dt><dd>sibling receipt metadata / receipt+link</dd>
+      <dt>placement</dt><dd>response JSON + sibling receipt metadata</dd>
       <dt>streaming</dt><dd class="warn">rejected in receipt v1</dd>
     </dl></article>
     <article class="panel span-12"><div class="callout"><strong>Boundary:</strong> this is not GPU attestation and it is not a proof of inference correctness. It is a signed, composable observation whose confidence increases when the existing host measurement chain binds the same inventory subject.</div></article>

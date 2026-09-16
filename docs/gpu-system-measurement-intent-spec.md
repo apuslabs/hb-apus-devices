@@ -119,7 +119,7 @@ default v1 digest input includes device identity, driver/firmware identity,
 IOMMU membership, PCIe link facts, and topology. It excludes temperature,
 power, utilization, memory usage, and process lists.
 
-### 4.2 `apus_measurement@1.0`
+### 4.2 `inference_measurement@1.0`
 
 This is a composition adapter, not a replacement for HyperBEAM or PermawebOS
 measurement code.
@@ -132,20 +132,21 @@ Exports:
 - `verify`
 - `snapshot`
 
-The adapter has two explicit modes:
+The adapter defaults to `auto` and also accepts two explicit modes:
 
 `hook-body` mode, when `~measurement@1.0` is available:
 
-1. Resolve the existing `~system@1.0/all` and `~meta@1.0/info` messages.
-2. Resolve `~gpu_inventory@1.0/report`.
-3. Add the GPU inventory under the system subject.
-4. Call `~measurement@1.0/boot` or `fresh` using its existing
-   `measurement-body-source=hook-body` composition path.
-5. Return the original measurement envelope plus composition metadata.
+1. Resolve `~gpu_inventory@1.0/report`.
+2. Hash the caller's nonce and the inventory digest into a measurement nonce.
+3. Call `~measurement@1.0/boot` or `fresh` through its public interface.
+4. Preserve the upstream subject: `~system@1.0/all` plus `~meta@1.0/info`.
+5. Return the original measurement envelope plus composition metadata and
+   available CPU/GPU evidence.
 
-The GPU inventory is then part of the measured subject ID. The TPM/SNP chain
-still decides the host measurement; this adapter only supplies the subject
-content.
+The retained `hook-body` option name selects this integration; it does not
+replace the upstream subject. Fresh measurements bind the request and GPU
+inventory through the nonce. Cached boot measurements retain the upstream
+backend's lifecycle and do not establish a new request binding.
 
 `observation-only` mode, when `~measurement@1.0` is unavailable:
 
@@ -165,9 +166,10 @@ Example composition metadata:
     <<"type">> => <<"apus-gpu-system-measurement">>,
     <<"version">> => <<"1.0">>,
     <<"measurement-integration">> => true,
-    <<"integration-mode">> => <<"hook-body">>,
+    <<"integration-mode">> => <<"measurement-nonce">>,
     <<"base-measurement-id">> => ...,
     <<"gpu-inventory-digest">> => ...,
+    <<"nonce-binding">> => ...,
     <<"subject-id">> => ...,
     <<"provenance-class">> => <<"host-measured-subject">>
 }
@@ -185,6 +187,8 @@ Exports:
 - `models`
 - `health`
 - `v1`
+- `verify-hashpath`
+- `publish`
 
 `models` and `health` delegate without a receipt. `completions` and `chat`
 delegate to `inference@1.0`, then attach an observation or receipt to the
@@ -284,13 +288,14 @@ agent@1.0
         -> inference@1.0
             -> relay@1.0 -> configured inference backend
         -> gpu_inventory@1.0
-        -> apus_measurement@1.0
+        -> inference_measurement@1.0
             -> ~measurement@1.0 when available
+            -> sev_gpu@1.0 for optional NVIDIA evidence
 ```
 
-`sev_gpu@1.0` is intentionally outside this graph. It remains an independent
-legacy/experimental device and is not invoked by `gpu_inventory@1.0` or
-`apus_measurement@1.0`.
+`gpu_inventory@1.0` only collects ordinary host facts. The measurement adapter
+separately requests optional NVIDIA evidence through `sev_gpu@1.0`; absent
+hardware attestation does not turn the inventory into a failure.
 
 The decorator must preserve the existing response modes:
 
@@ -305,13 +310,15 @@ All new devices live in the external repository as normal Forge roots:
 ```text
 src/dev_gpu_inventory.erl
 src/dev_gpu_inventory_*.erl
-src/dev_apus_measurement.erl
-src/dev_apus_measurement_*.erl
+src/dev_inference_measurement.erl
+src/dev_inference_measurement_*.erl
 src/dev_inference_receipt.erl
 src/dev_inference_receipt_*.erl
 ```
 
-No HyperBEAM core source is changed. Native code is not required for v1.
+No HyperBEAM core source is changed. Inventory works without native code;
+the optional SNP backend requires `make setup-measurement` on Linux before
+packaging. Pinned upstream sources are under `vendor/permaweb-os`.
 
 Forge requirements:
 
@@ -341,8 +348,8 @@ ordinary signed Device Forge archives.
 
 ### Measurement adapter
 
-- hook-body mode includes GPU inventory in the subject ID;
-- changing one static GPU field changes the subject ID;
+- integration preserves the upstream system/node subject;
+- changing the request or static GPU inventory changes the fresh nonce binding;
 - base measurement failure downgrades to observation-only or returns an explicit
   error; it never claims host-measured-subject;
 - plain HyperBEAM without `~measurement@1.0` still produces a valid observation
@@ -364,14 +371,13 @@ ordinary signed Device Forge archives.
 
 1. Complete: `gpu_inventory@1.0` uses fixture-friendly sysfs parsing plus
    optional fixed-query NVIDIA enrichment, with deterministic tests.
-2. Complete: `apus_measurement@1.0` returns observation-only envelopes on
+2. Complete: `inference_measurement@1.0` returns observation-only envelopes on
    stock HyperBEAM.
-3. Implemented: the adapter calls PermawebOS `measurement@1.0` through the
-   documented `measurement-body-source=hook-body` path when that device is
-   loaded. Runtime validation against a hardware-backed PermawebOS node is a
-   deployment check, not a HyperBEAM-core change.
-4. Complete: `inference_receipt@1.0` handles non-streaming completions and
-   preserves the original response body/data.
+3. Implemented: the adapter calls PermawebOS `measurement@1.0` through its
+   public `boot`, `fresh`, and `verify` paths, preserving the system/node
+   subject. Hardware-backed validation remains a deployment check.
+4. Complete: `inference_receipt@1.0` handles non-streaming completions, hashes
+   the original response, and includes the receipt in the response JSON.
 5. Complete: `agent-inference-device` is an explicit opt-in; the default is
    unchanged.
 6. Complete locally: Forge package, verify, device tests, preloaded-store
@@ -388,24 +394,24 @@ These decisions are part of the v1 contract:
    supported vendor, and absence of NVIDIA tooling is a valid result.
 2. v1 exposes both a static inventory report/digest and a separate lower-trust
    runtime snapshot. Volatile values never enter the static digest.
-3. `inference_receipt@1.0` returns the original inference body/data unchanged
-   and publishes the receipt as sibling metadata (`receipt+link` in HTTP
-   responses). Streaming is rejected by the decorator.
+3. `inference_receipt@1.0` retains the inference output and adds the receipt
+   to the JSON body as well as sibling AO-Core metadata. Streaming is rejected
+   by the decorator.
 4. `agent@1.0` keeps `inference@1.0` by default. `agent-inference-device` is
    the explicit opt-in for `inference_receipt@1.0`.
-5. `sev_gpu@1.0` remains independent and is never called by the inventory,
-   measurement, or receipt composition graph.
+5. `sev_gpu@1.0` supplies optional GPU attestation to the measurement adapter;
+   the inventory device remains independent of TEE.
 6. When `measurement@1.0` is absent, the adapter is observation-only. When it
-   is present, the adapter passes a `measurement-body-source=hook-body` body
-   containing the canonical inventory, and labels the result
-   `host-measured-subject` only after the base measurement path succeeds.
+   is present, the adapter retains the standard system/node subject and binds
+   fresh request and inventory facts through the nonce. CPU evidence retains
+   the upstream verifier result separately from successful collection.
 
 ## 12. Validation evidence and boundaries
 
 The Device Forge tests cover deterministic inventory digests, exclusion of
 volatile fields, NVIDIA CSV parsing, measurement mode selection, receipt
-request digests, and streaming truth parsing. The six roots package and load
-under the pinned HyperBEAM commit.
+request digests, and streaming truth parsing. The six APUS roots and three
+upstream roots package and load under the pinned HyperBEAM commit.
 
 On a macOS host without NVIDIA, a local Forge node reports
 `supported=false`, `provenance.class=host-observed`, and

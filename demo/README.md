@@ -6,7 +6,7 @@ composition. It intentionally separates:
 - local HyperBEAM observation on a host without NVIDIA;
 - a separately recorded RTX 4090 observation from `ssh pc-win`;
 - the trust level that would be available when PermawebOS
-  `measurement@1.0` consumes the GPU inventory as `hook-body`.
+  `measurement@1.0` binds the GPU inventory through a fresh nonce.
 
 Run it from the repository root:
 

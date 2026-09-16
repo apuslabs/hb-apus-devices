@@ -33,7 +33,7 @@ echo "pin:  2c03978a3d201444bf7aada3eb35809153e41ef3"
 section "1. Device Forge Roots"
 cmd "grep -H '^-implements' src/dev_agent.erl src/dev_inference.erl src/dev_sev_gpu.erl"
 grep -H '^-implements' src/dev_agent.erl src/dev_inference.erl src/dev_sev_gpu.erl \
-  src/dev_gpu_inventory.erl src/dev_apus_measurement.erl \
+  src/dev_gpu_inventory.erl src/dev_inference_measurement.erl \
   src/dev_inference_receipt.erl
 
 section "2. Device Forge Package Artifacts"
@@ -48,7 +48,7 @@ done
 
 section "3. Published Arweave IDs"
 cmd "grep -E '^- (agent|inference|sev_gpu)@1.0 spec=' PUBLISH.md"
-grep -E '^- (agent|inference|sev_gpu|gpu_inventory|apus_measurement|inference_receipt)@1.0 spec=' PUBLISH.md
+grep -E '^- (agent|inference|sev_gpu|gpu_inventory|inference_measurement|inference_receipt)@1.0 spec=' PUBLISH.md
 
 section "4. Local Forge Preloaded Store"
 cmd "ls -lh _build/device-local-store/data.mdb"

@@ -6,7 +6,8 @@ External HyperBEAM Device Forge repository for Apus devices:
 - `inference@1.0`
 - `sev_gpu@1.0`
 - `gpu_inventory@1.0`
-- `apus_measurement@1.0`
+- `inference_measurement@1.0`
+- `measurement@1.0`, `system@1.0`, `snp@1.0` (unchanged PermawebOS sources)
 - `inference_receipt@1.0`
 
 This repository is pinned to the official HyperBEAM `edge` commit
@@ -28,13 +29,29 @@ make test
 
 ## Optional Native Setup
 
+Build Sam's SNP backend on the Linux target before packaging:
+
+```sh
+make setup-measurement
+```
+
+The pinned sources and provenance are in `vendor/permaweb-os/UPSTREAM.md`.
+`inference_measurement@1.0` calls the standard measurement protocol and binds
+the GPU inventory and request digest into its fresh nonce. System facts come
+from upstream `system@1.0/all`; the standard measured subject remains the
+system report plus `meta@1.0/info`.
+
 `sev_gpu@1.0` can package NVIDIA GPU attestation assets under `priv/dev_sev_gpu/`:
 
 ```sh
 make setup-cc
 ```
 
-`inference@1.0` can use the Apus deterministic inference backend:
+`inference@1.0` relays chat requests to a llama.cpp server at
+`http://localhost:30001` by default. See [inference and receipt configuration](docs/inference.md)
+for backend routing, execution metadata, verification, and receipt publishing.
+
+To install the separate Apus deterministic inference backend:
 
 ```sh
 make setup-inference
@@ -43,7 +60,7 @@ make setup-inference
 ## Local Node
 
 ```sh
-rebar3 device local
+make local
 ```
 
 ## Offline Demo
