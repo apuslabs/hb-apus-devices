@@ -26,6 +26,9 @@ OpenAI parameters as message keys: `model`, `messages`, `prompt`,
 `logit_bias`, `user`, `stream`.
 
 - `tee=true` attaches `sev_gpu@1.0` GPU attestation to a non-streaming response.
+  Its `raw` field (whose SHA-256 is the attestation nonce) records only the
+  generation parameters sent to the runtime and `tee`; `user`, HTTP headers
+  and the caller's IP are never recorded.
 - `stream=true` returns server-sent events from the runtime.
 
 ## Node options

@@ -3,7 +3,7 @@
 Receipt decorator for `inference@1.0`.
 
 The device runs a non-streaming chat completion through `inference@1.0`,
-hashes the exact request and response, collects `gpu_inventory@1.0/report`
+hashes the executed request and the response, collects `gpu_inventory@1.0/report`
 and `inference_measurement@1.0/fresh`, and returns the runtime's JSON with a
 signed `receipt` object added. Streaming requests are rejected.
 
@@ -29,6 +29,16 @@ artifacts: `model-sha256`, `model-source`, `model-tx`, `model-revision`,
 
 These declarations are recorded, not checked. The device does not download or
 hash the model.
+
+The executed and recorded request is built from an allowlist before the
+`inference@1.0` step runs: the generation parameters, `tee`, the declarations
+above (except `measurement-mode` and `gpu-inventory-root`, which only select
+how the node probes itself), `path`, and a random `request-nonce`. HTTP
+headers such as `cf-connecting-ip`, `x-forwarded-for`, `x-real-ip`,
+`user-agent`, cookies and credentials, the OpenAI `user` identifier and the
+private peer `ip` never enter the HashPath, `request-digest` or the published
+receipt. The nonce keeps identical prompts from sharing a HashPath or a
+cached, previously attested response.
 
 ## Response (`completions`)
 
@@ -72,6 +82,10 @@ AO-Core rejects posted messages whose nested `device` keys the node cannot
 load before this device runs. For example, an older receipt's
 `cpu-tee.device=/dev/sev-guest` causes this. Post the `ao-core` object rather
 than the whole receipt.
+
+The recorded step's HashPath is generated even when the node sets
+`hashpath: ignore`, and `request-digest` is the digest of the recorded
+(allowlisted) request.
 
 ## `publish`
 

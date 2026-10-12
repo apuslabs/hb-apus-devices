@@ -26,6 +26,13 @@ response uses `inference-opts/model_name`, defaulting to
 
 Set `tee=true` on a non-streaming request to include `sev_gpu@1.0` attestation data in the response body.
 
+The attestation `raw` field records the backend generation parameters (model,
+messages or prompt, sampling settings) and `tee`, not the HTTP message, and
+its SHA-256 is the NVIDIA report nonce. The OpenAI `user` identifier, HTTP
+headers (including `cf-*`, `x-forwarded-*`, `x-real-ip`, `user-agent`,
+cookies and credentials) and HyperBEAM's private peer `ip` are excluded.
+Prompts and completions are public once a receipt is published.
+
 `sev_gpu@1.0` loads its native resources from the Forge implementation archive.
 If the NIF is unavailable, it can use `/usr/bin/nvattest` to generate NVIDIA
 attestation claims and evidence. GPU inventory remains available without TEE.
@@ -33,7 +40,12 @@ attestation claims and evidence. GPU inventory remains available without TEE.
 ## Inference Receipts
 
 Use `inference_receipt@1.0/v1/chat/completions` to wrap the inference call.
-The device hashes the original request and response, collects
+The device executes, hashes and records an allowlisted request: the generation
+parameters above, `tee`, the execution metadata below, `path`, and a random
+`request-nonce`. Transport fields are dropped before execution, so the
+HashPath never commits to them. The nonce gives repeated prompts distinct
+HashPaths and keeps the attested step out of the result cache. The device
+hashes that request and the response, collects
 `gpu_inventory@1.0/report` and `inference_measurement@1.0/fresh`, and includes
 the signed receipt in the response JSON. Streaming is rejected by this device.
 

@@ -9,6 +9,21 @@
 
 -define(SERVER_PORT, "30001").
 
+%% OpenAI-compatible generation parameters relayed to the backend.
+-define(PARAM_KEYS, [
+    <<"model">>, <<"prompt">>, <<"messages">>, <<"max_tokens">>,
+    <<"temperature">>, <<"top_p">>, <<"n">>, <<"stream">>,
+    <<"stop">>, <<"presence_penalty">>, <<"frequency_penalty">>,
+    <<"logit_bias">>, <<"user">>, <<"seed">>, <<"top_k">>,
+    <<"repetition_penalty">>, <<"length_penalty">>, <<"early_stopping">>,
+    <<"tools">>, <<"tool_choice">>
+]).
+
+%% Generation inputs that may appear in the published attestation. `user' is
+%% a caller identifier that does not affect sampling, so it is withheld. Keep
+%% this list in sync with `dev_inference_receipt:execution_request/3'.
+-define(PUBLIC_PARAM_KEYS, ?PARAM_KEYS -- [<<"user">>]).
+
 %% Device API
 
 %% @doc Return information about the device.
@@ -180,7 +195,7 @@ do_inference_request(Base, Req, Opts, Path) ->
             Response = relay_to_backend(<<"POST">>, Path, Body, RequestOpts),
             
             case should_include_attestation(Req, RequestOpts) of
-                true -> add_attestation(Response, Base, Req, RequestOpts);
+                true -> add_attestation(Response, Base, Req, Body, RequestOpts);
                 false -> format_response(Response, Req, RequestOpts)
             end
     end.
@@ -220,14 +235,6 @@ should_include_attestation(Req, Opts) ->
     end.
 
 extract_inference_params(Req, Opts) ->
-    ParamKeys = [
-        <<"model">>, <<"prompt">>, <<"messages">>, <<"max_tokens">>,
-        <<"temperature">>, <<"top_p">>, <<"n">>, <<"stream">>,
-        <<"stop">>, <<"presence_penalty">>, <<"frequency_penalty">>,
-        <<"logit_bias">>, <<"user">>, <<"seed">>, <<"top_k">>,
-        <<"repetition_penalty">>, <<"length_penalty">>, <<"early_stopping">>,
-        <<"tools">>, <<"tool_choice">>
-    ],
     Params = lists:foldl(
         fun(Key, Acc) ->
             case hb_ao:get(Key, Req, not_found, Opts) of
@@ -236,9 +243,25 @@ extract_inference_params(Req, Opts) ->
             end
         end,
         #{},
-        ParamKeys
+        ?PARAM_KEYS
     ),
     hb_cache:ensure_all_loaded(Params, Opts).
+
+%% @doc Build the request recorded in the public attestation from the exact
+%% backend payload. The HTTP message that reached HyperBEAM also carries
+%% transport fields (`cf-connecting-ip', `x-forwarded-for', `x-real-ip',
+%% `user-agent', cookies, credentials) and the private peer `ip'; none of
+%% them is hashed into the nonce or published.
+public_request(Req, Body, Opts) ->
+    Params = try hb_json:decode(Body) of
+        Decoded when is_map(Decoded) -> maps:with(?PUBLIC_PARAM_KEYS, Decoded);
+        _ -> #{}
+    catch _:_ -> #{}
+    end,
+    case hb_ao:get(<<"tee">>, Req, not_found, Opts) of
+        not_found -> Params;
+        Tee -> Params#{<<"tee">> => Tee}
+    end.
 
 relay_to_backend(Method, DefaultPath, Body, Opts) ->
     Peer = maps:get(<<"agent-api-peer">>, Opts,
@@ -304,9 +327,11 @@ format_response({error, Error}, Req, _Opts) ->
 error_body(Error) when is_map(Error) -> hb_json:encode(Error);
 error_body(Error) -> hb_util:bin(Error).
 
-add_attestation({ok, Res}, Base, Req, Opts) ->
+add_attestation({ok, Res}, Base, Req, Body, Opts) ->
+    %% `raw' is published verbatim, and the NVIDIA report binds its SHA-256.
+    %% Record only the public generation request, never the HTTP message.
     MergedData = #{
-        <<"request">> => hb_private:reset(Req),
+        <<"request">> => public_request(Req, Body, Opts),
         <<"response">> => hb_private:reset(Res),
         <<"ao-core">> => ao_core_evidence(Base, Req, Res, Opts),
         <<"timestamp">> => os:system_time(millisecond),
@@ -353,7 +378,7 @@ add_attestation({ok, Res}, Base, Req, Opts) ->
                 <<"body">> => EnhancedBody
             }}
     end;
-add_attestation({error, Error}, _Base, Req, Opts) ->
+add_attestation({error, Error}, _Base, Req, _Body, Opts) ->
     format_response({error, Error}, Req, Opts).
 
 %% @doc Preserve the AO-Core execution link in the public attestation envelope.
@@ -413,6 +438,49 @@ receive_stream(ConnPid, StreamRef, Sender) ->
 
 -ifdef(TEST).
 
+%% TEST-NET addresses standing in for the caller and an intermediate proxy.
+-define(LEAK_NEEDLES, [
+    <<"cf-connecting-ip">>, <<"cf-ipcountry">>, <<"cf-ray">>, <<"cf-visitor">>,
+    <<"cdn-loop">>, <<"x-forwarded-for">>, <<"x-forwarded-proto">>,
+    <<"x-real-ip">>, <<"true-client-ip">>, <<"forwarded">>, <<"user-agent">>,
+    <<"cookie">>, <<"authorization">>,
+    <<"203.0.113.77">>, <<"198.51.100.20">>, <<"leak-test-agent">>,
+    <<"leak-test-cookie">>, <<"leak-test-token">>, <<"leak-test-user">>,
+    <<"a494f31a6eb0fd20">>
+]).
+
+%% An HTTP request as HyperBEAM receives it behind Cloudflare and Nginx.
+leaky_request() ->
+    #{
+        <<"accept">> => <<"*/*">>,
+        <<"cdn-loop">> => <<"cloudflare; loops=1">>,
+        <<"cf-connecting-ip">> => <<"203.0.113.77">>,
+        <<"cf-ipcountry">> => <<"SG">>,
+        <<"cf-ray">> => <<"a494f31a6eb0fd20-SIN">>,
+        <<"cf-visitor">> => <<"{\"scheme\":\"https\"}">>,
+        <<"x-forwarded-for">> => <<"203.0.113.77, 198.51.100.20">>,
+        <<"x-forwarded-proto">> => <<"http">>,
+        <<"x-real-ip">> => <<"203.0.113.77">>,
+        <<"true-client-ip">> => <<"203.0.113.77">>,
+        <<"forwarded">> => <<"for=203.0.113.77">>,
+        <<"user-agent">> => <<"leak-test-agent">>,
+        <<"cookie">> => <<"session=leak-test-cookie">>,
+        <<"authorization">> => <<"Bearer leak-test-token">>,
+        <<"user">> => <<"leak-test-user">>,
+        <<"host">> => <<"hb.apus.network">>,
+        <<"method">> => <<"POST">>,
+        <<"model">> => <<"test-model">>,
+        <<"messages">> => [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+        <<"max_tokens">> => 4,
+        <<"tee">> => true,
+        <<"priv">> => #{<<"ip">> => <<"203.0.113.77">>}
+    }.
+
+assert_no_transport_leak(Term) ->
+    Bin = term_to_binary(Term),
+    ?assertEqual([], [Needle || Needle <- ?LEAK_NEEDLES,
+        binary:match(Bin, Needle) =/= nomatch]).
+
 request_opts_promote_backend_route_test() ->
     Result = merge_request_opts(
         #{<<"agent-api-peer">> => <<"https://example.test">>},
@@ -423,5 +491,30 @@ request_opts_promote_backend_route_test() ->
         maps:get(<<"agent-api-peer">>, Result)),
     ?assertEqual(<<"/v1/chat/completions">>,
         maps:get(<<"agent-api-path">>, Result)).
+
+public_request_keeps_only_generation_inputs_test() ->
+    Req = leaky_request(),
+    Public = public_request(Req, prepare_request_body(Req, #{}), #{}),
+    ?assertEqual(
+        lists:sort([<<"model">>, <<"messages">>, <<"max_tokens">>, <<"tee">>]),
+        lists:sort(maps:keys(Public))),
+    assert_no_transport_leak(Public).
+
+attestation_raw_excludes_transport_fields_test() ->
+    Req = leaky_request(),
+    Body = prepare_request_body(Req, #{}),
+    Res = #{<<"status">> => 200, <<"content-type">> => <<"application/json">>,
+        <<"body">> => <<"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}">>},
+    {ok, #{<<"body">> := Enhanced} = Result} = add_attestation(
+        {ok, Res}, #{<<"device">> => <<"inference@1.0">>}, Req, Body, #{}),
+    assert_no_transport_leak(Result),
+    #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce}} =
+        hb_json:decode(Enhanced),
+    %% The NVIDIA report is requested for this nonce; it must still be the
+    %% digest of the published `raw' bytes.
+    ?assertEqual(Nonce, hb_util:to_hex(hb_crypto:sha256(Raw))),
+    ?assertMatch(#{<<"request">> := #{<<"messages">> :=
+            [#{<<"content">> := <<"hi">>}]}},
+        hb_json:decode(Raw)).
 
 -endif.
