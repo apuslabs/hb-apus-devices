@@ -9,6 +9,7 @@
 -implements(<<"docs@1.0">>).
 -specification("docs/spec/docs.md").
 -export([info/1, index/3, device/3, devices/3, spec/3, recipes/3, llms/3]).
+-export(['device-schema'/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -45,7 +46,8 @@ info(_) ->
                 <<"devices">>,
                 <<"spec">>,
                 <<"recipes">>,
-                <<"llms">>
+                <<"llms">>,
+                <<"device-schema">>
             ]
     }.
 
@@ -98,9 +100,8 @@ device(_Base, Req, Opts) ->
                 <<"</dd></dl></header>">>,
                 agent_box(<<"Agents">>, [
                     [<<"curl -s \"$NODE/~docs@1.0/spec?name=">>, Name, <<"\"">>],
-                    [<<"curl -s -H 'accept: application/json' "
-                       "-H 'accept-bundle: true' \"$NODE/~">>, Name,
-                       <<"/schema\"">>],
+                    [<<"curl -s \"$NODE/~docs@1.0/device-schema?name=">>, Name,
+                        <<"\"">>],
                     [<<"curl -s \"$NODE/~docs@1.0/recipes?name=">>, Name,
                         <<"\"">>]
                 ], Opts),
@@ -134,7 +135,9 @@ devices(_Base, _Req, Opts) ->
                 <<"links">> => #{
                     <<"page">> => <<"/~docs@1.0/device?name=", Name/binary>>,
                     <<"spec">> => <<"/~docs@1.0/spec?name=", Name/binary>>,
-                    <<"schema">> => <<"/~", Name/binary, "/schema">>,
+                    <<"schema">> =>
+                        <<"/~docs@1.0/device-schema?name=", Name/binary>>,
+                    <<"native-schema">> => <<"/~", Name/binary, "/schema">>,
                     <<"recipes">> =>
                         <<"/~docs@1.0/recipes?name=", Name/binary>>
                 }
@@ -155,6 +158,28 @@ spec(_Base, Req, Opts) ->
     with_device(Req, Opts, fun text_not_found/1,
         fun(#{ spec_body := Body }) ->
             {ok, text(<<"text/markdown; charset=utf-8">>, Body)}
+        end).
+
+%% @doc The device's extracted schema as JSON. `/~<device>/schema' serves the
+%% same data, but a gateway may route a device's paths elsewhere (on
+%% hb.apus.network, `/~inference@1.0/*' goes to the model runtime).
+-spec 'device-schema'(#{ _ => _ }, #{ name => binary(), _ => _ }, map()) ->
+    {ok, #{ body := binary(), status := integer(), _ => _ }}.
+'device-schema'(_Base, Req, Opts) ->
+    with_device(Req, Opts, fun text_not_found/1,
+        fun(#{ name := Name }) ->
+            case device_schema(Name, Opts) of
+                {ok, Schemas} ->
+                    {ok, text(<<"application/json">>, hb_json:encode(#{
+                        <<"device">> => Name,
+                        <<"functions">> => jsonable(Schemas)
+                    }))};
+                {error, Reason} ->
+                    {ok, (text(<<"application/json">>, hb_json:encode(#{
+                        <<"device">> => Name,
+                        <<"error">> => hb_util:bin(io_lib:format("~0P", [Reason, 8]))
+                    })))#{ <<"status">> => 500 }}
+            end
         end).
 
 %% @doc The device's recipes as one markdown document.
@@ -207,9 +232,10 @@ llms(_Base, _Req, Opts) ->
           "links.\n">>,
         <<"- `GET /~docs@1.0/spec?name=<device>`: specification "
           "(markdown).\n">>,
-        <<"- `GET /~<device>/schema` with `accept: application/json` and "
-          "`accept-bundle: true`: arguments and results extracted from the "
-          "implementation's `-spec`.\n">>,
+        <<"- `GET /~docs@1.0/device-schema?name=<device>`: arguments and results "
+          "extracted from the implementation's `-spec` (JSON). The device also "
+          "serves it at `/~<device>/schema` with `accept: application/json` and "
+          "`accept-bundle: true`, unless a gateway routes that path elsewhere.\n">>,
         <<"- `GET /~docs@1.0/recipes?name=<device>`: runnable curl examples "
           "(markdown).\n">>,
         <<"- `GET /~docs@1.0/index`: the same information as HTML.\n\n">>,
@@ -476,6 +502,11 @@ presence_badge(Other) -> esc(hb_util:bin(Other)).
 
 %% @doc A one-line rendering of an extracted type schema.
 type_label(#{ <<"kind">> := <<"wildcard">> }) -> <<"_">>;
+type_label(#{ <<"kind">> := <<"literal">>, <<"value">> := Value })
+        when is_binary(Value) ->
+    Value;
+type_label(#{ <<"kind">> := <<"literal">>, <<"value">> := Value }) when is_atom(Value) ->
+    atom_to_binary(Value, utf8);
 type_label(#{ <<"kind">> := <<"literal">>, <<"value">> := Value }) ->
     hb_util:bin(io_lib:format("~0p", [Value]));
 type_label(#{ <<"kind">> := <<"union">>, <<"members">> := Members }) ->
@@ -766,7 +797,7 @@ recipes_html(Recipes, _Status, Opts) ->
             <<"</code> &middot; <a href=\"https://arweave.net/">>, ID,
             <<"\" rel=\"noopener\">recipe transaction</a></p></header>"
               "<div class=\"md\">">>,
-            md_to_html(recipe_body(ID, Opts), 3),
+            md_to_html(strip_title(recipe_body(ID, Opts), Title), 3),
             <<"</div></article>">>
         ]
     ||
@@ -1136,7 +1167,9 @@ type_label_test() ->
             ]}
         ]
     },
-    ?assertEqual(<<"{ok, message} | {error, _}">>, iolist_to_binary(type_label(Ret))).
+    ?assertEqual(<<"{ok, message} | {error, _}">>, iolist_to_binary(type_label(Ret))),
+    ?assertEqual(<<"ok">>,
+        iolist_to_binary(type_label(#{ <<"kind">> => <<"literal">>, <<"value">> => <<"ok">> }))).
 
 markdown_spec_keeps_apostrophes_test() ->
     Spec = #{ <<"body">> => <<"# x@1.0\n\nThe `a` runtime's `b` value.\n">> },

@@ -18,5 +18,7 @@ curl -s -X POST "$HB/~inference@1.0/v1/chat/completions" \
 ```
 
 Expected: a `chat.completion` object whose `choices[0].message.content` is
-`pong`. Add `"tee": true` to the body to route the request through
-`inference_receipt@1.0` and receive GPU attestation and a receipt.
+`pong`. Add `"tee": true` to the body to run the request through HyperBEAM:
+the response then carries `attestation` from `sev_gpu@1.0`, and on
+`hb.apus.network` the explorer proxy uploads the attestation record to Arweave
+and returns its `load_dataitem_id`.

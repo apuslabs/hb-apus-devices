@@ -23,7 +23,8 @@ returns 200 with `verified=false`, empty `claims` and `evidences=null`.
 
 - `body`: the `evidences` JSON from a previous `generate`.
 
-Returns the binary `true` or `false`.
+Returns the binary `true` or `false`. Verification needs the NVAT NIF: when
+the node cannot load it, `verify` returns `nif_not_loaded`.
 
 ## Native assets
 

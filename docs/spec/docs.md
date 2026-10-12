@@ -16,9 +16,11 @@ published on Arweave. It describes only what this node can run.
 | `devices` | GET | JSON list of devices with spec IDs, signers, schema functions and recipe counts. |
 | `spec` | GET | The device's specification as `text/markdown`. Takes `name`. |
 | `recipes` | GET | The device's recipes as `text/markdown`. Takes `name`. |
+| `device-schema` | GET | The device's extracted schema as JSON. Takes `name`. |
 | `llms` | GET | Plain-text guide for agents: how to discover and call devices here. |
 
-Each device's own schema is at `/~<device>/schema`; this device links to it.
+Each device also serves its own schema at `/~<device>/schema`. `device-schema`
+returns the same data when a gateway routes a device's paths elsewhere.
 
 ## Recipes
 

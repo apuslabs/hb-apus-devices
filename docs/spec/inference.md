@@ -46,9 +46,13 @@ their status code.
 `https://hb.apus.network` sits behind the APUS explorer proxy. Requests to
 `/~inference@1.0/*` without `tee=true` are sent straight to the model runtime,
 with the device prefix removed (so `/~inference@1.0/v1/models` is the runtime's
-`/v1/models`). A request with `tee=true` is routed through HyperBEAM to
+`/v1/models`). A request with `tee=true` goes to HyperBEAM instead:
+`inference@1.0` adds `sev_gpu@1.0` attestation, and the proxy uploads the
+attestation record to Arweave and returns its `load_dataitem_id`. The legacy
+`/~inference@1.0/completions` path with `tee=true` is rewritten to
 `inference_receipt@1.0`. Call the node port directly to exercise the device
-itself.
+itself, and read this device's schema from
+`/~docs@1.0/device-schema?name=inference@1.0`.
 
 ## Related devices
 
