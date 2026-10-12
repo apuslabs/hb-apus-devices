@@ -10,3 +10,4 @@
 /logs/
 /vendor/permaweb-os/native/lapee_snp_nif/target/
 /vendor/permaweb-os/src/priv/
+cache-attested/

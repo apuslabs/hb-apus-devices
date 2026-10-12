@@ -1,7 +1,8 @@
-.PHONY: compile package verify test eunit-all local publish setup-inference setup-measurement setup-cc check-nvat-deps clean-publish
+.PHONY: compile package verify test eunit-all local publish recipes publish-recipes setup-inference setup-measurement setup-cc check-nvat-deps clean-publish
 
-HYPERBEAM_REF = 2c03978a3d201444bf7aada3eb35809153e41ef3
+HYPERBEAM_REF = 28baa3d27d70c4268f439587ba0398fb7771e0e3
 WALLET ?= $(HOME)/.aos.json
+PRELOADED_STORE ?= _build/preloaded-store
 
 DETERMINISTIC_INFERENCE_BRANCH ?= main
 DETERMINISTIC_INFERENCE_DIR = _build/deterministic-inference
@@ -28,7 +29,7 @@ setup-measurement:
 	bash scripts/setup-measurement.sh
 
 test:
-	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt
+	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt,dev_docs
 
 eunit-all:
 	rebar3 eunit-all
@@ -54,6 +55,13 @@ publish:
 		grep 'device publish:' "$$OUT" | sed -E 's/^.*device publish: /- /'; \
 	} > PUBLISH.md; \
 	rm -f "$$OUT"
+
+recipes:
+	escript scripts/publish-recipes.escript $(PRELOADED_STORE) $(WALLET)
+
+publish-recipes:
+	@test -f "$(WALLET)" || (echo "Missing wallet: $(WALLET)" && exit 1)
+	escript scripts/publish-recipes.escript $(PRELOADED_STORE) $(WALLET) --upload
 
 setup-python:
 	@if ! command -v python3 > /dev/null; then \

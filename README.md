@@ -9,9 +9,13 @@ External HyperBEAM Device Forge repository for Apus devices:
 - `inference_measurement@1.0`
 - `measurement@1.0`, `system@1.0`, `snp@1.0` (unchanged PermawebOS sources)
 - `inference_receipt@1.0`
+- `docs@1.0`: self-documentation for every loaded device
 
-This repository is pinned to the official HyperBEAM `edge` commit
-`2c03978a3d201444bf7aada3eb35809153e41ef3`.
+This repository is pinned to `apuslabs/HyperBEAM` branch `feat/self-docs-v011`
+(`28baa3d27d70c4268f439587ba0398fb7771e0e3`): upstream `cookbook/schema-vary`
+merged with the official `edge` commit `2c03978a3d201444bf7aada3eb35809153e41ef3`.
+It adds AO-Core `vary` and `/~<device>/schema`, extracted from each device's
+`-spec` declarations.
 
 ## Build
 
@@ -85,3 +89,23 @@ make publish
 ```
 
 The publish output is recorded in `PUBLISH.md`.
+
+## Self-documentation
+
+`docs@1.0` serves the node's device documentation at `/~docs@1.0/index`:
+the Device-Specification of every preloaded device, its schema (from the
+loaded implementation's `-spec`), and Device-Recipe messages from Arweave.
+Agents can start from `/~docs@1.0/llms`.
+
+Device specifications live in `docs/spec/` and are attached with
+`-specification(...)`. Recipes live in `docs/recipes/<device>/`. After building
+the preloaded store the node will run, sign and upload them:
+
+```sh
+make recipes            # sign and print IDs only
+make publish-recipes    # upload with $(WALLET)
+```
+
+`-spec` declarations now change runtime inputs: without `_ => _`, undeclared
+keys are removed before the function runs. Keep `_ => _` in request specs
+unless a key really should be dropped.
