@@ -9,7 +9,7 @@
 -implements(<<"docs@1.0">>).
 -specification("docs/spec/docs.md").
 -export([info/1, index/3, device/3, devices/3, spec/3, recipes/3, llms/3]).
--export(['device-schema'/3]).
+-export([device_schema/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -163,9 +163,9 @@ spec(_Base, Req, Opts) ->
 %% @doc The device's extracted schema as JSON. `/~<device>/schema' serves the
 %% same data, but a gateway may route a device's paths elsewhere (on
 %% hb.apus.network, `/~inference@1.0/*' goes to the model runtime).
--spec 'device-schema'(#{ _ => _ }, #{ name => binary(), _ => _ }, map()) ->
+-spec device_schema(#{ _ => _ }, #{ name => binary(), _ => _ }, map()) ->
     {ok, #{ body := binary(), status := integer(), _ => _ }}.
-'device-schema'(_Base, Req, Opts) ->
+device_schema(_Base, Req, Opts) ->
     with_device(Req, Opts, fun text_not_found/1,
         fun(#{ name := Name }) ->
             case device_schema(Name, Opts) of
