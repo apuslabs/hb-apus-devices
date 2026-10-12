@@ -1,7 +1,8 @@
 %%% @doc Receipt decorator for the existing OpenAI-compatible inference device.
 %%%
 %%% The decorator commits the original request/response transcript to the node
-%%% observation and includes the receipt in the public response JSON.
+%%% observation and includes the receipt in the public response JSON. Publishing
+%%% waits for the signed Arweave bundle to be posted and its chunks seeded.
 -module(dev_inference_receipt).
 -implements(<<"inference_receipt@1.0">>).
 -export([info/1, completions/3, chat/3, models/3, health/3, v1/3,
@@ -22,10 +23,9 @@ info(_Opts) ->
 
 %% @doc Decorate a non-streaming completion response with a receipt.
 completions(Base, Req, Opts) ->
-    %% The Explorer's public receipt endpoint is chat-completions. Route the
-    %% nested AO-Core request explicitly through the chat handler so the
-    %% llama.cpp backend receives `/v1/chat/completions`.
-    decorate(<<"v1/chat/completions">>, Base, Req, Opts).
+    %% The inference completion handler targets `/v1/chat/completions`.
+    %% Resolve one AO-Core step so its exact input can accompany the receipt.
+    decorate(<<"completions">>, Base, Req, Opts).
 
 %% @doc Preserve the chat route so `/chat/completions` reaches completions/3.
 chat(Base, Req, Opts) ->
@@ -77,31 +77,48 @@ publish(_Base, Req, Opts) ->
     %% handling and Arweave transport inside HyperBEAM.
     Unsigned = #{<<"data">> => Data,
         <<"content-type">> => <<"application/json">>},
-    PublishOpts = Opts#{hashpath => ignore},
+    PublishOpts = publish_opts(Opts),
     %% The ANS-104 commitment device returns the signed structured message
     %% expected by `bundler@1.0`; no second conversion is necessary.
     Signed = hb_message:commit(Unsigned, PublishOpts, <<"ans104@1.0">>),
     case hb_ao:resolve(
         #{<<"device">> => <<"bundler@1.0">>},
-        Signed#{<<"path">> => <<"item">>},
+        Signed#{<<"path">> => <<"item">>, <<"await">> => true},
         PublishOpts
     ) of
-        {ok, Response} ->
+        {ok, #{<<"id">> := ID, <<"bundle-id">> := BundleID,
+                <<"bundle-status">> := <<"complete">>} = Response} ->
             %% Keep the item ID at the response top level. AO-Core may expose
             %% the nested body through a cache link during HTTP encoding, so
             %% callers must not need to dereference that link just to index
             %% the Arweave data item.
-            ID = case Response of
-                Map when is_map(Map) -> maps:get(<<"id">>, Map, undefined);
-                _ -> undefined
-            end,
             {ok, #{<<"status">> => 200, <<"id">> => ID,
+                <<"bundle-id">> => BundleID,
+                <<"bundle-status">> => <<"complete">>,
                 <<"body">> => Response}};
+        {ok, _Response} ->
+            {error, #{<<"status">> => 502, <<"body">> => #{
+                <<"error">> => <<"receipt-publish-incomplete">>
+            }}};
         {error, Reason} ->
             {error, #{<<"status">> => 502, <<"body">> => #{
                 <<"error">> => <<"receipt-publish-failed">>,
                 <<"reason">> => json_safe(Reason)
             }}}
+    end.
+
+%% Only node configuration selects the publication wallet. Keep the node's
+%% identity key separate from its funded upload wallet, and key this bundler
+%% worker by the latter so an existing unfunded worker cannot be reused.
+publish_opts(Opts) ->
+    Base = Opts#{hashpath => ignore, <<"bundler-max-items">> => 1},
+    case hb_opts:get(<<"receipt-wallet-location">>, undefined, Opts) of
+        undefined -> Base;
+        Path ->
+            Wallet = hb:wallet(hb_util:list(Path)),
+            (maps:without([<<"http-server">>, http_server,
+                <<"priv-wallet">>, priv_wallet], Base))#{
+                <<"priv-wallet">> => Wallet}
     end.
 
 %% @doc Recompute AO-Core HashPath from the recorded message transcript.
@@ -208,19 +225,21 @@ decorate(Path, Base, Req, Opts) ->
         false ->
             case delegate(Path, Base, Req, Opts) of
                 {ok, Response} ->
-                    add_receipt(Response, Req, Opts, Base);
+                    add_receipt(Response, Req, Opts,
+                        #{<<"device">> => <<"inference@1.0">>},
+                        Req#{<<"path">> => Path});
                 {error, _} = Error -> Error;
                 Other -> {ok, Other}
             end
     end.
 
 %% @doc Attach the receipt after committing the original response body/data.
-add_receipt(Response, Req, Opts, Base) when is_map(Response) ->
+add_receipt(Response, Req, Opts, Base, ExecutionReq) when is_map(Response) ->
     Body = first_defined([
         hb_ao:get(<<"body">>, Response, undefined, Opts),
         hb_ao:get(<<"data">>, Response, <<>>, Opts)
     ]),
-    Receipt = make_receipt(Req, Body, Response, Opts, Base),
+    Receipt = make_receipt(Req, Body, Response, Opts, Base, ExecutionReq),
     %% HTTP response encoding serializes the `body` field and can omit
     %% sibling AO-Core keys. Put the receipt in the JSON body as well so the
     %% public API and the Arweave uploader carry the exact same evidence.
@@ -230,7 +249,7 @@ add_receipt(Response, Req, Opts, Base) when is_map(Response) ->
         <<"data">> => BodyWithReceipt,
         <<"receipt">> => Receipt
     })};
-add_receipt(Response, _Req, _Opts, _Base) ->
+add_receipt(Response, _Req, _Opts, _Base, _ExecutionReq) ->
     {ok, Response}.
 
 body_with_receipt(Body, Receipt, _Opts) when is_binary(Body) ->
@@ -261,7 +280,7 @@ json_safe(Tuple) when is_tuple(Tuple) ->
 json_safe(Value) -> Value.
 
 %% @doc Build and commit a request/response observation.
-make_receipt(Req, Body, Response, Opts, Base) ->
+make_receipt(Req, Body, Response, Opts, Base, ExecutionReq) ->
     Inventory = resolve_inventory(Req, Opts),
     Measurement = resolve_measurement(Req, Opts),
     RequestDigest = digest(hb_private:reset(Req)),
@@ -291,7 +310,7 @@ make_receipt(Req, Body, Response, Opts, Base) ->
         <<"system-measurement">> => Measurement
     },
     Receipt1 = ReceiptMeasurement#{
-        <<"ao-core">> => ao_core_evidence(Base, Req, Response, Opts),
+        <<"ao-core">> => ao_core_evidence(Base, ExecutionReq, Response, Opts),
         <<"device-chain">> => device_chain_evidence(Opts)
     },
     Committed = try hb_message:commit(Receipt1, Opts)
@@ -542,6 +561,38 @@ first_defined([undefined | Rest]) -> first_defined(Rest);
 first_defined([Value | _]) -> Value.
 
 -ifdef(TEST).
+
+publish_posts_signed_bundle_before_returning_test_() ->
+    {timeout, 20, fun() ->
+        Parent = self(),
+        {Server, NodeOpts} = hb_mock_server:start_arweave_gateway(#{
+            price => {200, <<"12345">>},
+            tx_anchor => {200, hb_util:encode(crypto:strong_rand_bytes(32))},
+            chunk => fun(_Req) ->
+                Parent ! {chunk_started, self()},
+                receive release_chunk -> {200, <<"OK">>} end
+            end
+        }),
+        try
+            Opts = NodeOpts#{<<"priv-wallet">> => ar_wallet:new(),
+                <<"store">> => hb_test_utils:test_store()},
+            spawn_link(fun() ->
+                Parent ! {published, publish(#{},
+                    #{<<"receipt">> => #{<<"test">> => <<"receipt">>}}, Opts)}
+            end),
+            Handler = receive {chunk_started, PID} -> PID
+                after 10000 -> error(no_signed_bundle_submitted) end,
+            receive {published, _} -> error(returned_before_seeding)
+                after 50 -> ok end,
+            Handler ! release_chunk,
+            receive {published, Result} ->
+                ?assertMatch({ok, #{<<"id">> := _, <<"bundle-id">> := _,
+                    <<"bundle-status">> := <<"complete">>}}, Result)
+                after 3000 -> error(no_publish_completion) end
+        after
+            hb_mock_server:stop(Server)
+        end
+    end}.
 
 request_digest_changes_with_body_test() ->
     ?assertNotEqual(digest(#{<<"x">> => 1}), digest(#{<<"x">> => 2})).

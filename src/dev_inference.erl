@@ -30,7 +30,7 @@ stop() ->
 
 %% @doc Handle completion requests.
 completions(Base, Req, Opts) ->
-    %% The deployed llama.cpp server exposes the OpenAI chat endpoint. The
+    %% The deployed SGLang server exposes the OpenAI chat endpoint. The
     %% receipt and Explorer routes both use this shape; keeping the backend
     %% path explicit also survives nested AO-Core v1 dispatch where the
     %% public `chat-mode` marker is not retained in the inner message.
@@ -52,15 +52,15 @@ chat(Base, Req, Opts) ->
 models(Base, _Req, Opts) ->
     Model = hb_ao:get(<<"inference-opts/model_name">>, Base,
         hb_ao:get(<<"inference-opts/model_name">>, Opts,
-            <<"MiniCPM5-2B-Q4_K_M.gguf">>, Opts), Opts),
+            <<"google/gemma-4-26B-A4B-it">>, Opts), Opts),
     Body = hb_json:encode(#{
         <<"object">> => <<"list">>,
         <<"data">> => [#{
             <<"id">> => Model,
             <<"object">> => <<"model">>,
-            <<"owned_by">> => <<"llamacpp">>,
+            <<"owned_by">> => <<"google">>,
             <<"root">> => Model,
-            <<"max_model_len">> => 4096
+            <<"max_model_len">> => 32768
         }]
     }),
     {ok, #{
