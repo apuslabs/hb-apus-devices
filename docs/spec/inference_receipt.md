@@ -16,7 +16,7 @@ signed `receipt` object added. Streaming requests are rejected.
 | `completions` | POST | Runs the completion and attaches the receipt. |
 | `models` | GET | Delegates to `inference@1.0/models` without creating a receipt. |
 | `health` | GET | Delegates to `inference@1.0/health` without creating a receipt. |
-| `verify-hashpath` | POST | Recomputes the HashPath of a recorded transcript. |
+| `verify-hashpath` | POST | Recomputes a recorded transcript's HashPath and compares it with the receipt's `ao-core.hashpath`. |
 | `publish` | POST | Signs a receipt as an ANS-104 item and submits it to `bundler@1.0`. |
 
 ## Request (`completions`)
@@ -35,14 +35,43 @@ hash the model.
 The runtime JSON plus `receipt`, which contains the request and response
 digests, the node address, the GPU inventory digest, the measurement
 envelope (or an observation-only result when hardware measurement is
-unavailable), `verification-input` messages, and the node's signature.
+unavailable), and the node's signature. Its `ao-core` object records
+`status` (`captured` or `not-captured`), the `hashpath` AO-Core assigned to
+the response, the `verification-input` messages, and `verification-status`
+(`verified`, `failed`, `not-captured` or `unavailable`). The node computes
+`verification-status` with the same comparison as `verify-hashpath`.
 
 ## `verify-hashpath`
 
-Send the receipt's `verification-input` (`base`, `request`, `response`,
-optional `rest`) or `verification-input-term`. Returns 200 with
-`verified=true|false`, `expected-hashpath` and `recomputed-hashpath`, or 422
-with `error=invalid-hashpath-transcript` when the transcript cannot be parsed.
+Send the receipt's `ao-core` object as `ao-core`. A whole receipt under
+`receipt`, or `verification-input` (`base`, `request`, `response`, optional
+`rest`) and `verification-input-term` at the top level, are also accepted.
+
+The device recomputes the HashPath from `base` and `request` and compares it
+with the HashPath the receipt recorded: `ao-core.hashpath`, and the
+response's private `priv.hashpath` when the transcript arrives as
+`verification-input-term`. HTTP requests cannot carry private keys, so a JSON
+`verification-input` sent without `ao-core.hashpath` has nothing to compare
+against. Every recorded value present must match.
+
+Returns 200 with `verified`, `expected-hashpath` (the recorded value),
+`hashpath-sources` and `recomputed-hashpath`. When `verified=false`, `reason`
+is `hashpath-mismatch`, `hashpath-chain-mismatch` (a `rest` step failed) or
+`hashpath-not-captured`.
+
+`hashpath-not-captured` means the input records no HashPath. This applies to
+receipts with `ao-core.status=not-captured` (for example, those issued by
+HyperBEAM 2c03978a). Such receipts cannot be HashPath-verified, and no
+`expected-hashpath` is returned; `recomputed-hashpath` is informational.
+
+Returns 422 with `error=invalid-hashpath-transcript` when the transcript
+cannot be parsed, or `error=hashpath-verification-input-missing` when no
+transcript is supplied.
+
+AO-Core rejects posted messages whose nested `device` keys the node cannot
+load before this device runs. For example, an older receipt's
+`cpu-tee.device=/dev/sev-guest` causes this. Post the `ao-core` object rather
+than the whole receipt.
 
 ## `publish`
 

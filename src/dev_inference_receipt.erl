@@ -166,41 +166,49 @@ publish_opts(Opts) ->
                 <<"priv-wallet">> => Wallet}
     end.
 
-%% @doc Recompute AO-Core HashPath from the recorded message transcript.
+%% @doc Recompute AO-Core HashPath from the recorded message transcript and
+%% compare it with the HashPath the receipt recorded.
 %%
 %% The receipt stores the exact base, request, and response messages under
-%% `ao-core.verification-input'. This endpoint deliberately calls the same
-%% hb_path verifier used by the resolver instead of trusting the recorded
-%% verification-status field.
+%% `ao-core.verification-input', and the HashPath AO-Core assigned to the
+%% response under `ao-core.hashpath'. The response's own copy is private
+%% (`priv.hashpath'); HyperBEAM drops private keys from HTTP requests, so it
+%% survives only in `verification-input-term'. Every recorded value that is
+%% present must equal the HashPath recomputed from the base and request.
 -spec verify_hashpath(
     #{ _ => _ },
-    #{ 'verification-input' => _, 'verification-input-term' => _, _ => _ },
+    #{
+        'ao-core' => _,
+        receipt => _,
+        'verification-input' => _,
+        'verification-input-term' => _,
+        _ => _
+    },
     map()
 ) -> {ok, #{ status := 200 | 422, body := _ }}.
 verify_hashpath(_Base, Req, Opts) ->
-    Input = first_defined([
-        hb_ao:get(<<"verification-input">>, Req, undefined, Opts),
-        hb_ao:get(<<"verification-input">>,
-            hb_ao:get(<<"body">>, Req, #{}, Opts), undefined, Opts),
-        hb_ao:get(<<"ao-core">>, Req, undefined, Opts)
-    ]),
-    TermInput = first_defined([
-        hb_ao:get(<<"verification-input-term">>, Req, undefined, Opts),
-        hb_ao:get(<<"verification-input-term">>,
-            hb_ao:get(<<"body">>, Req, #{}, Opts), undefined, Opts)
-    ]),
+    %% Callers can post the receipt's `ao-core' object, the whole receipt,
+    %% or the verification keys directly. JSON may also arrive under `body'.
+    Roots = [Root || Root <- [Req, get_map(<<"body">>, Req, Opts)],
+        is_map(Root)],
+    Sections = [Section ||
+        Root <- Roots,
+        Section <- [get_map(<<"ao-core">>, Root, Opts),
+            get_map(<<"ao-core">>, get_map(<<"receipt">>, Root, Opts), Opts)],
+        is_map(Section)],
+    Input = load_transcript(
+        find_evidence(<<"verification-input">>, Roots ++ Sections, Opts), Opts),
+    TermInput =
+        find_evidence(<<"verification-input-term">>, Roots ++ Sections, Opts),
     case verification_messages(TermInput, Input, Opts) of
         {ok, Base, Request, Response, Rest} ->
             try
-                Verified = hb_path:verify_hashpath(
-                    [Base, Request, Response | Rest], Opts),
-                {ok, #{<<"status">> => 200, <<"body">> => #{
-                    <<"verified">> => Verified,
-                    <<"expected-hashpath">> =>
-                        hb_path:from_message(hashpath, Response, Opts),
-                    <<"recomputed-hashpath">> =>
-                        hb_path:hashpath(Base, Request, Opts)
-                }}}
+                Recomputed = hb_path:hashpath(Base, Request, Opts),
+                Recorded = recorded_hashpaths(Sections, Response, Opts),
+                ChainVerified = Rest == [] orelse
+                    hb_path:verify_hashpath([Request, Response | Rest], Opts),
+                {ok, #{<<"status">> => 200, <<"body">> =>
+                    hashpath_result(Recomputed, Recorded, ChainVerified)}}
             catch _:_ ->
                 {ok, #{<<"status">> => 422, <<"body">> => #{
                     <<"verified">> => false,
@@ -230,6 +238,70 @@ verification_messages(_Term, #{<<"base">> := Base,
         restore_json_links(Response), restore_json_links(Rest)};
 verification_messages(_, _, _Opts) ->
     {error, <<"receipt does not contain recorded AO-Core messages">>}.
+
+%% The JSON codec stores the nested transcript messages of an HTTP request as
+%% lazy cache links; load them so the messages can be hashed. Links recorded
+%% inside the transcript itself are JSON objects until restore_json_links/1.
+load_transcript(Input, Opts) when is_map(Input) ->
+    try hb_cache:ensure_all_loaded(Input, Opts)
+    catch _:_ -> Input
+    end;
+load_transcript(Input, _Opts) -> Input.
+
+%% The HashPath values the receipt recorded for the response, with their
+%% source. `ao-core.hashpath' is public; the response's private copy is only
+%% present when the transcript arrives as an Erlang term.
+recorded_hashpaths(Sections, Response, Opts) ->
+    Public = find_evidence(<<"hashpath">>, Sections, Opts),
+    Private = maps:get(<<"hashpath">>, hb_private:from_message(Response),
+        undefined),
+    [{Source, Hashpath} ||
+        {Source, Hashpath} <- [{<<"ao-core.hashpath">>, Public},
+            {<<"response.priv.hashpath">>, Private}],
+        is_binary(Hashpath)].
+
+%% A receipt with no recorded HashPath (`ao-core.status=not-captured') has
+%% nothing to compare against, so it is reported as unverified rather than
+%% compared with an unrelated value such as the response ID.
+hashpath_result(Recomputed, [], _ChainVerified) ->
+    #{
+        <<"verified">> => false,
+        <<"reason">> => <<"hashpath-not-captured">>,
+        <<"recomputed-hashpath">> => Recomputed
+    };
+hashpath_result(Recomputed, [{_, Expected} | _] = Recorded, ChainVerified) ->
+    Matches = lists:all(fun({_, Hashpath}) -> Hashpath =:= Recomputed end,
+        Recorded),
+    Result = #{
+        <<"verified">> => Matches andalso ChainVerified,
+        <<"expected-hashpath">> => Expected,
+        <<"hashpath-sources">> => [Source || {Source, _} <- Recorded],
+        <<"recomputed-hashpath">> => Recomputed
+    },
+    case {Matches, ChainVerified} of
+        {true, true} -> Result;
+        {false, _} -> Result#{<<"reason">> => <<"hashpath-mismatch">>};
+        {true, false} -> Result#{<<"reason">> => <<"hashpath-chain-mismatch">>}
+    end.
+
+%% Read posted evidence as plain data. hb_ao:get/4 would dispatch to any
+%% `device' key inside a posted receipt (e.g. a TEE report's device path).
+get_map(Key, Msg, Opts) ->
+    case evidence_value(Key, Msg, Opts) of
+        Value when is_map(Value) -> Value;
+        _ -> undefined
+    end.
+
+find_evidence(Key, Scopes, Opts) ->
+    first_defined([evidence_value(Key, Scope, Opts) || Scope <- Scopes]).
+
+evidence_value(Key, Msg, Opts) when is_map(Msg) ->
+    try hb_maps:get(Key, Msg, undefined, Opts) of
+        null -> undefined;
+        Value -> Value
+    catch _:_ -> undefined
+    end;
+evidence_value(_Key, _Msg, _Opts) -> undefined.
 
 restore_json_links(#{<<"type">> := <<"link">>, <<"id">> := ID} = Map) ->
     {link, ID, maps:get(<<"metadata">>, Map, #{})};
@@ -407,13 +479,18 @@ ao_core_evidence(Base, Req, Response, Opts) ->
         <<"verification-input-term">> => hb_util:encode(term_to_binary(
             #{base => Base, request => Req, response => Response},
             [compressed])),
-        <<"verification-status">> => hashpath_verification(Base, Req, Response, Opts)
+        <<"verification-status">> =>
+            hashpath_verification(Base, Req, Hashpath, Opts)
     }.
 
-hashpath_verification(Base, Req, Response, Opts) ->
-    case catch hb_path:verify_hashpath([Base, Req, Response], Opts) of
-        true -> <<"verified">>;
-        false -> <<"failed">>;
+%% Compare against the captured HashPath, as verify-hashpath does. The
+%% response's private copy may be absent when the value came from the
+%% inference device's public evidence.
+hashpath_verification(_Base, _Req, undefined, _Opts) -> <<"not-captured">>;
+hashpath_verification(Base, Req, Hashpath, Opts) ->
+    case catch hb_path:hashpath(Base, Req, Opts) of
+        Hashpath -> <<"verified">>;
+        Other when is_binary(Other) -> <<"failed">>;
         _ -> <<"unavailable">>
     end.
 
@@ -678,5 +755,144 @@ verify_hashpath_rejects_invalid_transcript_test() ->
         #{<<"verification-input-term">> => Term}, #{}),
     ?assertEqual(422, Status),
     ?assertEqual(false, maps:get(<<"verified">>, Result)).
+
+%% Transcript recorded on the H100 guest on 2026-10-12 by HyperBEAM
+%% feat/self-docs-v011 @ 28baa3d2 (`ao-core.status=captured').
+-define(CAPTURED_HASHPATH, <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
+    "hDjPRer0jfXtHMDhJIRBozzWusYX6-sed0_5HEH2NFk">>).
+
+captured_transcript() ->
+    #{
+        <<"base">> => #{<<"device">> => <<"inference@1.0">>},
+        <<"request">> => #{
+            <<"accept">> => <<"*/*">>,
+            <<"accept-bundle">> => false,
+            <<"content-type">> => <<"application/json">>,
+            <<"host">> => <<"127.0.0.1">>,
+            <<"max_tokens">> => 8,
+            <<"messages">> => [#{
+                <<"content">> => <<"Reply with the single word: pong">>,
+                <<"role">> => <<"user">>
+            }],
+            <<"method">> => <<"POST">>,
+            <<"model">> => <<"google/gemma-4-26B-A4B-it">>,
+            <<"path">> => <<"completions">>,
+            <<"priv">> => #{<<"ip">> => <<"127.0.0.1">>},
+            <<"temperature">> => 0,
+            <<"user-agent">> => <<"curl/8.5.0">>
+        },
+        <<"response">> => #{
+            <<"body">> => <<"{\"id\":\"8e78675fae60435ea0f3c88182e3eec0\","
+                "\"object\":\"chat.completion\",\"created\":1791805877,"
+                "\"model\":\"google/gemma-4-26B-A4B-it\",\"choices\":[{"
+                "\"index\":0,\"message\":{\"role\":\"assistant\","
+                "\"content\":\"pong\",\"reasoning_content\":null,"
+                "\"tool_calls\":null},\"logprobs\":null,"
+                "\"finish_reason\":\"stop\",\"matched_stop\":106}],"
+                "\"usage\":{\"prompt_tokens\":20,\"total_tokens\":22,"
+                "\"completion_tokens\":2,\"prompt_tokens_details\":null,"
+                "\"reasoning_tokens\":0},\"metadata\":{"
+                "\"weight_version\":\"default\"}}">>,
+            <<"content-type">> => <<"application/json">>,
+            <<"priv">> => #{<<"hashpath">> => ?CAPTURED_HASHPATH},
+            <<"status">> => 200
+        }
+    }.
+
+%% Encode a request the way an HTTP client sends it: JSON through the
+%% `json@1.0' codec, with private keys removed on ingress.
+http_request(Msg) ->
+    hb_private:reset(hb_message:convert(hb_json:encode(json_safe(Msg)),
+        <<"structured@1.0">>, <<"json@1.0">>, #{})).
+
+verify_http(Msg) ->
+    {ok, #{<<"status">> := 200, <<"body">> := Result}} =
+        verify_hashpath(#{}, http_request(Msg), #{}),
+    Result.
+
+verify_hashpath_accepts_captured_receipt_test() ->
+    AOCore = #{
+        <<"status">> => <<"captured">>,
+        <<"hashpath">> => ?CAPTURED_HASHPATH,
+        <<"verification-input">> => captured_transcript()
+    },
+    Result = verify_http(#{<<"ao-core">> => AOCore}),
+    ?assertEqual(true, maps:get(<<"verified">>, Result)),
+    ?assertEqual(?CAPTURED_HASHPATH, maps:get(<<"expected-hashpath">>, Result)),
+    ?assertEqual(?CAPTURED_HASHPATH,
+        maps:get(<<"recomputed-hashpath">>, Result)),
+    ?assertEqual([<<"ao-core.hashpath">>],
+        maps:get(<<"hashpath-sources">>, Result)),
+    %% The whole receipt can be posted as well.
+    ?assertEqual(true, maps:get(<<"verified">>,
+        verify_http(#{<<"receipt">> => #{<<"ao-core">> => AOCore}}))),
+    %% A changed request no longer reproduces the recorded HashPath.
+    #{<<"request">> := Request} = Transcript = captured_transcript(),
+    Tampered = verify_http(#{<<"ao-core">> => AOCore#{
+        <<"verification-input">> => Transcript#{
+            <<"request">> => Request#{<<"max_tokens">> => 9}}}}),
+    ?assertEqual(false, maps:get(<<"verified">>, Tampered)),
+    ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, Tampered)),
+    %% The response's private HashPath does not survive HTTP, so the
+    %% transcript alone carries nothing to compare with.
+    Bare = verify_http(#{<<"verification-input">> => captured_transcript()}),
+    ?assertEqual(false, maps:get(<<"verified">>, Bare)),
+    ?assertEqual(<<"hashpath-not-captured">>, maps:get(<<"reason">>, Bare)).
+
+verify_hashpath_checks_every_recorded_copy_test() ->
+    #{<<"base">> := Base, <<"request">> := Request,
+        <<"response">> := Response} = captured_transcript(),
+    Term = hb_util:encode(term_to_binary(
+        #{base => Base, request => Request, response => Response})),
+    Verify = fun(Hashpath) ->
+        {ok, #{<<"body">> := Result}} = verify_hashpath(#{}, #{
+            <<"ao-core">> => #{
+                <<"hashpath">> => Hashpath,
+                <<"verification-input-term">> => Term
+            }
+        }, #{}),
+        Result
+    end,
+    Agreeing = Verify(?CAPTURED_HASHPATH),
+    ?assertEqual(true, maps:get(<<"verified">>, Agreeing)),
+    ?assertEqual([<<"ao-core.hashpath">>, <<"response.priv.hashpath">>],
+        maps:get(<<"hashpath-sources">>, Agreeing)),
+    Conflicting = Verify(<<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/other">>),
+    ?assertEqual(false, maps:get(<<"verified">>, Conflicting)),
+    ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, Conflicting)).
+
+%% Receipts from HyperBEAM 2c03978a recorded no HashPath.
+verify_hashpath_reports_not_captured_receipt_test() ->
+    #{<<"response">> := Response} = Transcript = captured_transcript(),
+    Result = verify_http(#{<<"ao-core">> => #{
+        <<"status">> => <<"not-captured">>,
+        <<"verification-input">> => Transcript#{
+            <<"response">> => maps:remove(<<"priv">>, Response)}
+    }}),
+    ?assertEqual(false, maps:get(<<"verified">>, Result)),
+    ?assertEqual(<<"hashpath-not-captured">>, maps:get(<<"reason">>, Result)),
+    ?assertEqual(?CAPTURED_HASHPATH,
+        maps:get(<<"recomputed-hashpath">>, Result)),
+    ?assertNot(maps:is_key(<<"expected-hashpath">>, Result)).
+
+%% The receipt's own verification-status uses the same comparison, including
+%% when the HashPath comes from the inference device's public evidence.
+receipt_verification_status_uses_captured_hashpath_test() ->
+    #{<<"base">> := Base, <<"request">> := Request} = captured_transcript(),
+    Response = fun(Evidence) ->
+        #{<<"status">> => 200, <<"body">> =>
+            hb_json:encode(#{<<"ao-core">> => Evidence})}
+    end,
+    Captured = ao_core_evidence(Base, Request,
+        Response(#{<<"hashpath">> => ?CAPTURED_HASHPATH}), #{}),
+    ?assertEqual(<<"captured">>, maps:get(<<"status">>, Captured)),
+    ?assertEqual(<<"verified">>, maps:get(<<"verification-status">>, Captured)),
+    ?assertEqual(true, maps:get(<<"verified">>, verify_http(
+        #{<<"ao-core">> => maps:without([<<"verification-input-term">>],
+            Captured)}))),
+    NotCaptured = ao_core_evidence(Base, Request, Response(#{}), #{}),
+    ?assertEqual(<<"not-captured">>, maps:get(<<"status">>, NotCaptured)),
+    ?assertEqual(<<"not-captured">>,
+        maps:get(<<"verification-status">>, NotCaptured)).
 
 -endif.

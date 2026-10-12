@@ -57,12 +57,24 @@ hash alone does not establish which model executed.
 
 ## HashPath Verification
 
-`inference_receipt@1.0/verify-hashpath` accepts the recorded
-`verification-input` messages (`base`, `request`, `response`, and optional
-`rest`), or the receipt's `verification-input-term` snapshot. It delegates to
-`hb_path:verify_hashpath/2`. A different base or request fails the check;
-matching only the request ID is insufficient. Invalid transcripts return
-status 422 with `verified=false`.
+Post the receipt's `ao-core` object to
+`inference_receipt@1.0/verify-hashpath` as `ao-core`. The device recomputes
+the HashPath from the recorded `base` and `request` messages with
+`hb_path:hashpath/3`. It then compares the result with the HashPath recorded
+in the receipt, `ao-core.hashpath`. A different base or request fails the
+check; matching only the request ID is insufficient.
+
+The response's own copy of the HashPath is private (`priv.hashpath`).
+HyperBEAM drops private keys from HTTP requests, so this copy is only checked
+when the transcript is sent as `verification-input-term`. A JSON
+`verification-input` without `ao-core.hashpath` returns `verified=false` with
+`reason=hashpath-not-captured`. Do not compare against the response message
+ID; it is not a HashPath.
+
+Receipts with `ao-core.status=not-captured`, issued before HashPath capture
+(HyperBEAM 2c03978a), record no HashPath. They return `verified=false` with
+`reason=hashpath-not-captured` and cannot be HashPath-verified. Invalid
+transcripts return status 422 with `verified=false`.
 
 HashPath verification checks the recorded execution-history commitment. Model
 execution and hardware evidence require their respective checks.
