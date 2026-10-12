@@ -81,6 +81,7 @@ publish(Path, Specs, Upload, Opts) ->
         <<"slug">> => Slug,
         <<"title">> => Title,
         <<"source-path">> => list_to_binary(Path),
+        <<"published-at">> => integer_to_binary(erlang:system_time(second)),
         <<"body">> => Body
     },
     Signed = hb_message:commit(Message, Opts, <<"ans104@1.0">>),

@@ -16,10 +16,11 @@ HB=${HB:-https://hb.apus.network}
 curl -s -X POST "$HB/~inference_receipt@1.0/v1/chat/completions" \
   -H 'content-type: application/json' \
   -d '{"model":"google/gemma-4-26B-A4B-it","messages":[{"role":"user","content":"Reply with the single word: pong"}],"max_tokens":8,"temperature":0}' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"]); print(sorted(d.get("receipt", {}).keys()))'
+  | python3 -c 'import json,sys; t=sys.stdin.read(); d=json.loads(t[t.index("{"):t.rindex("}")+1]); print(d["choices"][0]["message"]["content"]); print(d["receipt"]["ao-core"]["status"], sorted(d["receipt"])[:6])'
 ```
 
-Expected: the answer `pong`, then the receipt's keys, including the request
-and response digests and the node signature. On `hb.apus.network` the
+Expected: the answer `pong`, then `captured` (the AO-Core HashPath of the
+execution is recorded) and the first receipt keys. The node may return the
+JSON as the only part of a multipart body; the parser above accepts both. On `hb.apus.network` the
 explorer proxy also uploads the receipt to Arweave and adds
 `load_dataitem_id`, so each run creates one Arweave data item.

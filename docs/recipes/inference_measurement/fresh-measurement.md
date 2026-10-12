@@ -6,16 +6,22 @@ slug: fresh-measurement
 
 Bind your own nonce and the node's GPU inventory into a fresh measurement.
 
+Prerequisites:
+- HyperBEAM node reachable with `HB=${HB:-https://hb.apus.network}`.
+- `curl`, `openssl` and `python3`.
+
 ```bash
 HB=${HB:-https://hb.apus.network}
 NONCE=$(openssl rand -hex 32)
 curl -s -H 'accept: application/json' -H 'accept-bundle: true' \
   "$HB/~inference_measurement@1.0/fresh?nonce=$NONCE" \
-  | python3 -c 'import json,sys; b=json.load(sys.stdin)["body"]; print(b["purpose"], b["integration-mode"], b["gpu-inventory-digest"])'
+  | python3 -c 'import json,sys; b=json.load(sys.stdin)["body"]; c=b.get("apus-gpu-composition", b); print(b.get("type"), b.get("measurement-device", "-"), c.get("integration-mode"), c.get("gpu-inventory-digest"))'
 ```
 
-Expected: `fresh`, the integration mode, and the GPU inventory digest (the
-same value as `gpu_inventory@1.0/digest`). The body also carries `cpu-tee`,
-`gpu-tee`, the full `gpu-inventory` and the node's commitment. When the host
-measurement device is unavailable the mode is `observation-only` and
-`failure` explains why.
+Expected, when the host measurement device works: `lapee-measurement snp@1.0
+measurement-nonce <digest>`. The body then carries the AMD SEV-SNP `evidence`
+(report and certificate chain) and `apus-gpu-composition.nonce-binding` with
+your nonce and the GPU inventory digest. When hardware measurement is
+unavailable the device falls back to `apus-gpu-system-measurement -
+observation-only <digest>` and `failure` explains why. The digest equals
+`gpu_inventory@1.0/digest`.

@@ -550,7 +550,7 @@ fetch_recipes(Catalog, Opts) ->
 assign_recipes(Catalog, Recipes, Extra) ->
     maps:from_list(
         [
-            {Name, sort_recipes(
+            {Name, sort_recipes(latest(SpecID,
                 [
                     R#{ official => lists:member(Owner, Signers ++ Extra) }
                 ||
@@ -559,11 +559,34 @@ assign_recipes(Catalog, Recipes, Extra) ->
                     For =:= SpecID orelse
                         (Primary =:= Name andalso
                             lists:member(Owner, Signers ++ Extra))
-                ])}
+                ]))}
         ||
             #{ name := Name, spec_id := SpecID, signers := Signers } <- Catalog
         ]
     ).
+
+%% @doc Keep one recipe per author and slug: a republished recipe replaces
+%% the older one. Prefer the recipe bound to the current specification, then
+%% the newest `published-at'.
+latest(SpecID, Recipes) ->
+    Ranked =
+        lists:sort(
+            fun(A, B) -> rank(SpecID, A) >= rank(SpecID, B) end,
+            Recipes
+        ),
+    element(2, lists:foldl(
+        fun(R = #{ owner := Owner, slug := Slug }, {Seen, Acc}) ->
+            case lists:member({Owner, Slug}, Seen) of
+                true -> {Seen, Acc};
+                false -> {[{Owner, Slug} | Seen], [R | Acc]}
+            end
+        end,
+        {[], []},
+        Ranked
+    )).
+
+rank(SpecID, #{ for := For, published := Published }) ->
+    {For =:= SpecID, Published}.
 
 sort_recipes(Recipes) ->
     lists:sort(
@@ -590,12 +613,24 @@ recipe(Node) ->
         for => maps:get(<<"recipe-for-device">>, Tags, <<>>),
         primary => maps:get(<<"primary-device">>, Tags, <<>>),
         title => maps:get(<<"title">>, Tags, maps:get(<<"slug">>, Tags, ID)),
+        slug => maps:get(<<"slug">>, Tags, ID),
+        published => published_at(Tags, Node),
         confirmed =>
             case maps:get(<<"block">>, Node, null) of
                 #{ <<"timestamp">> := TS } when is_integer(TS) -> true;
                 _ -> false
             end
     }.
+
+published_at(Tags, Node) ->
+    case catch binary_to_integer(maps:get(<<"published-at">>, Tags, <<>>)) of
+        Seconds when is_integer(Seconds) -> Seconds;
+        _ ->
+            case maps:get(<<"block">>, Node, null) of
+                #{ <<"timestamp">> := TS } when is_integer(TS) -> TS;
+                _ -> 0
+            end
+    end.
 
 trusted_signers(Catalog, Opts) ->
     lists:usort(
@@ -1124,18 +1159,21 @@ assign_recipes_test() ->
         #{ name => <<"a@1.0">>, spec_id => <<"SPEC-A">>, signers => [<<"S">>] },
         #{ name => <<"b@1.0">>, spec_id => <<"SPEC-B">>, signers => [<<"S">>] }
     ],
+    R = fun(ID, Owner, For, Primary, Slug, Published) ->
+        #{ id => ID, owner => Owner, for => For, primary => Primary,
+            title => Slug, slug => Slug, published => Published,
+            confirmed => true }
+    end,
     Recipes = [
-        #{ id => <<"1">>, owner => <<"S">>, for => <<"SPEC-A">>,
-            primary => <<"a@1.0">>, title => <<"x">>, confirmed => true },
-        #{ id => <<"2">>, owner => <<"X">>, for => <<"SPEC-A">>,
-            primary => <<"a@1.0">>, title => <<"y">>, confirmed => true },
-        #{ id => <<"3">>, owner => <<"S">>, for => <<"OLD-SPEC">>,
-            primary => <<"b@1.0">>, title => <<"z">>, confirmed => false },
-        #{ id => <<"4">>, owner => <<"X">>, for => <<"OLD-SPEC">>,
-            primary => <<"b@1.0">>, title => <<"w">>, confirmed => true }
+        R(<<"1">>, <<"S">>, <<"SPEC-A">>, <<"a@1.0">>, <<"x">>, 10),
+        R(<<"2">>, <<"X">>, <<"SPEC-A">>, <<"a@1.0">>, <<"y">>, 10),
+        R(<<"3">>, <<"S">>, <<"OLD-SPEC">>, <<"b@1.0">>, <<"z">>, 10),
+        R(<<"4">>, <<"X">>, <<"OLD-SPEC">>, <<"b@1.0">>, <<"w">>, 10),
+        R(<<"5">>, <<"S">>, <<"OLD-SPEC">>, <<"a@1.0">>, <<"x">>, 20),
+        R(<<"6">>, <<"S">>, <<"OLD-SPEC">>, <<"b@1.0">>, <<"z">>, 30)
     ],
     Assigned = assign_recipes(Catalog, Recipes, []),
     ?assertEqual([{<<"1">>, true}, {<<"2">>, false}],
         [{ID, O} || #{ id := ID, official := O } <- maps:get(<<"a@1.0">>, Assigned)]),
-    ?assertEqual([{<<"3">>, true}],
+    ?assertEqual([{<<"6">>, true}],
         [{ID, O} || #{ id := ID, official := O } <- maps:get(<<"b@1.0">>, Assigned)]).

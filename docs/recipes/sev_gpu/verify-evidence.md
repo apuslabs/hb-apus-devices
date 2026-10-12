@@ -14,5 +14,7 @@ EVIDENCE=$(curl -s "$HB/~sev_gpu@1.0/generate?nonce=$NONCE" \
 curl -s -X POST "$HB/~sev_gpu@1.0/verify" --data-binary "$EVIDENCE"
 ```
 
-Expected: `true` when the evidence verifies, `false` otherwise (including
-when `generate` returned no evidence).
+Expected: `true` when the evidence verifies and `false` when it does not.
+Verification runs in the NVAT NIF only: when the node cannot load it, the
+response is `nif_not_loaded` (status 200), which is what `hb.apus.network`
+returns while its GPU driver and NVML library versions differ.
