@@ -4,6 +4,7 @@
 %%% claim and it keeps volatile runtime values out of the static digest.
 -module(dev_gpu_inventory).
 -implements(<<"gpu_inventory@1.0">>).
+-specification("docs/spec/gpu_inventory.md").
 -export([info/1, report/3, digest/3, snapshot/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -19,12 +20,22 @@ info(_Opts) ->
     }.
 
 %% @doc Return stable GPU and PCIe facts with a canonical inventory digest.
+-spec report(
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, #{ status := integer(), body := _ }} | {error, _}.
 report(Base, Req, Opts) ->
     Root = inventory_root(Base, Req, Opts),
     Report = collect_report(Root, Opts),
     {ok, #{<<"status">> => 200, <<"body">> => Report}}.
 
 %% @doc Return the stable digest and the inventory it commits to.
+-spec digest(
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, #{ status := integer(), body := _ }} | {error, _}.
 digest(Base, Req, Opts) ->
     {ok, #{<<"body">> := Report}} = report(Base, Req, Opts),
     {ok, #{
@@ -38,6 +49,11 @@ digest(Base, Req, Opts) ->
     }}.
 
 %% @doc Return volatile runtime facts as a lower-trust observation.
+-spec snapshot(
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, #{ status := integer(), body := _ }} | {error, _}.
 snapshot(Base, Req, Opts) ->
     Root = inventory_root(Base, Req, Opts),
     {Rows, Sources, Errors} = nvidia_snapshot(Root),

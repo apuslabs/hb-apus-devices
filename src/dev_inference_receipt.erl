@@ -5,6 +5,7 @@
 %%% waits for the signed Arweave bundle to be posted and its chunks seeded.
 -module(dev_inference_receipt).
 -implements(<<"inference_receipt@1.0">>).
+-specification("docs/spec/inference_receipt.md").
 -export([info/1, completions/3, chat/3, models/3, health/3, v1/3,
     verify_hashpath/3, publish/3]).
 -include_lib("hb/include/hb.hrl").
@@ -22,12 +23,36 @@ info(_Opts) ->
     }.
 
 %% @doc Decorate a non-streaming completion response with a receipt.
+-spec completions(
+    #{ _ => _ },
+    #{
+        body => _,
+        model => _,
+        messages => _,
+        stream => _,
+        'model-sha256' => _,
+        'model-source' => _,
+        'model-tx' => _,
+        'runtime-build-hash' => _,
+        'inference-profile' => _,
+        'workload-manifest-id' => _,
+        'measurement-mode' => _,
+        'gpu-inventory-root' => _,
+        _ => _
+    },
+    map()
+) -> {ok, _} | {error, _}.
 completions(Base, Req, Opts) ->
     %% The inference completion handler targets `/v1/chat/completions`.
     %% Resolve one AO-Core step so its exact input can accompany the receipt.
     decorate(<<"completions">>, Base, Req, Opts).
 
 %% @doc Preserve the chat route so `/chat/completions` reaches completions/3.
+-spec chat(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, #{ _ => _ }}.
 chat(Base, Req, Opts) ->
     {ok, hb_util:deep_merge(
         Base,
@@ -39,14 +64,29 @@ chat(Base, Req, Opts) ->
     )}.
 
 %% @doc Delegate model discovery without creating a workload receipt.
+-spec models(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 models(Base, Req, Opts) -> delegate(<<"models">>, Base, Req, Opts).
 
 %% @doc Delegate health checks without creating a workload receipt.
+-spec health(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 health(Base, Req, Opts) -> delegate(<<"health">>, Base, Req, Opts).
 
 %% @doc Preserve the OpenAI v1 route so nested `/chat/completions` dispatch
 %% reaches this decorator's chat export instead of attaching a receipt to the
 %% intermediate route envelope.
+-spec v1(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, #{ _ => _ }}.
 v1(Base, Req, Opts) ->
     {ok, hb_util:deep_merge(
         Base,
@@ -61,6 +101,11 @@ v1(Base, Req, Opts) ->
 %% @doc Publish a completed receipt through HyperBEAM's internal bundler.
 %% The receipt device owns the upload boundary; callers only receive the
 %% bundler result and never handle a wallet or Arweave signature.
+-spec publish(
+    #{ _ => _ },
+    #{ receipt => _, body => _, _ => _ },
+    map()
+) -> {ok, #{ status := 200, id := binary(), _ => _ }} | {error, _}.
 publish(_Base, Req, Opts) ->
     Receipt = first_defined([
         hb_ao:get(<<"receipt">>, Req, undefined, Opts),
@@ -127,6 +172,11 @@ publish_opts(Opts) ->
 %% `ao-core.verification-input'. This endpoint deliberately calls the same
 %% hb_path verifier used by the resolver instead of trusting the recorded
 %% verification-status field.
+-spec verify_hashpath(
+    #{ _ => _ },
+    #{ 'verification-input' => _, 'verification-input-term' => _, _ => _ },
+    map()
+) -> {ok, #{ status := 200 | 422, body := _ }}.
 verify_hashpath(_Base, Req, Opts) ->
     Input = first_defined([
         hb_ao:get(<<"verification-input">>, Req, undefined, Opts),

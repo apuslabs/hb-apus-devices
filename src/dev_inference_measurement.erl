@@ -5,6 +5,7 @@
 %%% On stock HyperBEAM it returns an explicitly lower-trust observation.
 -module(dev_inference_measurement).
 -implements(<<"inference_measurement@1.0">>).
+-specification("docs/spec/inference_measurement.md").
 -export([info/1, boot/3, fresh/3, verify/3, snapshot/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("kernel/include/file.hrl").
@@ -21,12 +22,27 @@ info(_Opts) ->
     }.
 
 %% @doc Create or return the cached GPU-aware boot measurement.
+-spec boot(
+    #{ 'measurement-mode' => _, 'gpu-inventory-root' => _, _ => _ },
+    #{ 'measurement-mode' => _, 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 boot(Base, Req, Opts) -> compose(boot, Base, Req, Opts).
 
 %% @doc Create a fresh GPU-aware measurement for the supplied nonce.
+-spec fresh(
+    #{ 'measurement-mode' => _, 'gpu-inventory-root' => _, _ => _ },
+    #{ nonce => _, 'measurement-mode' => _, 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 fresh(Base, Req, Opts) -> compose(fresh, Base, Req, Opts).
 
 %% @doc Verify a base measurement or an observation-only envelope.
+-spec verify(
+    #{ _ => _ },
+    #{ envelope => _, body => _, _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 verify(_Base, Req, Opts) ->
     Envelope = first_defined([
         hb_ao:get(<<"envelope">>, Req, undefined, Opts),
@@ -44,6 +60,11 @@ verify(_Base, Req, Opts) ->
     end.
 
 %% @doc Return the lower-trust runtime GPU snapshot.
+-spec snapshot(
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    #{ 'gpu-inventory-root' => _, _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 snapshot(Base, Req, Opts) ->
     hb_ao:resolve(
         #{<<"device">> => <<"gpu_inventory@1.0">>},

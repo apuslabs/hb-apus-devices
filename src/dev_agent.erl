@@ -19,6 +19,7 @@
 %%%     #{}).
 -module(dev_agent).
 -implements(<<"agent@1.0">>).
+-specification("docs/spec/agent.md").
 -export([info/1, run/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -38,6 +39,20 @@ info(_Msg) ->
 
 %% @doc Entry point for the agent. Reads user prompt from the request,
 %% builds initial messages, and starts the ReAct loop.
+-spec run(
+    #{ _ => _ },
+    #{
+        'agent-user-prompt' => _,
+        'agent-model' => _,
+        'agent-max-iterations' => _,
+        'agent-disable-tools' => _,
+        'agent-api-peer' => _,
+        'agent-api-path' => _,
+        'agent-api-key' => _,
+        _ => _
+    },
+    map()
+) -> {ok, #{ 'agent-answer' := _, 'agent-iterations' := _, _ => _ }}.
 run(Base, Req, Opts) ->
     UserPrompt = hb_ao:get(<<"agent-user-prompt">>, Req, <<"Hello">>, Opts),
     SystemPrompt = default_system_prompt(),

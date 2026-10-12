@@ -8,6 +8,7 @@
 %%% The NIF handles SDK initialization internally, so no explicit setup is required.
 -module(dev_sev_gpu).
 -implements(<<"sev_gpu@1.0">>).
+-specification("docs/spec/sev_gpu.md").
 -export([info/1, generate/3, verify/3]).
 -on_load(init/0).
 -include_lib("hb/include/hb.hrl").
@@ -74,7 +75,11 @@ info(_) ->
 %%
 %% Input message M2 should contain:
 %% - nonce: Hex-encoded nonce for attestation freshness
--spec generate(map(), map(), map()) -> {ok, binary()} | {error, term()}.
+-spec generate(
+    #{ _ => _ },
+    #{ nonce => _, _ => _ },
+    map()
+) -> {ok, binary()} | {error, term()}.
 generate(_M1, M2, Opts) ->
     Nonce = hb_ao:get(nonce, M2, ?TEST_MOCK_NONCE, Opts),
     case safe_collect_evidence(Nonce) of
@@ -98,7 +103,11 @@ generate(_M1, M2, Opts) ->
 %% - {ok, <<"true">>} if verification succeeds
 %% - {ok, <<"false">>} if verification fails
 %% - {error, Reason} on error
--spec verify(map(), map(), map()) -> {ok, binary()} | {error, term()}.
+-spec verify(
+    #{ _ => _ },
+    #{ body => _, _ => _ },
+    map()
+) -> {ok, binary()} | {error, term()}.
 verify(_M1, M2, _Opts) ->
     EvidenceJSON = maps:get(<<"body">>, M2, <<>>),
     case safe_verify_evidence(EvidenceJSON) of

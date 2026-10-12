@@ -2,6 +2,7 @@
 %%% This module provides an interface to a local Python-based inference server.
 -module(dev_inference).
 -implements(<<"inference@1.0">>).
+-specification("docs/spec/inference.md").
 -export([info/1, completions/3, chat/3, models/3, health/3, v1/3, stop/0]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
@@ -29,6 +30,23 @@ stop() ->
     end.
 
 %% @doc Handle completion requests.
+-spec completions(
+    #{ _ => _ },
+    #{
+        body => _,
+        model => _,
+        messages => _,
+        prompt => _,
+        max_tokens => _,
+        temperature => _,
+        top_p => _,
+        stream => _,
+        tee => _,
+        tools => _,
+        _ => _
+    },
+    map()
+) -> {ok, _} | {error, _}.
 completions(Base, Req, Opts) ->
     %% The deployed SGLang server exposes the OpenAI chat endpoint. The
     %% receipt and Explorer routes both use this shape; keeping the backend
@@ -38,6 +56,11 @@ completions(Base, Req, Opts) ->
     do_inference_request(Base, Req, Opts, Path).
 
 %% @doc Handle chat completion requests.
+-spec chat(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, #{ _ => _ }}.
 chat(Base, Req, Opts) ->
     {ok, hb_util:deep_merge(
         Base, 
@@ -49,6 +72,11 @@ chat(Base, Req, Opts) ->
     )}.
 
 %% @doc Handle models request.
+-spec models(
+    #{ 'inference-opts' => _, _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, #{ status := 200, 'content-type' := binary(), body := binary() }}.
 models(Base, _Req, Opts) ->
     Model = hb_ao:get(<<"inference-opts/model_name">>, Base,
         hb_ao:get(<<"inference-opts/model_name">>, Opts,
@@ -70,6 +98,11 @@ models(Base, _Req, Opts) ->
     }}.
 
 %% @doc Handle v1 API requests.
+-spec v1(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, #{ _ => _ }}.
 v1(Base, Req, Opts) ->
     {ok, hb_util:deep_merge(
         Base, 
@@ -80,6 +113,11 @@ v1(Base, Req, Opts) ->
     )}.
 
 %% @doc Check the health of the inference server.
+-spec health(
+    #{ _ => _ },
+    #{ _ => _ },
+    map()
+) -> {ok, _} | {error, _}.
 health(_Base, _Req, Opts) ->
     forward_health_check(Opts).
 
