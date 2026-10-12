@@ -3,7 +3,7 @@
 %%
 %% Usage (from the repository root, after `rebar3 compile`):
 %%   escript scripts/publish-recipes.escript PRELOADED_STORE WALLET [--upload]
-%%       [--expect ADDRESS] [--bundler URL]
+%%       [--expect ADDRESS] [--bundler URL] [--only PATH-SUBSTRING]
 %%
 %% Each recipe's `recipe-for-device' is the device's specification ID in
 %% PRELOADED_STORE, so the store must be the one the node will run. Without
@@ -43,7 +43,14 @@ main([StoreDir, KeyPath | Flags]) ->
                 <<"prometheus">> => false
             },
             Specs = spec_ids(StoreDir, SeedOpts),
-            Recipes = lists:sort(filelib:wildcard("docs/recipes/*/*.md")),
+            Only = flag("--only", Flags, ""),
+            Recipes =
+                [
+                    P
+                ||
+                    P <- lists:sort(filelib:wildcard("docs/recipes/*/*.md")),
+                    string:find(P, Only) =/= nomatch
+                ],
             io:format("Signer: ~s~nStore: ~s~nBundler: ~s~nMode: ~s~n~n",
                 [Address, StoreDir, Bundler,
                     if Upload -> "upload"; true -> "dry-run" end]),
@@ -57,7 +64,7 @@ main([StoreDir, KeyPath | Flags]) ->
 main(_) ->
     io:format(standard_error,
         "Usage: escript scripts/publish-recipes.escript PRELOADED_STORE WALLET "
-        "[--upload] [--expect ADDRESS] [--bundler URL]~n", []),
+        "[--upload] [--expect ADDRESS] [--bundler URL] [--only PATH]~n", []),
     halt(1).
 
 publish(Path, Specs, Upload, Opts) ->
@@ -180,16 +187,22 @@ load_wallet(KeyPath) ->
     end.
 
 write_ledger(Results, Address, true) ->
+    Ledger = "docs/recipes/PUBLISHED.md",
+    Header =
+        case filelib:is_regular(Ledger) of
+            true -> [];
+            false -> "# Published Device Recipes\n"
+        end,
     Lines = [
-        "# Published Device Recipes\n\n",
-        "- Signer: ", Address, "\n",
-        "- Published at: ", calendar:system_time_to_rfc3339(erlang:system_time(second),
+        Header,
+        "\n## ", calendar:system_time_to_rfc3339(erlang:system_time(second),
             [{offset, "Z"}]), "\n\n",
+        "- Signer: ", Address, "\n\n",
         "| Recipe ID | Device | Slug | Spec ID |\n|---|---|---|---|\n",
         [["| ", ID, " | ", D, " | ", S, " | ", Spec, " |\n"]
             || #{ id := ID, device := D, slug := S, spec := Spec } <- Results]
     ],
-    ok = file:write_file("docs/recipes/PUBLISHED.md", Lines);
+    ok = file:write_file(Ledger, Lines, [append]);
 write_ledger(_Results, _Address, false) ->
     ok.
 
