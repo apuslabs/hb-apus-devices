@@ -22,24 +22,38 @@ main([StoreDir, KeyPath | Flags]) ->
     Bundler = list_to_binary(flag("--bundler", Flags, binary_to_list(?DEFAULT_BUNDLER))),
     Wallet = load_wallet(KeyPath),
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    AddressStr = binary_to_list(Address),
     case flag("--expect", Flags, undefined) of
         undefined -> ok;
-        Expected when Expected =:= binary_to_list(Address) -> ok;
+        AddressStr -> ok;
         Expected -> fail("wallet ~s is ~s, expected ~s", [KeyPath, Address, Expected])
     end,
-    Opts = #{
-        <<"priv-wallet">> => Wallet,
-        <<"bundler-ans104">> => Bundler,
-        <<"prometheus">> => false
+    Bootstrap = #{
+        <<"bootstrap-device-src">> => [<<"_build/default/lib/hb/src/preloaded">>],
+        <<"commitment-device">> => <<"ans104@1.0">>
     },
-    Specs = spec_ids(StoreDir),
-    Recipes = lists:sort(filelib:wildcard("docs/recipes/*/*.md")),
-    io:format("Signer: ~s~nStore: ~s~nBundler: ~s~nMode: ~s~n~n",
-        [Address, StoreDir, Bundler, if Upload -> "upload"; true -> "dry-run" end]),
-    Results = [publish(Path, Specs, Upload, Opts) || Path <- Recipes],
-    write_ledger(Results, Address, Upload),
-    io:format("~n~p recipes ~s.~n",
-        [length(Results), if Upload -> "uploaded"; true -> "signed (dry run)" end]);
+    %% Codec devices are packaged in this HyperBEAM version. Outside a node,
+    %% the Forge seed compiles them from source so messages can be signed.
+    hb_forge_seed:with_forge_bootstrap(
+        Bootstrap,
+        fun(SeedOpts) ->
+            Opts = SeedOpts#{
+                <<"priv-wallet">> => Wallet,
+                <<"bundler-ans104">> => Bundler,
+                <<"prometheus">> => false
+            },
+            Specs = spec_ids(StoreDir, SeedOpts),
+            Recipes = lists:sort(filelib:wildcard("docs/recipes/*/*.md")),
+            io:format("Signer: ~s~nStore: ~s~nBundler: ~s~nMode: ~s~n~n",
+                [Address, StoreDir, Bundler,
+                    if Upload -> "upload"; true -> "dry-run" end]),
+            Results = [publish(Path, Specs, Upload, Opts) || Path <- Recipes],
+            write_ledger(Results, Address, Upload),
+            io:format("~n~p recipes ~s.~n",
+                [length(Results),
+                    if Upload -> "uploaded"; true -> "signed (dry run)" end])
+        end
+    );
 main(_) ->
     io:format(standard_error,
         "Usage: escript scripts/publish-recipes.escript PRELOADED_STORE WALLET "
@@ -50,7 +64,7 @@ publish(Path, Specs, Upload, Opts) ->
     Device = <<(list_to_binary(filename:basename(filename:dirname(Path))))/binary, "@1.0">>,
     SpecID =
         case maps:find(Device, Specs) of
-            {ok, ID} -> ID;
+            {ok, Found} -> Found;
             error -> fail("~s: ~s is not in the preloaded store", [Path, Device])
         end,
     {Meta, Body} = parse(Path),
@@ -113,7 +127,7 @@ upload(Msg, Opts) ->
     end.
 
 %% @doc Device name -> specification ID from a copy of the preloaded store.
-spec_ids(StoreDir) ->
+spec_ids(StoreDir, SeedOpts) ->
     Tmp = filename:join("/tmp", "publish-recipes-" ++ os:getpid()),
     ok = filelib:ensure_dir(filename:join(Tmp, "x")),
     {ok, _} = file:copy(filename:join(StoreDir, "data.mdb"), filename:join(Tmp, "data.mdb")),
@@ -122,7 +136,7 @@ spec_ids(StoreDir) ->
         <<"name">> => list_to_binary(Tmp),
         <<"capacity">> => 1073741824
     },
-    Opts = #{ <<"store">> => [Store] },
+    Opts = SeedOpts#{ <<"store">> => [Store] },
     ok = hb_store:start(Store, #{}, Opts),
     {ok, Index} = hb_cache:read(?INDEX_KEY, Opts),
     Specs =
