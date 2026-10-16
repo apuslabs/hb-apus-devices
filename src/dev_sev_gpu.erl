@@ -14,7 +14,9 @@
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--define(TEST_MOCK_NONCE, <<"da4a06c3604a5fac8aa0b4aaf5a6354cdd0dc7c193299bc3464f30b5cbfb931a">>).
+%% A fixed nonce for the unit tests, which must not depend on the machine.
+%% It is only ever passed explicitly by a test: `generate/3' never defaults to it.
+-define(TEST_NONCE, <<"da4a06c3604a5fac8aa0b4aaf5a6354cdd0dc7c193299bc3464f30b5cbfb931a">>).
 
 %% NIF stubs - these are replaced by the actual NIF functions when loaded
 -spec collect_evidence_nif(binary()) -> {ok, binary()} | {error, binary()}.
@@ -73,15 +75,33 @@ info(_) ->
 %% - eat: Detached Entity Attestation Token
 %% - verified: Boolean indicating local verification success
 %%
-%% Input message M2 should contain:
-%% - nonce: Hex-encoded nonce for attestation freshness
+%% Input message M2 must contain:
+%% - nonce: Hex-encoded nonce for attestation freshness. Required: a request
+%%   without one returns `{error, nonce_required}`, and a non-hex value
+%%   returns `{error, invalid_nonce}'. The device never substitutes a
+%%   default, which would make the report replayable.
 -spec generate(
     #{ _ => _ },
     #{ nonce => _, _ => _ },
     map()
 ) -> {ok, binary()} | {error, term()}.
 generate(_M1, M2, Opts) ->
-    Nonce = hb_ao:get(nonce, M2, ?TEST_MOCK_NONCE, Opts),
+    %% A nonce binds the attestation to this request. Without one the report
+    %% would be replayable, so a caller must always supply it.
+    Nonce = hb_ao:get(<<"nonce">>, M2, undefined, Opts),
+    case Nonce of
+        undefined ->
+            {error, nonce_required};
+        _ ->
+            case valid_nonce(Nonce) of
+                false ->
+                    {error, invalid_nonce};
+                true ->
+                    safe_generate(Nonce, Opts)
+            end
+    end.
+
+safe_generate(Nonce, _Opts) ->
     case safe_collect_evidence(Nonce) of
         {ok, ResultJSON} ->
             {ok, ResultJSON};
@@ -184,8 +204,20 @@ claims_verified(_) -> false.
 %% Unit Tests
 %% ============================================================================
 
+%% A caller that omits the nonce must not receive a report: the device used to
+%% substitute a fixed nonce, so `/~sev_gpu@1.0/generate' answered with
+%% verified=true and a replayable report.
+nonce_is_required_test() ->
+    ?assertEqual({error, nonce_required}, generate(#{}, #{}, #{})),
+    ?assertEqual({error, nonce_required}, generate(#{}, #{<<"other">> => 1}, #{})).
+
+%% A non-nonce value is rejected before any evidence is collected.
+invalid_nonce_is_rejected_test() ->
+    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => <<"not-hex">>}, #{})),
+    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => <<>>}, #{})).
+
 generate_test() ->
-    case generate(#{}, #{nonce => ?TEST_MOCK_NONCE}, #{}) of
+    case generate(#{}, #{nonce => ?TEST_NONCE}, #{}) of
         {ok, ResultJSON} ->
             ?assert(is_binary(ResultJSON)),
             ?assert(byte_size(ResultJSON) > 0),
@@ -204,7 +236,7 @@ generate_test() ->
     end.
 
 verify_test() ->
-    case generate(#{}, #{nonce => ?TEST_MOCK_NONCE}, #{}) of
+    case generate(#{}, #{nonce => ?TEST_NONCE}, #{}) of
         {ok, ResultJSON} ->
             case hb_json:decode(ResultJSON) of
                 #{<<"evidences">> := Evidences} ->

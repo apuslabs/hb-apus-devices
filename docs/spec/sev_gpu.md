@@ -12,12 +12,22 @@ SDK (NVAT), with a fallback to `/usr/bin/nvattest`.
 
 ## `generate`
 
-- `nonce`: hex freshness value (64 hex characters for NVAT).
+- `nonce`: hex freshness value (64 hex characters for NVAT). Required.
 
 Returns JSON with `evidences` (serialized evidence for a remote verifier),
 `claims`, `eat` (detached Entity Attestation Token), `verified` and the echoed
-`nonce`. When the GPU or SDK cannot produce evidence the response still
-returns 200 with `verified=false`, empty `claims` and `evidences=null`.
+`nonce`.
+
+`verified` is this node's own check of the evidence it just collected; it is not
+proof to a third party. A remote verifier must call `verify` and must confirm
+the echoed `nonce` is the one it chose, because the report is only as fresh as
+that nonce.
+
+Errors: `nonce_required` when the request carries no nonce, `invalid_nonce`
+when it is not hex, and `{nvat_error, Reason}` when the GPU or SDK cannot
+produce evidence. The device never substitutes a default nonce; a request
+without one would otherwise return a replayable report that still reads
+`verified=true`.
 
 ## `verify`
 
