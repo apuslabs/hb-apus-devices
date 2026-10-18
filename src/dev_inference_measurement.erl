@@ -495,13 +495,16 @@ evidence_nonce(Envelope, Opts) ->
             undefined
     end.
 
-%% @doc Verify an observation envelope: the node's signature and the nonce
-%% binding of its GPU evidence.
+%% @doc Verify an observation envelope: the signatures over its committed
+%% keys and the nonce binding of its GPU evidence. Keys outside the
+%% commitments, such as the `status' an HTTP response adds, do not take part
+%% in the signature check.
 verify_observation(Envelope, Opts) ->
-    Signers = signers(Envelope, Opts),
+    Committed = committed_keys_only(Envelope, Opts),
+    Signers = signers(Committed, Opts),
     SignatureVerified =
         Signers =/= [] andalso
-            (try hb_message:verify(Envelope, signers, Opts) catch _:_ -> false end) =:= true,
+            (try hb_message:verify(Committed, signers, Opts) catch _:_ -> false end) =:= true,
     GpuTee = hb_maps:get(<<"gpu-tee">>, Envelope, #{}, Opts),
     BindingVerified = binding_verified(Envelope, GpuTee, Opts),
     #{
@@ -510,9 +513,19 @@ verify_observation(Envelope, Opts) ->
         <<"signers">> => Signers,
         <<"nonce-binding-verified">> => BindingVerified,
         <<"gpu-tee-verified">> => gpu_evidence_verified(GpuTee, Opts),
-        <<"observation-id">> => message_id(Envelope, signed, Opts),
+        <<"observation-id">> => message_id(Committed, signed, Opts),
         <<"provenance-class">> => <<"host-observed">>
     }.
+
+%% @doc The envelope restricted to the keys its commitments cover, or the
+%% envelope itself when it cannot be restricted.
+committed_keys_only(Envelope, Opts) ->
+    try hb_message:with_only_committed(Envelope, Opts) of
+        {ok, Committed} when is_map(Committed) -> Committed;
+        _ -> Envelope
+    catch
+        _:_ -> Envelope
+    end.
 
 %% @doc `Holder' carries `nonce-binding' and `gpu-inventory-digest'. The
 %% binding must name that digest, and available GPU evidence must carry the
@@ -684,8 +697,14 @@ reason_text(#{ <<"error">> := Error }) when is_binary(Error) ->
 reason_text(_) ->
     <<"unavailable">>.
 
+%% @doc An error with its HTTP status and the JSON body `{"error": Code}',
+%% delivered inline.
 error_response(Status, Code) ->
-    {error, #{ <<"status">> => Status, <<"body">> => #{ <<"error">> => Code } }}.
+    {error, #{
+        <<"status">> => Status,
+        <<"content-type">> => <<"application/json">>,
+        <<"body">> => hb_json:encode(#{ <<"error">> => Code })
+    }}.
 
 first_defined([]) -> undefined;
 first_defined([undefined | Rest]) -> first_defined(Rest);
@@ -770,6 +789,14 @@ base_stub() ->
         end
     }.
 
+%% The HTTP status and the `error' code of an error result, whose body is
+%% inline JSON.
+error_of({error, #{
+        <<"status">> := Status,
+        <<"content-type">> := <<"application/json">>,
+        <<"body">> := Body }}) when is_binary(Body) ->
+    {Status, maps:get(<<"error">>, hb_json:decode(Body))}.
+
 stub_opts(Extra) ->
     maps:merge(
         #{
@@ -811,13 +838,13 @@ nonce_is_validated_test() ->
     ?assertEqual({ok, <<"abc">>}, request_nonce(#{ <<"nonce">> => <<"abc">> }, #{})),
     ?assertEqual({error, <<"invalid-nonce">>},
         request_nonce(#{ <<"nonce">> => binary:copy(<<"a">>, 1025) }, #{})),
-    ?assertMatch({error, #{ <<"status">> := 400 }},
-        fresh(#{}, #{ <<"nonce">> => <<>> }, stub_opts(#{}))),
+    ?assertEqual({400, <<"invalid-nonce">>},
+        error_of(fresh(#{}, #{ <<"nonce">> => <<>> }, stub_opts(#{})))),
     %% The nonce enters a JSON encoding, so it must be UTF-8 text.
     ?assertEqual({error, <<"invalid-nonce">>},
         request_nonce(#{ <<"nonce">> => <<255, 0>> }, #{})),
-    ?assertMatch({error, #{ <<"status">> := 400, <<"body">> := #{ <<"error">> := <<"invalid-nonce">> } }},
-        boot(#{}, #{ <<"nonce">> => <<"caf", 233>> }, stub_opts(#{}))),
+    ?assertEqual({400, <<"invalid-nonce">>},
+        error_of(boot(#{}, #{ <<"nonce">> => <<"caf", 233>> }, stub_opts(#{})))),
     ?assertEqual({ok, <<"caf", 195, 169>>},
         request_nonce(#{ <<"nonce">> => <<"caf", 195, 169>> }, #{})).
 
@@ -1069,12 +1096,49 @@ observation_verification_test() ->
     ?assertMatch({ok, #{ <<"verified">> := true, <<"signature-verified">> := true }},
         verify(#{}, #{ <<"body">> => JSON }, Opts)).
 
+%% An HTTP response adds a top-level `status' outside the commitments. The
+%% envelope still verifies, as a message and in its JSON form.
+observation_with_http_status_verifies_test() ->
+    Opts = stub_opts(#{}),
+    {ok, Envelope} = fresh(#{}, #{ <<"nonce">> => <<"request-5">> }, Opts),
+    {ok, Expected} = verify(#{}, #{ <<"envelope">> => Envelope }, Opts),
+    WithStatus = Envelope#{ <<"status">> => 200 },
+    {ok, FromMessage} = verify(#{}, #{ <<"envelope">> => WithStatus }, Opts),
+    ?assertMatch(
+        #{
+            <<"verified">> := true,
+            <<"signature-verified">> := true,
+            <<"nonce-binding-verified">> := true
+        },
+        FromMessage
+    ),
+    ?assertEqual(maps:get(<<"signers">>, Expected), maps:get(<<"signers">>, FromMessage)),
+    ?assertEqual(maps:get(<<"observation-id">>, Expected),
+        maps:get(<<"observation-id">>, FromMessage)),
+    JSON = hb_json:encode(
+        (hb_json:decode(hb_message:convert(Envelope, <<"json@1.0">>, Opts)))#{
+            <<"status">> => 200
+        }
+    ),
+    ?assertMatch({ok, #{ <<"verified">> := true, <<"signature-verified">> := true }},
+        verify(#{}, #{ <<"body">> => JSON }, Opts)),
+    %% A changed signed key still fails with the status present.
+    Tampered = WithStatus#{ <<"gpu-inventory-digest">> => <<"other">> },
+    ?assertMatch({ok, #{ <<"verified">> := false, <<"signature-verified">> := false }},
+        verify(#{}, #{ <<"envelope">> => Tampered }, Opts)).
+
 verify_rejects_unknown_input_test() ->
-    ?assertMatch({error, #{ <<"status">> := 400 }}, verify(#{}, #{}, #{})),
-    ?assertMatch({error, #{ <<"status">> := 400 }},
-        verify(#{}, #{ <<"body">> => <<"not json">> }, #{})),
-    ?assertMatch({error, #{ <<"status">> := 400 }},
-        verify(#{}, #{ <<"envelope">> => #{ <<"type">> => <<"other">> } }, #{})).
+    ?assertEqual({400, <<"envelope-required">>}, error_of(verify(#{}, #{}, #{}))),
+    ?assertEqual({400, <<"invalid-envelope">>},
+        error_of(verify(#{}, #{ <<"body">> => <<"not json">> }, #{}))),
+    ?assertEqual({400, <<"invalid-envelope">>},
+        error_of(verify(#{}, #{ <<"envelope">> => #{ <<"type">> => <<"other">> } }, #{}))).
+
+snapshot_rejects_another_result_test() ->
+    Inventory = #{ snapshot => fun(_, _, _) -> {ok, #{ <<"type">> => <<"other">> }} end },
+    ?assertEqual({502, <<"invalid-snapshot">>},
+        error_of(snapshot(#{}, #{},
+            stub_opts(#{ <<"inference-measurement-inventory-device">> => Inventory })))).
 
 snapshot_returns_the_inventory_snapshot_test() ->
     ?assertMatch({ok, #{ <<"type">> := <<"apus-gpu-runtime-snapshot">> }},

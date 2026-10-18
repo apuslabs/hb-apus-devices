@@ -1,6 +1,6 @@
 # `inference_measurement@1.0` — GPU-aware system measurement
 
-- **Depends-on:** `gpu_inventory@1.0`, `sev_gpu@1.0`, `measurement@1.0`, `message@1.0`
+- **Depends-on:** `gpu_inventory@1.0` (default inventory device: `report`, `snapshot`), `sev_gpu@1.0` (default GPU TEE device: `generate`, `verify`), `measurement@1.0` (default base measurement device: `info`, `boot`, `fresh`, `verify`), `message@1.0` (signers, commitments, verification and IDs of envelopes), `httpsig@1.0` (the node's default commitment device: it signs observation envelopes and verifies their signatures), `json@1.0` (decoding an envelope posted to `verify` as JSON)
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
 
@@ -165,13 +165,16 @@ envelopes have `purpose` `boot`.
      Return `verified`, `base-verification` (the base device's result),
      `nonce-binding-verified`, `nonce-binding-hardware-bound`,
      `gpu-tee-verified` and `provenance-class` = `host-measured-subject`.
-  3. **`apus-gpu-system-measurement`.** Check that the envelope has at least
-     one signer and that the commitments of its signers verify
-     (`signature-verified`), and check the binding (§5.5) of the envelope
-     against its `gpu-tee`. Return `verified` = both, `signature-verified`,
-     `signers`, `nonce-binding-verified`, `gpu-tee-verified`,
-     `observation-id` (the envelope's signed ID) and `provenance-class` =
-     `host-observed`.
+  3. **`apus-gpu-system-measurement`.** Restrict the envelope to the keys
+     its commitments cover (the envelope as given when it cannot be
+     restricted). Check that it has at least one signer and that the
+     commitments of its signers verify over those keys
+     (`signature-verified`); keys outside the commitments, such as the
+     `status` an HTTP response adds, do not affect this check. Check the
+     binding (§5.5) of the envelope as given against its `gpu-tee`. Return
+     `verified` = both, `signature-verified`, `signers`,
+     `nonce-binding-verified`, `gpu-tee-verified`, `observation-id` (the
+     envelope's signed ID) and `provenance-class` = `host-observed`.
   4. `gpu-tee-verified` is true when `gpu-tee` is available, has non-empty
      `evidences` and a `nonce`, and the GPU TEE device's `verify` returns
      `true` for those evidences and that nonce. It reports a re-verification
@@ -189,7 +192,11 @@ envelopes have `purpose` `boot`.
 - **Returns:** `{ok, Snapshot}`; see `gpu_inventory@1.0`.
 
 All dependency resolutions run with `cache-control: no-cache, no-store`, so
-every envelope observes the host afresh.
+no dependency result is read from or written to the node's cache. The
+default inventory device, `gpu_inventory@1.0`, may answer `report` with a
+report whose collection finished up to `gpu-inventory-cache-ms` earlier
+(five seconds by default); the report's `collected-at-unix` records when it
+was collected.
 
 ## 5. Data formats & encodings
 
@@ -281,7 +288,9 @@ ignores the `nonce` key of `verify`. Changing the recorded binding changes
 
 Request `accept: application/json` and `accept-bundle: true` to receive an
 envelope as one JSON object with nested objects inline. Booleans are rendered
-as `"true"` and `"false"`, typed through `ao-types`.
+as `"true"` and `"false"`, typed through `ao-types`. The serving node adds a
+top-level `status` to that object; it is outside the envelope's commitments,
+and `verify` accepts the object exactly as received.
 
 ## 6. Ordering, freshness & caching
 
@@ -292,8 +301,9 @@ as `"true"` and `"false"`, typed through `ao-types`.
 - Equal request nonces on equal hardware give equal `D`; freshness against
   replay therefore comes from the caller's nonce, which a verifier MUST choose
   itself.
-- Dependency results are never read from or written to the cache. The device
-  keeps no state.
+- Dependency results are never read from or written to the node's cache;
+  the inventory may be a report that the inventory device reuses (§4). The
+  device keeps no state.
 
 ## 7. Security & authority
 
@@ -328,23 +338,29 @@ as `"true"` and `"false"`, typed through `ao-types`.
 - `verify` checks signatures and bindings; it does not decide whether a
   measured subject or a GPU claim set is acceptable. That policy belongs to
   the verifier.
+- For an observation envelope, `signature-verified` is true when the
+  commitments of all its signers verify, whoever the signers are, and
+  `signers` lists them. A verifier MUST check that `signers` contains the
+  address of the node it expects.
 - Requests cannot select dependency devices or file paths. A request or base
   message may select `measurement-mode`, which only chooses between composing
   and observing.
 
 ## 8. Errors
 
-| Key | Status | `body.error` | Condition |
+| Key | Status | `error` | Condition |
 |---|---|---|---|
 | `boot`, `fresh` | 400 | `invalid-nonce` | `nonce` is empty, not a binary, not valid UTF-8, or longer than 1024 bytes. |
 | `verify` | 400 | `envelope-required` | Neither `envelope` nor `body` is present. |
 | `verify` | 400 | `invalid-envelope` | The input cannot be decoded, is not a message, or has another `type`. |
 | `snapshot` | 502 | `invalid-snapshot` | The inventory device returned another result. |
 
-Errors are `{error, #{status, body => #{error}}}`. Unavailable dependencies of
-`boot` and `fresh` are not errors: they appear in the envelope (`failure`,
-`gpu-tee.reason`, `gpu-inventory.errors`). `snapshot` returns the inventory
-device's own error unchanged.
+Errors are `{error, #{status, content-type, body}}`: `content-type` is
+`application/json` and `body` is the JSON text `{"error":"<error>"}`, so an
+HTTP client receives the status and that JSON body directly. Unavailable
+dependencies of `boot` and `fresh` are not errors: they appear in the
+envelope (`failure`, `gpu-tee.reason`, `gpu-inventory.errors`). `snapshot`
+returns the inventory device's own error unchanged.
 
 ## 9. Composition
 
@@ -376,7 +392,8 @@ inference_receipt@1.0 --fresh(nonce = request digest)--> inference_measurement@1
 5. An observation envelope is signed by the node when a commitment device and
    key are configured.
 6. For an observation envelope exactly as `fresh` returned it (as a
-   message, or in its `json@1.0` encoding), `verify` returns
+   message, or in its `json@1.0` encoding), also with keys outside its
+   commitments added (such as an HTTP `status`), `verify` returns
    `signature-verified` and `nonce-binding-verified` true; changing a signed
    key, the binding, or `gpu-tee.nonce` makes `verified` false.
 7. `verify` delegates base measurements to the base device without the keys
@@ -393,8 +410,8 @@ inference_receipt@1.0 --fresh(nonce = request digest)--> inference_measurement@1
 10. Inventory and GPU TEE results are accepted bare or under `body`; GPU TEE
     results are accepted as JSON binaries or messages.
 11. Dependency devices and the SEV-SNP guest path come only from node options.
-12. Successful results are bare messages; errors carry `status` and
-    `body.error`.
+12. Successful results are bare messages; errors carry `status`,
+    `content-type: application/json` and the JSON body `{"error": ...}`.
 
 ## 11. Out of scope
 
