@@ -176,7 +176,7 @@ publish_receipt(Receipt, Opts) ->
             {error, #{<<"status">> => 502, <<"body">> => #{
                 <<"error">> => <<"receipt-publish-incomplete">>
             }}};
-        {error, Reason} ->
+        {_Status, Reason} ->
             {error, #{<<"status">> => 502, <<"body">> => #{
                 <<"error">> => <<"receipt-publish-failed">>,
                 <<"reason">> => json_safe(Reason)
@@ -993,6 +993,109 @@ result_body_accepts_bare_and_enveloped_results_test() ->
     ?assertEqual(Envelope,
         result_body(#{<<"status">> => 200, <<"body">> => Envelope}, #{})),
     ?assertEqual(#{}, result_body(not_a_message, #{})).
+
+%% The wire contract seen by HTTP clients: plain and attested completions,
+%% streaming refusal, health, the model list, a receipt and its HashPath
+%% verification, all through a node's HTTP server.
+http_round_trip_test_() ->
+    {timeout, 120, fun() ->
+        with_runtime(fun(Runtime, _Handle) ->
+            Ref = make_ref(),
+            Node = hb_http_server:start_node((node_opts(Runtime))#{
+                <<"port">> => 0,
+                <<"inference-attestation-device">> =>
+                    stub_attestation_device(self(), Ref)
+            }),
+            Chat = #{
+                <<"model">> => <<"test-model">>,
+                <<"messages">> =>
+                    [#{<<"role">> => <<"user">>, <<"content">> => <<"ping">>}],
+                <<"max_tokens">> => 4
+            },
+            {200, Plain} = http_post(Node,
+                "~inference@1.0/v1/chat/completions", Chat),
+            ?assertMatch(#{<<"choices">> := [_]}, Plain),
+            ?assertNot(maps:is_key(<<"attestation">>, Plain)),
+            {400, Refused} = http_post(Node,
+                "~inference@1.0/v1/chat/completions",
+                Chat#{<<"stream">> => true}),
+            ?assertMatch(#{<<"error">> :=
+                    #{<<"code">> := <<"streaming_unsupported">>}}, Refused),
+            {200, Attested} = http_post(Node,
+                "~inference@1.0/v1/chat/completions?tee=true", Chat),
+            #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce},
+                <<"resolved_model">> := #{<<"model">> := <<"runtime-model">>}} =
+                    Attested,
+            ?assertEqual(hb_util:to_hex(hb_crypto:sha256(Raw)), Nonce),
+            ?assertEqual(Nonce, receive {attested_nonce, Ref, Asked} -> Asked
+                after 5000 -> no_attestation_request end),
+            ?assertEqual(
+                lists:sort([<<"max_tokens">>, <<"messages">>, <<"model">>,
+                    <<"tee">>]),
+                lists:sort(maps:keys(maps:get(<<"request">>,
+                    hb_json:decode(Raw))))),
+            {200, _} = http_get(Node, "~inference@1.0/health"),
+            {200, Models} = http_get(Node, "~inference@1.0/v1/models"),
+            ?assertMatch(#{<<"object">> := <<"list">>}, Models),
+            {200, WithReceipt} = http_post(Node,
+                "~inference_receipt@1.0/v1/chat/completions", Chat),
+            #{<<"choices">> := [_], <<"receipt">> := Receipt} = WithReceipt,
+            #{<<"node-address">> := NodeAddress, <<"ao-core">> := AOCore} =
+                Receipt,
+            ?assertEqual(43, byte_size(NodeAddress)),
+            ?assertEqual(<<"verified">>,
+                maps:get(<<"verification-status">>, AOCore)),
+            {200, Verification} = http_post(Node,
+                "~inference_receipt@1.0/verify-hashpath",
+                #{<<"ao-core">> => AOCore}),
+            %% The HTTP encoding types `verified' through `ao-types', so a
+            %% JSON client reads the string "true".
+            ?assertEqual(true, truthy(maps:get(<<"verified">>,
+                maps:get(<<"body">>, Verification, Verification))))
+        end)
+    end}.
+
+http_post(Node, Path, Json) ->
+    http_reply(httpc:request(post,
+        {binary_to_list(Node) ++ Path,
+            [{"accept", "application/json"}, {"accept-bundle", "true"}],
+            "application/json", hb_json:encode(Json)},
+        [{timeout, 60000}], [{body_format, binary}])).
+
+http_get(Node, Path) ->
+    http_reply(httpc:request(get,
+        {binary_to_list(Node) ++ Path,
+            [{"accept", "application/json"}, {"accept-bundle", "true"}]},
+        [{timeout, 60000}], [{body_format, binary}])).
+
+http_reply({ok, {{_, Status, _}, _Headers, Body}}) ->
+    {Status, first_json_object(Body)}.
+
+%% Clients read the first JSON object of a reply, which may be multipart.
+first_json_object(Body) ->
+    case binary:match(Body, <<"{">>) of
+        nomatch -> Body;
+        {Start, _} ->
+            Rest = binary:part(Body, Start, byte_size(Body) - Start),
+            hb_json:decode(binary:part(Rest, 0, object_length(Rest, 0, 0, false)))
+    end.
+
+object_length(<<$\\, _, Rest/binary>>, Pos, Depth, true) ->
+    object_length(Rest, Pos + 2, Depth, true);
+object_length(<<$", Rest/binary>>, Pos, Depth, InString) ->
+    object_length(Rest, Pos + 1, Depth, not InString);
+object_length(<<_, Rest/binary>>, Pos, Depth, true) ->
+    object_length(Rest, Pos + 1, Depth, true);
+object_length(<<${, Rest/binary>>, Pos, Depth, false) ->
+    object_length(Rest, Pos + 1, Depth + 1, false);
+object_length(<<$}, _/binary>>, Pos, 1, false) ->
+    Pos + 1;
+object_length(<<$}, Rest/binary>>, Pos, Depth, false) ->
+    object_length(Rest, Pos + 1, Depth - 1, false);
+object_length(<<_, Rest/binary>>, Pos, Depth, false) ->
+    object_length(Rest, Pos + 1, Depth, false);
+object_length(<<>>, Pos, _Depth, _InString) ->
+    Pos.
 
 publish_requires_a_receipt_test() ->
     ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
