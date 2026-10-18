@@ -1,16 +1,14 @@
 # Published Device Recipes
 
-Signer: `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8` (`~/.aos.json`).
-Generated from Arweave GraphQL on 2026-10-12. `docs@1.0` shows the newest
-recipe per author and slug, so earlier rounds are superseded.
+Signer: `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8`.
+Generated from Arweave GraphQL on 2026-10-12. For each device and slug, the
+newest recipe supersedes those of earlier rounds.
 
 ## Round 1 (no `published-at`; bound to the first staging store)
 
 | Recipe ID | Device | Slug | Spec ID | Block |
 |---|---|---|---|---|
 | ZkeAkz_qAYwBTp29yEVMivPLNppQXrvRXg5KENfjZ64 | agent@1.0 | run-without-tools | y8HJrJziDOzzzPizruD134Srsko5MB4cbrNKwOahmy4 | 2019831 |
-| CSGPndYTNHdrJUccBMJ3wYuQbUR5KMoZwfmw8erkAuo | docs@1.0 | agent-guide | _hy6LfGDXl2h867Umfeg8WwVamI7Jma-E429ygEK-B0 | 2019831 |
-| G3BY-CKxza9fiDO5NvPSY7rfbwqy3pr8Adhuo-54CPM | docs@1.0 | list-devices | _hy6LfGDXl2h867Umfeg8WwVamI7Jma-E429ygEK-B0 | 2019831 |
 | q2Mawy9KphgqHG7brFrLo5LbKGjnFydk9MxXNXQzX-Y | gpu_inventory@1.0 | inventory-digest | N4RKaltq1QevjABe3ML5oW8vgR98Nk2jvWUTJcDb5uM | 2019831 |
 | 8aac2f99-rDFosEvYRV9OqFtW4lCyrla9A1-1l45M40 | gpu_inventory@1.0 | inventory-report | N4RKaltq1QevjABe3ML5oW8vgR98Nk2jvWUTJcDb5uM | 2019831 |
 | Gmz7_KD6lK3lLo2oWgmDZ5P-GPYmLIPwtMh5iRxROvw | inference@1.0 | chat-completion | yBAqJdD-tNjCsThi_xiTXBZFbIFaWLbOic0MYmce13w | 2019831 |
@@ -28,8 +26,6 @@ recipe per author and slug, so earlier rounds are superseded.
 | Recipe ID | Device | Slug | Spec ID | Block |
 |---|---|---|---|---|
 | mexpbWfC86PYqD61w685LOW6DRwYU8mTdVA_04g_UBA | agent@1.0 | run-without-tools | 8hBDqHRc5JVznJ1-QanBla3Qz6Ob_JOjWW44_SsRP18 | 2019835 |
-| iI_BsKPUJEDH9EApgvzZlPmzQ6B_JCpormkG7Nc_1JM | docs@1.0 | agent-guide | X1sm7b7ewlaqqRt7-RtPYdS3ch-1COSxQ63NWv0oUKg | 2019835 |
-| 3u5rtSuWJNNvsgQA_dTLNq1HJhHTZpEIWOT40eXALJE | docs@1.0 | list-devices | X1sm7b7ewlaqqRt7-RtPYdS3ch-1COSxQ63NWv0oUKg | 2019835 |
 | 554X0lbfx9rPnT3SXApuPg9a7gPLyspcIAlbgPZHvWs | gpu_inventory@1.0 | inventory-digest | cj3-FQy59PimD8Y_1IrwmuceGYDvliB2_U2aWT_3_Qk | 2019835 |
 | iir88q_1_zwZOXJfh-wPZTmZVf02_aG5rdSqLVBlJ_o | gpu_inventory@1.0 | inventory-report | cj3-FQy59PimD8Y_1IrwmuceGYDvliB2_U2aWT_3_Qk | 2019835 |
 | HfI0z3XI9b0YTvOoQyXgYtjKsPnb8hENwTgPooARHgA | inference@1.0 | chat-completion | y7qwfBVwKo-M52pGwDKs25woPej0Fhto4krlBryi7MI | 2019835 |
@@ -53,8 +49,6 @@ recipe per author and slug, so earlier rounds are superseded.
 | Recipe ID | Device | Slug | Spec ID | Block |
 |---|---|---|---|---|
 | izXeDfU7ozW1cpPdJrJoQoYJVCmpHBnbqRzAf4oo9e8 | agent@1.0 | run-without-tools | yJBBcctNfebND4W87qj9Hj_l9jM4CYF5QQfIm89JW5k | 2019863 |
-| UO0m_XcnKfcVkp-zCplFnn8K8zGRUnaVzi7RAb_bK6c | docs@1.0 | agent-guide | tGkfZ9I_lyChUc-zPSY9Lt66un8bZ3RsV8rdNgARsJI | 2019863 |
-| PWBJPUvNotHTiziBVx-1us1B26XmnGguA2CMoupvcic | docs@1.0 | list-devices | tGkfZ9I_lyChUc-zPSY9Lt66un8bZ3RsV8rdNgARsJI | 2019863 |
 | v-6dyaJZh_h5x6OrODX5ZbqRs1OguUgGHrw9JH3fLz4 | gpu_inventory@1.0 | inventory-digest | e3KfjLtfRf4W25hsNK7HuYTIq6YJdgOiTVi_9e8kLZs | 2019863 |
 | PR94yBUwYqrM5snxV7-lUibh_Lsdft0Ue6LXpdbHkEA | gpu_inventory@1.0 | inventory-report | e3KfjLtfRf4W25hsNK7HuYTIq6YJdgOiTVi_9e8kLZs | 2019863 |
 | ucJdjo7_pDq4q0QK-aByeHbTBgnTHteFTdb_5Xrutl0 | inference@1.0 | chat-completion | LhyXfQF9YWPcHx8dJMoNXf3zmMmUOjM7hkSaoOo71e0 | 2019863 |

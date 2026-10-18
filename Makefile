@@ -29,7 +29,7 @@ setup-measurement:
 	bash scripts/setup-measurement.sh
 
 test:
-	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt,dev_docs
+	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt
 
 eunit-all:
 	rebar3 eunit-all
