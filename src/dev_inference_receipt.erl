@@ -8,8 +8,8 @@
 %%% measurement, and is signed with the node's identity.
 %%%
 %%% `verify-hashpath' recomputes a recorded transcript's HashPath, and
-%%% `publish' signs a document carrying a receipt of this node as an ANS-104
-%%% data item and submits it to the node's bundler.
+%%% `publish' signs a document carrying a receipt that names this node as an
+%%% ANS-104 data item and submits it to the node's bundler.
 -module(dev_inference_receipt).
 -implements(<<"inference_receipt@1.0">>).
 -specification("docs/spec/inference_receipt.md").
@@ -26,8 +26,9 @@
 -define(HASHPATH_SOURCE,
     <<"HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)">>).
 
-%% Upper bound on a decoded `verification-input-term' (1 MiB), and on its
-%% unpadded base64url text (the encoded length of 1 MiB).
+%% Upper bound on the external term of a transcript (1 MiB), and on the
+%% unpadded base64url text of `verification-input-term' (the encoded length
+%% of 1 MiB, so its decoded bytes never exceed 1 MiB).
 -define(MAX_TERM_BYTES, 1048576).
 -define(MAX_TERM_TEXT_BYTES, 1398102).
 
@@ -160,7 +161,7 @@ v1(Base, Req, Opts) ->
         Opts
     )}.
 
-%% @doc Publish a document carrying a receipt of this node through
+%% @doc Publish a document carrying a receipt that names this node through
 %% HyperBEAM's bundler. The device signs the ANS-104 item; callers never
 %% handle a wallet or a signature. With the `receipt-publishers' node option
 %% set, only requests signed by one of the listed addresses are accepted.
@@ -367,8 +368,8 @@ publish_opts(Opts) ->
 %% survives only in `verification-input-term'. Every recorded value that is
 %% present must equal the HashPath recomputed from the base and request.
 %%
-%% `verification-input-term' is unauthenticated input. It is bounded before
-%% and after base64url decoding, compressed terms are refused (their
+%% `verification-input-term' is unauthenticated input. Its text is bounded to
+%% the base64url length of 1 MiB, compressed terms are refused (their
 %% uncompressed size is allocated before decoding), and the term is decoded
 %% in safe mode and must contain only plain data.
 -spec verify_hashpath(
@@ -443,15 +444,14 @@ verification_messages(_, _, _Opts) ->
     {error, <<"receipt does not contain recorded AO-Core messages">>}.
 
 %% @doc Decode an unpadded base64url Erlang external term of a transcript
-%% within the size limits. The checks run in this order: text size, base64url
-%% and decoded size, compression, safe decoding, the transcript's keys, and
-%% plain data (maps, lists, tuples, binaries, atoms and numbers only).
+%% within the size limit. The checks run in this order: text size (which
+%% bounds the decoded bytes to 1 MiB), base64url, compression, safe decoding,
+%% the transcript's keys, and plain data (maps, lists, tuples, binaries,
+%% atoms and numbers only).
 decode_transcript_term(Text) when byte_size(Text) > ?MAX_TERM_TEXT_BYTES ->
     {error, <<"too-large">>};
 decode_transcript_term(Text) ->
     case catch hb_util:decode(Text) of
-        Bin when is_binary(Bin), byte_size(Bin) > ?MAX_TERM_BYTES ->
-            {error, <<"too-large">>};
         <<131, 80, _/binary>> ->
             {error, <<"compressed">>};
         Bin when is_binary(Bin) ->

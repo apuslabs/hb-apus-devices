@@ -26,6 +26,7 @@ the attestation nonce is the SHA-256 of `raw`; the next value is the node's
 own check of the GPU report. `raw` records the generation parameters and the
 runtime's response, never HTTP headers or the caller's address. On
 `hb.apus.network` the gateway sends this request to `inference@1.0` on the
-node; its response carries no receipt, so the gateway does not publish it to
-Arweave. The `chat-with-receipt` recipe with `"tee": true` publishes a
-receipt.
+node; its response carries no receipt, so `publish` refuses the gateway's
+record, nothing is stored on Arweave, and the gateway adds `receipt_upload`
+with `status: failed` to the response. The `chat-with-receipt` recipe with
+`"tee": true` publishes a receipt.

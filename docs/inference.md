@@ -14,7 +14,8 @@ behaviour of each key is defined in the device specifications:
 - `inference_receipt@1.0` executes a completion as a recorded AO-Core step and
   returns a receipt signed by the node: request and response digests, the
   step's HashPath and transcript, the GPU inventory and a fresh measurement.
-  It also verifies HashPaths and publishes the node's receipts to Arweave.
+  It also verifies HashPaths and publishes receipts that name the node to
+  Arweave.
 
 Both devices answer with complete responses; `stream=true` is rejected.
 
@@ -136,9 +137,11 @@ checked. The receipt's bindings `model-sha256`, `runtime-build-hash`,
 `inference-profile`, `model-source` and `model-tx` take the node option of
 the same name when it is set, and the request's declaration otherwise.
 
-`request-digest` and `response-digest` are SHA-256 digests over a canonical
-JSON encoding (compact, object keys in byte order at every depth) defined in
-the receipt specification, so a verifier can recompute them. The receipt's
+`request-digest` is the SHA-256 of the executed request in a canonical JSON
+encoding (compact, object keys in byte order at every depth), and
+`response-digest` is the SHA-256 of the bytes of the `inference@1.0`
+response body. Both are unpadded base64url and defined in the receipt
+specification, so a verifier can recompute them. The receipt's
 `system-measurement.envelope` is the measurement envelope exactly as
 `inference_measurement@1.0` returned it; post it as `envelope` to
 `/~inference_measurement@1.0/verify` to check it.
@@ -159,16 +162,19 @@ curl -s -X POST "$HB/~inference_receipt@1.0/v1/chat/completions" \
 The answer's `body.verified` is `true` (the string `"true"` in the typed
 HTTP encoding) when the recorded response is linked to the recorded base and
 request. Hardware provenance and model identity need the measurement and
-attestation checks. A `verification-input-term` larger than 1 MiB, or a
-compressed one, is refused with 400 before it is decoded.
+attestation checks. A `verification-input-term` whose text exceeds
+1,398,102 bytes (the base64url length of 1 MiB), or that holds a compressed
+term, is refused with 400 before it is decoded.
 
-`publish` signs a document that carries a receipt of this node as an ANS-104
-data item and submits it to the node's bundler; it spends the publication
-wallet's funds. It accepts a receipt, or a JSON object that carries one under
-`report.receipt`, of at most 8 MiB, whose `node-address` is this node. These
-are structural checks, not a signature check, so restrict `publish` to your
-gateway: set `receipt-publishers` to the gateway's signing address, or refuse
+`publish` signs a document as an ANS-104 data item and submits it to the
+node's bundler; it spends the publication wallet's funds. It accepts a
+receipt, or a JSON object that carries one under `report.receipt`, of at most
+8 MiB, whose `node-address` is this node. These are structural checks, not a
+signature check, so restrict `publish` to your gateway: set
+`receipt-publishers` to the gateway's signing address, or refuse
 `/~inference_receipt@1.0/publish` to every other caller in front of the node.
+A gateway that calls `publish` on behalf of its own callers should pass it
+only receipts the node returned to that gateway.
 With `receipt-publishers` set, the publisher signs a message holding only
 `receipt` and posts it to `/~inference_receipt@1.0/publish`; a request whose
 signature also covers `path` is refused with 403, because HyperBEAM delivers
@@ -187,17 +193,33 @@ front of the node:
 - `/~inference@1.0/*` requests without `tee=true` (a query parameter or a JSON
   field) go directly to the runtime with the `/~inference@1.0` prefix
   removed, so `/~inference@1.0/health` and `/~inference@1.0/v1/models`
-  exercise the runtime, not the device;
+  exercise the runtime, not the device. `/ao/~inference@1.0/*` requests go
+  to the runtime with the `/ao/~inference@1.0` prefix removed, with or
+  without `tee=true`;
 - `/~inference@1.0/*` requests with `tee=true` go to `inference@1.0` on the
   node, except `/~inference@1.0/completions` with `tee=true`, which the
   gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
-- every other path goes to the node, except
-  `/~inference_receipt@1.0/publish`, which the gateway refuses to outside
-  callers;
-- the gateway publishes receipts through `inference_receipt@1.0/publish` and
-  adds `load_dataitem_id` and `arweave_tx_id` to the response. An attested
-  completion served by `inference@1.0` alone carries no receipt and is not
-  published.
+- the gateway handles `GET /health`, `GET /attestations`,
+  `POST /attestations`, `GET /attestations/:id`,
+  `POST /attestations/:id/verify-hashpath`, `POST /tags/query` and
+  `POST /query/dataitem` itself: they read its index of published records,
+  check an indexed record with `verify-hashpath` on the node, or (`POST
+  /attestations`) publish the posted record as described below;
+- it answers 403 to any other request whose percent-decoded URL contains
+  `inference_receipt@1.0/publish`, and sends the rest to the node;
+- for each 200, non-streaming response from the node to a request whose path
+  contains `completions`, the gateway publishes a record and adds
+  `load_dataitem_id` and `arweave_tx_id` to the response, or adds
+  `receipt_upload` with `status: failed` when publication does not succeed.
+  To publish, it requires the response's `attestation.raw`, builds a
+  publication record that carries the response's `receipt`, as the gateway
+  normalizes it, under `report.receipt`, checks that the record holds no
+  client metadata, and posts `{"receipt": <record as JSON text>}` to
+  `inference_receipt@1.0/publish`. An attested completion served by
+  `inference@1.0` alone carries no receipt, so `publish` refuses its record;
+- `POST /attestations` posts the record in its body to `publish` after the
+  same client-metadata check, so a posted record is published when it passes
+  the checks of `publish`.
 
 ## Tests
 

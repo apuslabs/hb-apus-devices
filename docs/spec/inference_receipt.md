@@ -20,8 +20,9 @@ binds:
 
 `verify-hashpath` recomputes the HashPath of a recorded transcript and
 compares it with the value the receipt recorded. `publish` signs a document
-that carries a receipt of this node as an ANS-104 data item and submits it to
-the node's bundler, so the evidence can be stored on Arweave.
+that carries a receipt naming this node in `node-address` as an ANS-104 data
+item and submits it to the node's bundler, so the evidence can be stored on
+Arweave.
 
 **Reference deployment (informative).** Apus Network operates this device at
 `https://hb.apus.network`, decorating an SGLang runtime that serves
@@ -94,7 +95,7 @@ in confidential-computing mode.
 | `models` | GET | Return `inference@1.0/models`; no receipt. |
 | `health` | GET | Return `inference@1.0/health`; no receipt. |
 | `verify-hashpath` | POST | Recompute a recorded transcript's HashPath and compare it with the recorded value. |
-| `publish` | POST | Sign a document that carries a receipt of this node as an ANS-104 data item and submit it to `bundler@1.0`. |
+| `publish` | POST | Sign a document that carries a receipt naming this node in `node-address` as an ANS-104 data item and submit it to `bundler@1.0`. |
 
 Node options:
 
@@ -192,9 +193,8 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      error `invalid-verification-input-term` (§8), whose `reason` is shown
      in parentheses:
      1. the text is at most 1,398,102 bytes, the unpadded base64url length
-        of 1 MiB (`too-large`);
-     2. the text is base64url (`undecodable`) and decodes to at most
-        1,048,576 bytes (`too-large`);
+        of 1 MiB, so it decodes to at most 1,048,576 bytes (`too-large`);
+     2. the text is base64url (`undecodable`);
      3. the bytes are not a compressed external term, that is, version byte
         131 followed by tag 80 (`compressed`); decoding a compressed term
         allocates its uncompressed size first;
@@ -225,7 +225,7 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
   `recomputed-hashpath` is then informational). Unusable input returns an
   error result (§8).
 
-### `publish` — store a receipt of this node as an ANS-104 data item
+### `publish` — store a receipt that names this node as an ANS-104 data item
 
 - **Reads:** the request's `receipt`, else its `body`; the request's
   commitments; the node options `receipt-publishers` and
@@ -406,7 +406,9 @@ of §8. In these bodies `verified` is the JSON literal `false`.
   Operators SHOULD restrict `publish` to their gateway: set
   `receipt-publishers` to the gateway's signing address, or refuse
   `/~inference_receipt@1.0/publish` to every other caller in front of the
-  node.
+  node. A gateway that calls `publish` on behalf of its own callers extends
+  this reach to them, so it SHOULD pass `publish` only receipts that the
+  node returned to that gateway.
 - **What `publish` checks.** The checks of §4 establish that a document has
   the shape of a receipt and names this node in `node-address`, within 8 MiB.
   They are not a signature check: `node-address` is a public value, so a
@@ -424,9 +426,10 @@ of §8. In these bodies `verified` is the JSON literal `false`.
   signed request publishes its data again, so publishers SHOULD send signed
   requests only over private or encrypted channels.
 - **Posted evidence is data.** `verify-hashpath` reads posted values without
-  device dispatch. `verification-input-term` is bounded to 1 MiB before and
-  after base64url decoding, compressed terms are refused because decoding
-  allocates their uncompressed size first, the term is decoded in safe mode,
+  device dispatch. The text of `verification-input-term` is bounded to
+  1,398,102 bytes, the base64url length of 1 MiB, before it is decoded,
+  compressed terms are refused because decoding allocates their
+  uncompressed size first, the term is decoded in safe mode,
   and a term that contains a function, process identifier, port or reference
   is refused (§4).
 - **What a HashPath proves.** A verified HashPath shows that the recorded
@@ -479,25 +482,39 @@ of §8. In these bodies `verified` is the JSON literal `false`.
   sits in front of the node:
   - `/~inference@1.0/*` requests without `tee=true` (a query parameter or a
     JSON field) go directly to the runtime with the `/~inference@1.0` prefix
-    removed;
+    removed, and `/ao/~inference@1.0/*` requests go to the runtime with the
+    `/ao/~inference@1.0` prefix removed, with or without `tee=true`;
   - `/~inference@1.0/*` requests with `tee=true` go to `inference@1.0` on the
     node, except `/~inference@1.0/completions` with `tee=true`, which the
     gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`: a
     chat request whose user message is the request's `prompt`, with its
     `model`, `max_tokens` and `temperature`, `tee: true` and the
     deployment's declarations;
-  - every other path, including this device's `health`, `models` and
-    `completions`, goes to the node;
-  - for each successful attested completion (a response whose
-    `attestation.raw` is present) it posts `{"receipt": <publication record
-    as JSON text>}` to `publish`; the record carries the completion's receipt
-    under `report.receipt`. When `publish` succeeds, the gateway adds
-    `load_dataitem_id` and `arweave_tx_id` to the response, and each such
-    run creates an Arweave data item. Records without a receipt of the node,
-    such as those of attested completions served by `inference@1.0` alone,
-    are refused by `publish` (§4);
-  - the gateway refuses `/~inference_receipt@1.0/publish` to outside
-    callers, which restricts `publish` to the gateway (§7).
+  - the gateway handles `GET /health`, `GET /attestations`,
+    `POST /attestations`, `GET /attestations/:id`,
+    `POST /attestations/:id/verify-hashpath`, `POST /tags/query` and
+    `POST /query/dataitem` itself: they read its index of published
+    records, check an indexed record with `verify-hashpath` on the node, or
+    (`POST /attestations`) publish the posted record as described below;
+  - it answers 403 to any other request whose percent-decoded URL contains
+    `inference_receipt@1.0/publish`, and sends every other request,
+    including this device's `health`, `models` and `completions`, to the
+    node;
+  - for each 200, non-streaming response from the node to a request whose
+    path contains `completions`, the gateway publishes a record and adds
+    `load_dataitem_id` and `arweave_tx_id` to the response, or adds
+    `receipt_upload` with `status: failed` when publication does not
+    succeed. To publish, it requires the response's `attestation.raw`,
+    builds a publication record that carries the response's receipt, as the
+    gateway normalizes it, under `report.receipt`, checks that the record
+    holds no client metadata, and posts `{"receipt": <publication record as
+    JSON text>}` to `publish`; each accepted record creates an Arweave data
+    item. A record without a receipt that passes the checks of §4, such as
+    that of an attested completion served by `inference@1.0` alone, is
+    refused by `publish`;
+  - `POST /attestations` posts the record in its body to `publish` after
+    the same client-metadata check, so a posted record is published when it
+    passes the checks of §4 (§7).
 
 ## 10. Conformance (normative checklist)
 

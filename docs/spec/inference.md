@@ -363,15 +363,18 @@ error whose body is a JSON object is returned with that body unchanged.
   sits in front of the node:
   - `/~inference@1.0/*` requests without `tee=true` (a query parameter or a
     JSON field) go directly to the runtime with the `/~inference@1.0` prefix
-    removed, so they do not reach this device;
+    removed, and `/ao/~inference@1.0/*` requests go to the runtime with the
+    `/ao/~inference@1.0` prefix removed, with or without `tee=true`, so
+    neither reaches this device;
   - `/~inference@1.0/*` requests with `tee=true` go to this device on the
     node, except `/~inference@1.0/completions` with `tee=true`, which the
     gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
   - the gateway publishes receipts through the `publish` key of
     `inference_receipt@1.0` and adds `load_dataitem_id` and `arweave_tx_id`
     to those responses. `publish` accepts only documents that carry a receipt
-    of the node, so an attested completion served by this device alone,
-    which carries no receipt, is not published.
+    naming the node in `node-address`, so an attested completion served by
+    this device alone, which carries no receipt, is not published, and the
+    gateway adds `receipt_upload` with `status: failed` to its response.
 
   Address the node itself to exercise every key of this device.
 
