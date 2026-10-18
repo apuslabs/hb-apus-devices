@@ -1,39 +1,59 @@
 #!/usr/bin/env escript
-%% Sign docs/recipes/*/*.md as Device-Recipe messages and upload them.
+%% Sign the recipes in docs/recipes/<device>/<slug>.md as Device-Recipe
+%% messages and, with --upload, submit them to an ANS-104 bundler.
 %%
-%% Usage (from the repository root, after `rebar3 compile`):
-%%   escript scripts/publish-recipes.escript PRELOADED_STORE WALLET [--upload]
+%% Usage (from the repository root, after `rebar3 compile'):
+%%   escript scripts/publish-recipes.escript SPECS WALLET [--upload]
 %%       [--expect ADDRESS] [--bundler URL] [--only PATH-SUBSTRING]
+%%       [--ledger PATH]
 %%
-%% Each recipe's `recipe-for-device' is the device's specification ID in
-%% PRELOADED_STORE, so the store must be the one the node will run. Without
-%% `--upload' the recipes are signed and their IDs printed, nothing is sent.
+%% Each recipe's `recipe-for-device' tag is the specification ID of its
+%% device, read from SPECS, which is either:
+%%   - a preloaded store directory (`make preload'): the specification IDs
+%%     of the devices that a node running this store loads; or
+%%   - a publication record written by `make publish' (PUBLISH.md): the IDs
+%%     of the Device-Specification messages published on Arweave.
+%%
+%% Without --upload the recipes are signed and their IDs printed; nothing is
+%% sent. With --upload each signed recipe is posted to the bundler (default
+%% https://up.arweave.net:443) and listed in the ledger (default
+%% docs/recipes/PUBLISHED.md). --expect aborts unless WALLET has the given
+%% address. --only selects the recipes whose path contains the substring.
 -mode(compile).
 
 -define(INDEX_KEY, <<"~meta@1.0/preloaded-devices-index">>).
--define(DEFAULT_BUNDLER, <<"https://up.arweave.net:443">>).
+-define(DEFAULT_BUNDLER, "https://up.arweave.net:443").
+-define(DEFAULT_LEDGER, "docs/recipes/PUBLISHED.md").
+-define(RECIPES, "docs/recipes/*/*.md").
+-define(ID_PATTERN, "[A-Za-z0-9_-]{43}").
 
-main([StoreDir, KeyPath | Flags]) ->
+main([SpecSource, KeyPath | Flags]) ->
+    filelib:is_dir("docs/recipes")
+        orelse fail("run this script from the repository root", []),
     code:add_paths(filelib:wildcard("_build/default/lib/*/ebin")),
-    {ok, _} = application:ensure_all_started(crypto),
-    {ok, _} = application:ensure_all_started(ssl),
-    {ok, _} = application:ensure_all_started(inets),
+    lists:foreach(
+        fun(App) -> {ok, _} = application:ensure_all_started(App) end,
+        [crypto, ssl, hackney]
+    ),
     Upload = lists:member("--upload", Flags),
-    Bundler = list_to_binary(flag("--bundler", Flags, binary_to_list(?DEFAULT_BUNDLER))),
+    Bundler = list_to_binary(flag("--bundler", Flags, ?DEFAULT_BUNDLER)),
+    Ledger = flag("--ledger", Flags, ?DEFAULT_LEDGER),
+    Only = flag("--only", Flags, ""),
     Wallet = load_wallet(KeyPath),
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
-    AddressStr = binary_to_list(Address),
     case flag("--expect", Flags, undefined) of
         undefined -> ok;
-        AddressStr -> ok;
-        Expected -> fail("wallet ~s is ~s, expected ~s", [KeyPath, Address, Expected])
+        Expected ->
+            Expected =:= binary_to_list(Address)
+                orelse fail("wallet ~s has address ~s, expected ~s",
+                    [KeyPath, Address, Expected])
     end,
     Bootstrap = #{
         <<"bootstrap-device-src">> => [<<"_build/default/lib/hb/src/preloaded">>],
         <<"commitment-device">> => <<"ans104@1.0">>
     },
-    %% Codec devices are packaged in this HyperBEAM version. Outside a node,
-    %% the Forge seed compiles them from source so messages can be signed.
+    % Codec devices are packaged in this HyperBEAM version. Outside a node,
+    % the Forge seed compiles them from source so messages can be signed.
     hb_forge_seed:with_forge_bootstrap(
         Bootstrap,
         fun(SeedOpts) ->
@@ -42,37 +62,49 @@ main([StoreDir, KeyPath | Flags]) ->
                 <<"bundler-ans104">> => Bundler,
                 <<"prometheus">> => false
             },
-            Specs = spec_ids(StoreDir, SeedOpts),
-            Only = flag("--only", Flags, ""),
+            case Upload of
+                true -> start_http_client(Opts);
+                false -> ok
+            end,
+            Specs = spec_ids(SpecSource, SeedOpts),
             Recipes =
                 [
-                    P
+                    Path
                 ||
-                    P <- lists:sort(filelib:wildcard("docs/recipes/*/*.md")),
-                    string:find(P, Only) =/= nomatch
+                    Path <- lists:sort(filelib:wildcard(?RECIPES)),
+                    string:find(Path, Only) =/= nomatch
                 ],
-            io:format("Signer: ~s~nStore: ~s~nBundler: ~s~nMode: ~s~n~n",
-                [Address, StoreDir, Bundler,
-                    if Upload -> "upload"; true -> "dry-run" end]),
+            io:format("Signer: ~s~nSpecifications: ~s~nBundler: ~s~nMode: ~s~n~n",
+                [Address, SpecSource, Bundler, mode(Upload)]),
             Results = [publish(Path, Specs, Upload, Opts) || Path <- Recipes],
-            write_ledger(Results, Address, Upload),
-            io:format("~n~p recipes ~s.~n",
-                [length(Results),
-                    if Upload -> "uploaded"; true -> "signed (dry run)" end])
+            case Upload andalso Results =/= [] of
+                true -> write_ledger(Ledger, Results, Address);
+                false -> ok
+            end,
+            io:format("~n~p recipes ~s.~n", [length(Results), outcome(Upload)])
         end
     );
 main(_) ->
     io:format(standard_error,
-        "Usage: escript scripts/publish-recipes.escript PRELOADED_STORE WALLET "
-        "[--upload] [--expect ADDRESS] [--bundler URL] [--only PATH]~n", []),
+        "Usage: escript scripts/publish-recipes.escript SPECS WALLET [--upload] "
+        "[--expect ADDRESS] [--bundler URL] [--only PATH] [--ledger PATH]~n", []),
     halt(1).
 
+mode(true) -> "upload";
+mode(false) -> "dry run".
+
+outcome(true) -> "uploaded";
+outcome(false) -> "signed (dry run)".
+
+%% @doc Sign one recipe file and, when uploading, post it to the bundler.
 publish(Path, Specs, Upload, Opts) ->
-    Device = <<(list_to_binary(filename:basename(filename:dirname(Path))))/binary, "@1.0">>,
+    Device =
+        <<(list_to_binary(filename:basename(filename:dirname(Path))))/binary,
+            "@1.0">>,
     SpecID =
         case maps:find(Device, Specs) of
             {ok, Found} -> Found;
-            error -> fail("~s: ~s is not in the preloaded store", [Path, Device])
+            error -> fail("~s: no specification ID for ~s", [Path, Device])
         end,
     {Meta, Body} = parse(Path),
     Slug = maps:get(<<"slug">>, Meta, list_to_binary(filename:basename(Path, ".md"))),
@@ -104,8 +136,15 @@ publish(Path, Specs, Upload, Opts) ->
     io:format("~s ~s ~s~n", [ID, Device, Slug]),
     #{ id => ID, device => Device, slug => Slug, spec => SpecID }.
 
-%% @doc Serialize the committed message as an ANS-104 item and post it to the
-%% bundler, as `rebar3 device publish' does.
+%% @doc Start HyperBEAM's HTTP client, which carries the bundler uploads.
+start_http_client(Opts) ->
+    case hb_http_client:start_link(Opts) of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok
+    end.
+
+%% @doc Serialize the committed message as an ANS-104 data item and post it
+%% to the bundler through HyperBEAM's HTTP client.
 upload(Msg, Opts) ->
     {ok, Committed} = hb_message:with_only_committed(hb_private:reset(Msg), Opts),
     Item =
@@ -116,50 +155,76 @@ upload(Msg, Opts) ->
                 Opts
             )
         ),
-    URL = binary_to_list(maps:get(<<"bundler-ans104">>, Opts)) ++ "/~bundler@1.0/tx",
-    Headers = [{"codec-device", "ans104@1.0"}, {"accept-bundle", "true"}],
-    HTTPOpts = [
-        {timeout, 60000},
-        {ssl, [
-            {verify, verify_peer},
-            {cacerts, public_key:cacerts_get()},
-            {customize_hostname_check,
-                [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}
-        ]}
-    ],
-    case httpc:request(post, {URL, Headers, "application/ans104", Item}, HTTPOpts,
-            [{body_format, binary}]) of
-        {ok, {{_, Status, _}, _, Body}} when Status < 400 -> {ok, Body};
-        {ok, {{_, Status, _}, _, Body}} -> {error, {Status, Body}};
+    Req = #{
+        peer => maps:get(<<"bundler-ans104">>, Opts),
+        path => <<"/~bundler@1.0/tx">>,
+        method => <<"POST">>,
+        headers => #{
+            <<"codec-device">> => <<"ans104@1.0">>,
+            <<"content-type">> => <<"application/ans104">>,
+            <<"accept-bundle">> => <<"true">>
+        },
+        body => Item
+    },
+    case hb_http_client:request(Req, Opts) of
+        {ok, Status, _Headers, Body} when Status < 400 -> {ok, Body};
+        {ok, Status, _Headers, Body} -> {error, {Status, Body}};
         Error -> Error
     end.
 
-%% @doc Device name -> specification ID from a copy of the preloaded store.
-spec_ids(StoreDir, SeedOpts) ->
-    Tmp = filename:join("/tmp", "publish-recipes-" ++ os:getpid()),
-    ok = filelib:ensure_dir(filename:join(Tmp, "x")),
-    {ok, _} = file:copy(filename:join(StoreDir, "data.mdb"), filename:join(Tmp, "data.mdb")),
+%% @doc Device name to specification ID, from a preloaded store directory or
+%% from a publication record.
+spec_ids(Source, SeedOpts) ->
+    case {filelib:is_dir(Source), filelib:is_regular(Source)} of
+        {true, _} -> store_spec_ids(Source, SeedOpts);
+        {false, true} -> record_spec_ids(Source);
+        _ -> fail("specification source not found: ~s", [Source])
+    end.
+
+%% @doc Read the device index of a preloaded store. The store is copied first
+%% so that the original is never opened for writing.
+store_spec_ids(StoreDir, SeedOpts) ->
+    Data = filename:join(StoreDir, "data.mdb"),
+    filelib:is_regular(Data)
+        orelse fail("~s is not a preloaded store (no data.mdb)", [StoreDir]),
+    Tmp = filename:join("_build", "recipe-specs-" ++ os:getpid()),
+    ok = filelib:ensure_dir(filename:join(Tmp, "data.mdb")),
+    {ok, _} = file:copy(Data, filename:join(Tmp, "data.mdb")),
     Store = #{
         <<"store-module">> => hb_store_lmdb,
         <<"name">> => list_to_binary(Tmp),
         <<"capacity">> => 1073741824
     },
     Opts = SeedOpts#{ <<"store">> => [Store] },
-    ok = hb_store:start(Store, #{}, Opts),
-    {ok, Index} = hb_cache:read(?INDEX_KEY, Opts),
-    Specs =
-        maps:from_list(
-            [
-                {Name, hb_util:bin(hb_cache:ensure_loaded(Ref, Opts))}
-            ||
-                {Name, Ref} <- maps:to_list(Index),
-                is_binary(Name),
-                binary:match(Name, <<"@">>) =/= nomatch
-            ]
-        ),
-    hb_store:stop(Store, #{}, Opts),
-    os:cmd("rm -rf " ++ Tmp),
-    Specs.
+    try
+        ok = hb_store:start(Store, #{}, Opts),
+        {ok, Index} = hb_cache:read(?INDEX_KEY, Opts),
+        Specs =
+            maps:from_list(
+                [
+                    {Name, hb_util:bin(hb_cache:ensure_loaded(Ref, Opts))}
+                ||
+                    {Name, Ref} <- maps:to_list(Index),
+                    is_binary(Name),
+                    binary:match(Name, <<"@">>) =/= nomatch
+                ]
+            ),
+        hb_store:stop(Store, #{}, Opts),
+        Specs
+    after
+        file:del_dir_r(Tmp)
+    end.
+
+%% @doc Read the device table of a publication record written by
+%% `make publish': | `name@1.0` | `SpecID` | `ImplID` |
+record_spec_ids(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    Pattern =
+        "^\\| `([^`]+@[^`]+)` \\| `(" ?ID_PATTERN ")` \\| `" ?ID_PATTERN "` \\|",
+    case re:run(Bin, Pattern, [multiline, global, {capture, all_but_first, binary}]) of
+        {match, Rows} -> maps:from_list([{Name, Spec} || [Name, Spec] <- Rows]);
+        nomatch -> fail("~s lists no published device", [Path])
+    end.
 
 %% @doc Split `---' front matter (`key: value' lines) from the markdown body.
 parse(Path) ->
@@ -183,28 +248,35 @@ parse(Path) ->
 load_wallet(KeyPath) ->
     case filelib:is_regular(KeyPath) of
         true -> ar_wallet:load_keyfile(KeyPath);
-        false -> fail("wallet file not found: ~s", [KeyPath])
+        false -> fail("wallet keyfile not found: ~s", [KeyPath])
     end.
 
-write_ledger(Results, Address, true) ->
-    Ledger = "docs/recipes/PUBLISHED.md",
+%% @doc Append one publishing round to the ledger. Block heights are filled
+%% in from Arweave GraphQL once the bundles are confirmed.
+write_ledger(Ledger, Results, Address) ->
     Header =
         case filelib:is_regular(Ledger) of
             true -> [];
             false -> "# Published Device Recipes\n"
         end,
+    Timestamp =
+        calendar:system_time_to_rfc3339(
+            erlang:system_time(second),
+            [{offset, "Z"}]
+        ),
     Lines = [
         Header,
-        "\n## ", calendar:system_time_to_rfc3339(erlang:system_time(second),
-            [{offset, "Z"}]), "\n\n",
-        "- Signer: ", Address, "\n\n",
-        "| Recipe ID | Device | Slug | Spec ID |\n|---|---|---|---|\n",
-        [["| ", ID, " | ", D, " | ", S, " | ", Spec, " |\n"]
-            || #{ id := ID, device := D, slug := S, spec := Spec } <- Results]
+        "\n## Published at ", Timestamp, "\n\n",
+        "Signer: `", Address, "`.\n\n",
+        "| Recipe ID | Device | Slug | Spec ID | Block |\n",
+        "|---|---|---|---|---|\n",
+        [
+            ["| ", ID, " | ", Device, " | ", Slug, " | ", Spec, " | pending |\n"]
+        ||
+            #{ id := ID, device := Device, slug := Slug, spec := Spec } <- Results
+        ]
     ],
-    ok = file:write_file(Ledger, Lines, [append]);
-write_ledger(_Results, _Address, false) ->
-    ok.
+    ok = file:write_file(Ledger, Lines, [append]).
 
 flag(Name, [Name, Value | _], _Default) -> Value;
 flag(Name, [_ | Rest], Default) -> flag(Name, Rest, Default);
