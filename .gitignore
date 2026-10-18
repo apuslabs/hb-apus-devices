@@ -1,13 +1,26 @@
+# Build outputs
 /_build/
 /_checkouts/
-/priv/dev_sev_gpu/*.so
-/priv/dev_sev_gpu/lib/
 /.rebar3/
-/erl_crash.dump
-/hyperbeam-key.json
-/PUBLISH.md.tmp
-/cache-mainnet/
-/logs/
+/priv/
 /vendor/permaweb-os/native/lapee_snp_nif/target/
 /vendor/permaweb-os/src/priv/
-cache-attested/
+erl_crash.dump
+rebar3.crashdump
+
+# Keys and wallets
+hyperbeam-key.json
+*.key.json
+*-key.json
+*wallet*.json
+.aos.json
+*.pem
+
+# Local node configuration and state
+/config.flat
+/config.json
+cache-*/
+/logs/
+
+# Editors and operating systems
+.DS_Store

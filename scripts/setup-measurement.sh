@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Build the SNP NIF of the vendored PermawebOS snp@1.0 device and place its
+# Erlang wrapper and shared library where Device Forge packages them.
+# Run on the Linux target host before packaging; requires cargo and erlc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 measurement_root="$PWD/vendor/permaweb-os"
