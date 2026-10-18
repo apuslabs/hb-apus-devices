@@ -2,8 +2,8 @@
 %%% operator-configured model runtime.
 %%%
 %%% The device relays chat completions, the model list and a health probe to
-%%% one OpenAI-compatible runtime through `relay@1.0'. The runtime's base URL,
-%%% request paths and credentials are node options: neither the request nor
+%%% one OpenAI-compatible runtime through `relay@1.0'. The runtime's origin,
+%%% request paths and credential are node options: neither the request nor
 %%% the base message can select them. Results are complete messages, so the
 %%% device rejects `stream=true'.
 %%%
@@ -15,7 +15,6 @@
 -implements(<<"inference@1.0">>).
 -specification("docs/spec/inference.md").
 -export([info/1, completions/3, chat/3, v1/3, models/3, health/3]).
--include_lib("eunit/include/eunit.hrl").
 -include_lib("hb/include/hb.hrl").
 
 %% Node option defaults.
@@ -135,8 +134,8 @@ v1(Base, Req, Opts) ->
 ) -> {ok, #{ status := integer(), body := binary(), _ => _ }}
     | {error, #{ status := integer(), body := binary(), _ => _ }}.
 models(_Base, _Req, Opts) ->
-    Path = hb_opts:get(<<"inference-models-path">>, ?DEFAULT_MODELS_PATH, Opts),
-    case runtime_response(runtime_call(<<"GET">>, Path, undefined, Opts), Opts) of
+    case runtime_request(<<"GET">>, <<"inference-models-path">>,
+            ?DEFAULT_MODELS_PATH, undefined, Opts) of
         {ok, Res} ->
             {ok, #{
                 <<"status">> => success_status(Res, Opts),
@@ -159,8 +158,8 @@ models(_Base, _Req, Opts) ->
 ) -> {ok, #{ healthy := true, _ => _ }}
     | {error, #{ status := integer(), body := binary(), _ => _ }}.
 health(_Base, _Req, Opts) ->
-    Path = hb_opts:get(<<"inference-health-path">>, ?DEFAULT_HEALTH_PATH, Opts),
-    case runtime_response(runtime_call(<<"GET">>, Path, undefined, Opts), Opts) of
+    case runtime_request(<<"GET">>, <<"inference-health-path">>,
+            ?DEFAULT_HEALTH_PATH, undefined, Opts) of
         {ok, Res} ->
             {ok, #{
                 <<"healthy">> => true,
@@ -180,8 +179,8 @@ health(_Base, _Req, Opts) ->
 %% Send the generation request and shape the runtime's answer.
 complete(Base, Req, Opts) ->
     Payload = backend_payload(Req, Opts),
-    Path = hb_opts:get(<<"inference-path">>, ?DEFAULT_PATH, Opts),
-    case runtime_response(runtime_call(<<"POST">>, Path, Payload, Opts), Opts) of
+    case runtime_request(<<"POST">>, <<"inference-path">>, ?DEFAULT_PATH,
+            Payload, Opts) of
         {ok, Res} ->
             case truthy(hb_ao:get(<<"tee">>, Req, false, Opts)) of
                 true -> attested_response(Res, Base, Req, Payload, Opts);
@@ -254,10 +253,20 @@ public_request(Req, Body, Opts) ->
 
 %%% Runtime transport
 
-%% Send one request to the configured runtime through `relay@1.0'. Only node
-%% options select the peer, the path and the credential.
-runtime_call(Method, Path, Body, Opts) ->
-    Peer = runtime_peer(Opts),
+%% Send one request to the configured runtime and classify the answer (see
+%% runtime_response/2). Only node options select the peer, the path and the
+%% credential; an unusable `inference-peer' is reported without a request.
+runtime_request(Method, PathKey, DefaultPath, Body, Opts) ->
+    case runtime_peer(Opts) of
+        {ok, Peer} ->
+            Path = runtime_path(PathKey, DefaultPath, Opts),
+            runtime_response(runtime_call(Method, Peer, Path, Body, Opts), Opts);
+        error ->
+            misconfigured_peer()
+    end.
+
+%% One `relay@1.0' call to `Peer'.
+runtime_call(Method, Peer, Path, Body, Opts) ->
     Request0 = #{<<"method">> => Method, <<"path">> => Path},
     Request1 = case Body of
         undefined -> Request0;
@@ -276,16 +285,58 @@ runtime_call(Method, Path, Body, Opts) ->
                 <<"target">> => <<"payload">>,
                 <<"payload">> => Request
             },
-            auxiliary_opts(Opts)
+            relay_opts(Opts)
         )
     catch Class:Reason ->
         {error, {Class, Reason}}
     end.
 
-%% The configured base URL, without a trailing `/' (paths start with `/').
+%% @doc The runtime origin `scheme://host:port' taken from `inference-peer'.
+%% HyperBEAM's HTTP clients connect to a peer's host and port only and use
+%% TLS exactly when the port is 443. A peer is therefore rejected when it has
+%% a path other than `/', a query, a fragment or user information, when its
+%% host is empty or an IPv6 literal, or when it combines `https' with a port
+%% other than 443 or `http' with port 443. A missing port is 80 for `http'
+%% and 443 for `https'.
 runtime_peer(Opts) ->
-    Peer = hb_util:bin(hb_opts:get(<<"inference-peer">>, ?DEFAULT_PEER, Opts)),
-    string:trim(Peer, trailing, "/").
+    Configured = hb_opts:get(<<"inference-peer">>, ?DEFAULT_PEER, Opts),
+    try uri_string:parse(hb_util:bin(Configured)) of
+        #{scheme := Scheme, host := Host} = URI
+                when is_binary(Scheme), is_binary(Host) ->
+            runtime_origin(
+                string:lowercase(Scheme),
+                Host,
+                maps:get(port, URI, undefined),
+                maps:without([scheme, host, port], URI)
+            );
+        _ -> error
+    catch _:_ -> error
+    end.
+
+runtime_origin(Scheme, Host, Port, Rest) ->
+    IsOrigin = Host =/= <<>> andalso binary:match(Host, <<":">>) =:= nomatch
+        andalso lists:member(Rest, [#{}, #{path => <<>>}, #{path => <<"/">>}]),
+    case {IsOrigin, Scheme, Port} of
+        {false, _, _} -> error;
+        {true, <<"http">>, undefined} -> origin(Scheme, Host, 80);
+        {true, <<"http">>, Explicit}
+                when is_integer(Explicit), Explicit > 0, Explicit =/= 443 ->
+            origin(Scheme, Host, Explicit);
+        {true, <<"https">>, undefined} -> origin(Scheme, Host, 443);
+        {true, <<"https">>, 443} -> origin(Scheme, Host, 443);
+        _ -> error
+    end.
+
+origin(Scheme, Host, Port) ->
+    {ok, <<Scheme/binary, "://", Host/binary, ":",
+        (integer_to_binary(Port))/binary>>}.
+
+%% A configured request path; a missing leading `/' is added.
+runtime_path(Key, Default, Opts) ->
+    case hb_util:bin(hb_opts:get(Key, Default, Opts)) of
+        <<"/", _/binary>> = Path -> Path;
+        Path -> <<"/", Path/binary>>
+    end.
 
 %% Runtime calls and attestations are fresh side effects of this step: they
 %% are neither looked up in nor written to the result cache, and they carry
@@ -294,6 +345,15 @@ auxiliary_opts(Opts) ->
     Opts#{
         <<"hashpath">> => ignore,
         <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+    }.
+
+%% Runtime calls use the node's general HTTP client (`http-client', default
+%% `hackney') and therefore its connect and receive timeouts, rather than
+%% `relay@1.0''s own client setting.
+relay_opts(Opts) ->
+    (auxiliary_opts(Opts))#{
+        <<"relay-http-client">> =>
+            hb_opts:get(<<"http-client">>, hackney, Opts)
     }.
 
 %% Classify a `relay@1.0' result as a 2xx runtime response, a runtime error
@@ -336,6 +396,15 @@ unreachable(Reason) ->
     {error, 503,
         error_json(<<"runtime_unavailable">>, <<"runtime_unavailable">>,
             <<"The inference runtime is unreachable.">>),
+        #{}}.
+
+%% The configured value is not returned: it may name internal addresses.
+misconfigured_peer() ->
+    ?event(inference, invalid_inference_peer),
+    {error, 500,
+        error_json(<<"server_error">>, <<"runtime_misconfigured">>,
+            <<"The node's inference-peer option is not a supported runtime "
+              "origin.">>),
         #{}}.
 
 error_status(Status) when Status >= 400, Status =< 599 -> Status;
@@ -572,6 +641,7 @@ truthy(_) -> false.
 %%% Tests
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 %% TEST-NET addresses standing in for the caller and an intermediate proxy.
 -define(LEAK_NEEDLES, [
@@ -809,12 +879,18 @@ request_and_base_cannot_select_the_runtime_test_() ->
                     <<"inference-api-key">> => <<"caller-key">>,
                     <<"inference-attestation-device">> => <<"diverted@1.0">>
                 },
+                Ref = make_ref(),
                 Opts = (runtime_opts(URL))#{
-                    <<"inference-api-key">> => <<"operator-key">>},
+                    <<"inference-api-key">> => <<"operator-key">>,
+                    <<"inference-attestation-device">> =>
+                        stub_attestation_device(self(), Ref)
+                },
                 Base = Override#{<<"device">> => <<"inference@1.0">>},
-                {ok, _} = hb_ao:resolve(Base,
+                {ok, Attested} = hb_ao:resolve(Base,
                     maps:merge(chat_request(), Override#{
-                        <<"path">> => <<"completions">>}), Opts),
+                        <<"path">> => <<"completions">>,
+                        <<"tee">> => true
+                    }), Opts),
                 {ok, _} = hb_ao:resolve(Base,
                     Override#{<<"path">> => <<"models">>}, Opts),
                 {ok, _} = hb_ao:resolve(Base,
@@ -822,6 +898,12 @@ request_and_base_cannot_select_the_runtime_test_() ->
                 [Sent] = hb_mock_server:get_requests(chat, 1, Handle),
                 ?assertMatch(#{<<"authorization">> := <<"Bearer operator-key">>},
                     maps:get(<<"headers">>, Sent)),
+                %% The operator's attestation device answered, not the one
+                %% named on the request and the base message.
+                #{<<"attestation">> := #{<<"nonce">> := Nonce,
+                    <<"verified">> := true}} = decode_body(Attested),
+                ?assertEqual(Nonce, receive {attested_nonce, Ref, Asked} -> Asked
+                    after 5000 -> no_attestation_request end),
                 ?assertMatch([_], hb_mock_server:get_requests(models, 1, Handle)),
                 ?assertMatch([_], hb_mock_server:get_requests(health, 1, Handle)),
                 ?assertEqual([],
@@ -883,10 +965,72 @@ retry_after_is_preserved_test() ->
     {error, Reply} = reply(error, 429, ?JSON, Body, Extra, #{}, #{}),
     ?assertEqual(<<"7">>, maps:get(<<"retry-after">>, Reply)).
 
-runtime_peer_ignores_a_trailing_slash_test() ->
-    ?assertEqual(?DEFAULT_PEER, runtime_peer(#{})),
-    ?assertEqual(<<"http://runtime.test:8000">>, runtime_peer(
-        #{<<"inference-peer">> => <<"http://runtime.test:8000/">>})).
+runtime_peer_is_an_origin_test() ->
+    Peer = fun(URL) -> runtime_peer(#{<<"inference-peer">> => URL}) end,
+    ?assertEqual({ok, ?DEFAULT_PEER}, runtime_peer(#{})),
+    ?assertEqual({ok, <<"http://runtime.test:8000">>},
+        Peer(<<"http://runtime.test:8000/">>)),
+    ?assertEqual({ok, <<"http://runtime.test:80">>},
+        Peer(<<"HTTP://runtime.test">>)),
+    ?assertEqual({ok, <<"https://runtime.test:443">>},
+        Peer(<<"https://runtime.test">>)),
+    ?assertEqual({ok, <<"https://runtime.test:443">>},
+        Peer(<<"https://runtime.test:443/">>)),
+    lists:foreach(
+        fun(URL) -> ?assertEqual(error, Peer(URL)) end,
+        [
+            <<"http://runtime.test:8000/openai">>,
+            <<"https://runtime.test:8443">>,
+            <<"http://runtime.test:443">>,
+            <<"http://runtime.test:8000?key=1">>,
+            <<"http://user@runtime.test:8000">>,
+            <<"http://[::1]:8000">>,
+            <<"ftp://runtime.test:21">>,
+            <<"runtime.test:8000">>,
+            <<"not a url">>
+        ]).
+
+runtime_paths_start_with_a_slash_test() ->
+    ?assertEqual(<<"/v1/chat/completions">>,
+        runtime_path(<<"inference-path">>, ?DEFAULT_PATH, #{})),
+    ?assertEqual(<<"/openai/v1/models">>,
+        runtime_path(<<"inference-models-path">>, ?DEFAULT_MODELS_PATH,
+            #{<<"inference-models-path">> => <<"openai/v1/models">>})).
+
+invalid_peer_is_reported_without_a_request_test() ->
+    Opts = #{<<"inference-peer">> => <<"https://runtime.test:8443">>},
+    lists:foreach(
+        fun(Error) ->
+            ?assertEqual(500, maps:get(<<"status">>, Error)),
+            ?assertMatch(#{<<"error">> :=
+                    #{<<"code">> := <<"runtime_misconfigured">>}},
+                decode_body(Error)),
+            ?assertEqual(nomatch,
+                binary:match(maps:get(<<"body">>, Error), <<"8443">>))
+        end,
+        [element(2, completions(#{}, chat_request(), Opts)),
+            element(2, models(#{}, #{}, Opts)),
+            element(2, health(#{}, #{}, Opts))]).
+
+%% A runtime that accepts the connection and never answers is reported as
+%% unavailable once the node HTTP client's receive timeout expires.
+silent_runtime_times_out_test_() ->
+    {timeout, 60, fun() ->
+        Silent = fun(_Req) -> timer:sleep(infinity) end,
+        with_runtime([{"/health", health, Silent}, {"/v1/models", models, Silent}],
+            fun(URL, _Handle) ->
+                Opts = (runtime_opts(URL))#{
+                    <<"http-client-hackney-recv-timeout">> => 500},
+                lists:foreach(
+                    fun(Key) ->
+                        {Micros, {error, Error}} =
+                            timer:tc(?MODULE, Key, [#{}, #{}, Opts]),
+                        ?assertEqual(503, maps:get(<<"status">>, Error)),
+                        ?assert(Micros < 20000000)
+                    end,
+                    [health, models])
+            end)
+    end}.
 
 relay_results_are_classified_test() ->
     Body = <<"{\"ok\":true}">>,
