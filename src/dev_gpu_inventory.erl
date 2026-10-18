@@ -365,7 +365,9 @@ timeout(Opts) ->
     end.
 
 %% @doc Run an executable without a shell and collect its standard output
-%% within `Timeout' milliseconds.
+%% for at most `Timeout' milliseconds. On timeout the device closes the port,
+%% which closes the process's standard input and output; the process itself
+%% ends when it next writes output or exits on its own.
 run(Path, Args, Timeout) ->
     PortOpts = [{args, Args}, binary, exit_status, use_stdio, hide],
     try open_port({spawn_executable, Path}, PortOpts) of

@@ -58,7 +58,7 @@ reported in `errors`.
 |---|---|---|
 | `gpu-inventory-root` | `/sys` | Root of the sysfs tree to read. |
 | `gpu-inventory-nvidia-smi-path` | `nvidia-smi` | An absolute path, or a bare executable name looked up in the node's `PATH`. Any other relative path counts as absent. |
-| `gpu-inventory-nvidia-smi-timeout` | `10000` | Upper bound in milliseconds for one `nvidia-smi` run: a positive integer or decimal string; other values select the default. |
+| `gpu-inventory-nvidia-smi-timeout` | `10000` | How long, in milliseconds, the device waits for one `nvidia-smi` run: a positive integer or decimal string; other values select the default. |
 
 ## 4. Resolved keys (normative)
 
@@ -221,8 +221,11 @@ rendered as the strings `"true"` and `"false"`, typed through `ao-types`.
   reported; it does not prove what hardware is present.
 - Requests cannot choose the sysfs root, the executable or the timeout; these
   are node options. No key reads the request or base message.
-- `nvidia-smi` runs through an argument vector with predefined field lists, never
-  through a shell, with bounded run time and output.
+- `nvidia-smi` runs through an argument vector with predefined field lists,
+  never through a shell. The device reads at most 1 MiB of its output and
+  waits at most the configured timeout. On timeout it closes the port, which
+  closes the process's standard input and output; the process ends when it
+  next writes output or exits on its own.
 - The report contains PCI identities, driver and firmware versions and GPU
   UUIDs. It contains no credentials and no file paths.
 
@@ -264,7 +267,8 @@ no `nvidia-smi` error.
 7. A missing `nvidia-smi` is not an error; a failing, slow or malformed run is
    reported in `errors`.
 8. The sysfs root and the executable come only from node options.
-9. `nvidia-smi` is run without a shell, bounded in time and output size.
+9. `nvidia-smi` is run without a shell; the device waits at most the
+   configured timeout and reads at most 1 MiB of output.
 
 ## 11. Out of scope
 

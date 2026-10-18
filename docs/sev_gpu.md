@@ -61,8 +61,9 @@ readelf -d priv/dev_sev_gpu/dev_sev_gpu_nif.so | grep -E 'RUNPATH|RPATH'
 
 Expected: `[$ORIGIN/lib:$ORIGIN/../lib]`.
 
-The `dev_sev_gpu_nif` module always carries the name the library declares, so
-the NIF loads whatever generated name Device Forge gives the device module. When the module is present but the library does not load (for
+The `dev_sev_gpu_nif` module always carries the name the library declares,
+so the NIF loads whatever generated name Device Forge gives the device
+module. When the module is present but the library does not load (for
 example because `libnvat` is missing), the node prints one line on standard
 error:
 
@@ -70,12 +71,32 @@ error:
 sev_gpu@1.0: NVAT NIF not loaded from <path>: <reason>
 ```
 
+The module and its library stay loaded until the node stops. After an
+upgrade of the `sev_gpu@1.0` implementation archive the node keeps the
+loaded copy and prints one line naming the loaded and the new module file;
+restart the node to load the new native backend.
+
 ## Command-line backend
 
 Without the NIF, `sev_gpu@1.0` runs NVIDIA's `nvattest` tool directly (no
 shell) from `sev-gpu-nvattest-path`, `/usr/bin/nvattest` by default. Install
-it with the NVAT SDK; `nvattest version` prints the installed version. `verify`
-on this backend needs an `nvattest` that supports `--gpu-evidence-source file`.
+it with the NVAT SDK; `nvattest version` prints the installed version.
+`verify` on this backend needs an `nvattest` whose `attest` command accepts
+`--gpu-evidence-source file`:
+
+```bash
+/usr/bin/nvattest attest --help | grep -e '--gpu-evidence-source' -e '--gpu-evidence-file'
+```
+
+The device stops waiting for a run after `sev-gpu-nvattest-timeout` and
+closes the process's pipes. To also bound the lifetime of the process, point
+`sev-gpu-nvattest-path` at a wrapper executable that enforces a limit, for
+example one that runs `nvattest` under coreutils `timeout`.
+
+Both backends use NVAT's default policy, which fetches reference integrity
+manifests from NVIDIA's RIM service and checks certificate revocation with
+NVIDIA's OCSP responder. The node needs outbound HTTPS access to
+`rim.attestation.nvidia.com` and `ocsp.ndis.nvidia.com`.
 
 ## Node options
 
@@ -88,8 +109,13 @@ on this backend needs an `nvattest` that supports `--gpu-evidence-source file`.
 | `gpu-inventory-root` | `/sys` | `gpu_inventory@1.0` |
 | `gpu-inventory-nvidia-smi-path` | `nvidia-smi` | `gpu_inventory@1.0`: absolute path or name in `PATH` |
 | `gpu-inventory-nvidia-smi-timeout` | `10000` (ms) | `gpu_inventory@1.0` |
-| `measurement-mode` | `auto` | `inference_measurement@1.0` |
+| `measurement-mode` | `auto` | `inference_measurement@1.0`: `auto`, `hook-body` or `observation-only` |
+| `inference-measurement-inventory-device` | `gpu_inventory@1.0` | `inference_measurement@1.0` |
+| `inference-measurement-gpu-tee-device` | `sev_gpu@1.0` | `inference_measurement@1.0` |
+| `inference-measurement-base-device` | `measurement@1.0` | `inference_measurement@1.0` |
 | `inference-measurement-sev-guest-path` | `/dev/sev-guest` | `inference_measurement@1.0` |
+
+Section 3 of each specification defines these options in full.
 
 Set `sev-gpu-backend` to `nif` on a node that must never fall back to
 `nvattest`; `generate` then fails with `nif_unavailable` when the NIF is not
@@ -120,5 +146,7 @@ rebar3 device test --device-src=src,vendor/permaweb-os/src \
 ```
 
 The tests cover nonce validation, the claims rule, both backends (with
-stand-in executables), inventory parsing and the measurement binding. Tests
-that need a real GPU run on a confidential-computing host and skip elsewhere.
+stand-in executables), inventory parsing, the measurement binding and its
+anchoring in the host report. Two tests attest the real GPU end to end on a
+confidential-computing host; elsewhere they check that `generate` reports
+the missing attestation backend as an error.
