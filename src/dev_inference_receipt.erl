@@ -16,7 +16,6 @@
 -export([info/1, completions/3, chat/3, v1/3, models/3, health/3,
     verify_hashpath/3, publish/3]).
 -include_lib("hb/include/hb.hrl").
--include_lib("eunit/include/eunit.hrl").
 
 -define(VERSION, <<"1.0">>).
 -define(INFERENCE_BASE, #{<<"device">> => <<"inference@1.0">>}).
@@ -55,7 +54,8 @@ info(_Opts) ->
         version => ?VERSION
     }.
 
-%% @doc Run a non-streaming completion and attach a receipt.
+%% @doc Run a non-streaming completion and attach a receipt. A result of
+%% `inference@1.0' that is not a message is returned unchanged.
 -spec completions(
     #{ _ => _ },
     #{
@@ -73,7 +73,7 @@ info(_Opts) ->
         _ => _
     },
     map()
-) -> {ok, #{ receipt := map(), _ => _ }} | {error, _}.
+) -> {ok, _} | {error, _}.
 completions(_Base, Req, Opts) ->
     decorate(<<"completions">>, Req, Opts).
 
@@ -127,7 +127,9 @@ v1(Base, Req, Opts) ->
     )}.
 
 %% @doc Publish a completed receipt through HyperBEAM's bundler. The device
-%% signs the ANS-104 item; callers never handle a wallet or a signature.
+%% signs the ANS-104 item; callers never handle a wallet or a signature. With
+%% the `receipt-publishers' node option set, only requests signed by one of
+%% the listed addresses are accepted.
 -spec publish(
     #{ _ => _ },
     #{ receipt => _, body => _, _ => _ },
@@ -135,16 +137,51 @@ v1(Base, Req, Opts) ->
 ) -> {ok, #{ id := binary(), 'bundle-id' := binary(), _ => _ }}
     | {error, #{ status := integer(), body := _ }}.
 publish(_Base, Req, Opts) ->
-    case first_defined([
+    Receipt = first_defined([
         hb_ao:get(<<"receipt">>, Req, undefined, Opts),
         hb_ao:get(<<"body">>, Req, undefined, Opts)
-    ]) of
-        undefined ->
+    ]),
+    case {authorized_publisher(Req, Opts), Receipt} of
+        {false, _} ->
+            {error, #{<<"status">> => 403, <<"body">> => #{
+                <<"error">> => <<"receipt-publisher-not-allowed">>
+            }}};
+        {true, undefined} ->
             {error, #{<<"status">> => 400, <<"body">> => #{
                 <<"error">> => <<"receipt-required">>
             }}};
-        Receipt ->
+        {true, _} ->
             publish_receipt(Receipt, Opts)
+    end.
+
+%% Without `receipt-publishers' any caller may publish. With it, a listed
+%% address must have committed to the published key (`receipt', else `body'),
+%% and its commitments must verify against the request as the device sees
+%% it.
+authorized_publisher(Req, Opts) ->
+    case hb_opts:get(<<"receipt-publishers">>, undefined, Opts) of
+        undefined -> true;
+        Allowed when is_list(Allowed) ->
+            Key = case hb_maps:is_key(<<"receipt">>, Req, Opts) of
+                true -> <<"receipt">>;
+                false -> <<"body">>
+            end,
+            lists:any(
+                fun(Signer) ->
+                    lists:member(Signer, Allowed) andalso
+                        signed_by(Signer, Key, Req, Opts)
+                end,
+                safe_signers(Req, Opts)
+            );
+        _ -> false
+    end.
+
+signed_by(Signer, Key, Req, Opts) ->
+    Committers = #{<<"committers">> => [Signer]},
+    try
+        lists:member(Key, hb_message:committed(Req, Committers, Opts))
+            andalso hb_message:verify(Req, Committers, Opts) =:= true
+    catch _:_ -> false
     end.
 
 publish_receipt(Receipt, Opts) ->
@@ -409,7 +446,8 @@ decorate(Path, Req, Opts) ->
             case hb_ao:resolve(?INFERENCE_BASE, ExecutionReq,
                     execution_opts(Opts)) of
                 {ok, Response} -> add_receipt(Response, ExecutionReq, Opts);
-                Error -> Error
+                {error, _} = Error -> Error;
+                {_Status, Reason} -> {error, Reason}
             end
     end.
 
@@ -443,6 +481,16 @@ body_with_receipt(Body, Receipt, _Opts) when is_map(Body) ->
     Body#{<<"receipt">> => json_safe(Receipt)};
 body_with_receipt(Body, _Receipt, _Opts) ->
     Body.
+
+%% The receipt as a JSON client decodes it: absent values removed, links and
+%% other tuples converted (json_safe/1), then encoded and decoded once. The
+%% node commits this form, so `signed-receipt' verifies after the JSON body is
+%% decoded.
+json_form(Value) ->
+    Safe = json_safe(Value),
+    try hb_json:decode(hb_json:encode(Safe))
+    catch _:_ -> Safe
+    end.
 
 json_safe(Map) when is_map(Map) ->
     maps:fold(
@@ -488,12 +536,12 @@ make_receipt(ExecutionReq, Body, Response, Opts) ->
         <<"provenance-class">> => Provenance
     },
     Receipt0 = add_execution_bindings(ReceiptBase, ExecutionReq, Opts, Inventory),
-    Receipt1 = Receipt0#{
+    Receipt1 = json_form(Receipt0#{
         <<"system-measurement">> => Measurement,
         <<"ao-core">> =>
             ao_core_evidence(?INFERENCE_BASE, ExecutionReq, Response, Opts),
         <<"device-chain">> => device_chain_evidence()
-    },
+    }),
     Committed = try hb_message:commit(Receipt1, Opts)
     catch _:_ -> Receipt1
     end,
@@ -646,16 +694,12 @@ add_execution_bindings(Receipt, Req, Opts, Inventory) ->
         Candidates
     ).
 
-%% @doc Resolve the node's GPU inventory report. The inventory device reads
-%% its own node options; nothing from the caller's request is forwarded.
+%% @doc Resolve the node's GPU inventory report.
 resolve_inventory(Opts) ->
     probe(
         fun() ->
-            {ok, Response} = hb_ao:resolve(
-                #{<<"device">> => <<"gpu_inventory@1.0">>},
-                #{<<"path">> => <<"report">>},
-                Opts
-            ),
+            {Base, Req} = inventory_probe(),
+            {ok, Response} = hb_ao:resolve(Base, Req, Opts),
             result_body(Response, Opts)
         end
     ).
@@ -664,14 +708,20 @@ resolve_inventory(Opts) ->
 resolve_measurement(RequestDigest, Opts) ->
     probe(
         fun() ->
-            {ok, Response} = hb_ao:resolve(
-                #{<<"device">> => <<"inference_measurement@1.0">>},
-                #{<<"path">> => <<"fresh">>, <<"nonce">> => RequestDigest},
-                Opts
-            ),
+            {Base, Req} = measurement_probe(RequestDigest),
+            {ok, Response} = hb_ao:resolve(Base, Req, Opts),
             measurement_fields(result_body(Response, Opts), Opts)
         end
     ).
+
+%% The probe messages. They carry nothing from the caller's request: the
+%% inventory and measurement devices read their own node options.
+inventory_probe() ->
+    {#{<<"device">> => <<"gpu_inventory@1.0">>}, #{<<"path">> => <<"report">>}}.
+
+measurement_probe(RequestDigest) ->
+    {#{<<"device">> => <<"inference_measurement@1.0">>},
+        #{<<"path">> => <<"fresh">>, <<"nonce">> => RequestDigest}}.
 
 %% A probe that fails, or whose device is not loadable on this node,
 %% contributes an empty object instead of failing the completion.
@@ -778,6 +828,7 @@ first_defined([undefined | Rest]) -> first_defined(Rest);
 first_defined([Value | _]) -> Value.
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 %% TEST-NET addresses standing in for the caller and an intermediate proxy.
 -define(LEAK_NEEDLES, [
@@ -915,8 +966,18 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
             %% `tee=true' attests the same response: the report is bound to
             %% the SHA-256 of the published `raw'.
             #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce,
-                <<"verified">> := true}, <<"receipt">> := _} =
+                <<"verified">> := true}, <<"receipt">> := JsonReceipt} =
                     hb_json:decode(maps:get(<<"body">>, Result)),
+            %% The signed receipt verifies in the message and in the JSON
+            %% body, and its only signer is `node-address'.
+            assert_signed_by(NodeAddress,
+                maps:get(<<"signed-receipt">>, maps:get(<<"receipt">>, Result)),
+                Opts),
+            assert_signed_by(NodeAddress,
+                maps:get(<<"signed-receipt">>, JsonReceipt), Opts),
+            ?assertEqual(
+                maps:without([<<"signed-receipt">>], maps:get(<<"receipt">>, Result)),
+                maps:without([<<"signed-receipt">>], JsonReceipt)),
             ?assertEqual(hb_util:to_hex(hb_crypto:sha256(Raw)), Nonce),
             ?assertEqual(Nonce,
                 receive {attested_nonce, Ref, Asked} -> Asked
@@ -938,18 +999,36 @@ request_and_base_cannot_select_the_runtime_test_() ->
                     <<"inference-peer">> => Diverted,
                     <<"inference-path">> => <<"/diverted">>,
                     <<"inference-api-key">> => <<"caller-key">>,
-                    <<"gpu-inventory-root">> => <<"/diverted">>
+                    <<"inference-attestation-device">> => <<"diverted@1.0">>,
+                    <<"gpu-inventory-root">> => <<"/diverted">>,
+                    <<"measurement-mode">> => <<"diverted">>
                 },
+                Ref = make_ref(),
                 Opts = (node_opts(URL))#{
-                    <<"inference-api-key">> => <<"operator-key">>},
+                    <<"inference-api-key">> => <<"operator-key">>,
+                    <<"inference-attestation-device">> =>
+                        stub_attestation_device(self(), Ref)
+                },
                 Base = Override#{<<"device">> => <<"inference_receipt@1.0">>},
                 Chat = #{
                     <<"model">> => <<"test-model">>,
                     <<"messages">> =>
-                        [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+                        [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}],
+                    <<"tee">> => true
                 },
-                {ok, _} = hb_ao:resolve(Base, maps:merge(Chat,
+                {ok, Result} = hb_ao:resolve(Base, maps:merge(Chat,
                     Override#{<<"path">> => <<"completions">>}), Opts),
+                %% None of the override keys entered the executed request.
+                #{<<"ao-core">> := #{<<"verification-input">> :=
+                    #{<<"request">> := Executed}}} = maps:get(<<"receipt">>, Result),
+                ?assertEqual([], [Key || Key <- maps:keys(Override),
+                    maps:is_key(Key, Executed)]),
+                %% The operator's attestation device answered.
+                #{<<"attestation">> := #{<<"verified">> := true,
+                    <<"nonce">> := Nonce}} =
+                        hb_json:decode(maps:get(<<"body">>, Result)),
+                ?assertEqual(Nonce, receive {attested_nonce, Ref, Asked} -> Asked
+                    after 5000 -> no_attestation_request end),
                 {ok, _} = hb_ao:resolve(Base,
                     Override#{<<"path">> => <<"models">>}, Opts),
                 {ok, _} = hb_ao:resolve(Base,
@@ -1012,6 +1091,21 @@ result_body_accepts_bare_and_enveloped_results_test() ->
         result_body(#{<<"status">> => 200, <<"body">> => Envelope}, #{})),
     ?assertEqual(#{}, result_body(not_a_message, #{})).
 
+probes_carry_only_a_path_and_the_request_digest_test() ->
+    ?assertEqual(
+        {#{<<"device">> => <<"gpu_inventory@1.0">>},
+            #{<<"path">> => <<"report">>}},
+        inventory_probe()),
+    ?assertEqual(
+        {#{<<"device">> => <<"inference_measurement@1.0">>},
+            #{<<"path">> => <<"fresh">>, <<"nonce">> => <<"digest">>}},
+        measurement_probe(<<"digest">>)).
+
+%% `Signed' verifies and `Address' is its only signer.
+assert_signed_by(Address, Signed, Opts) ->
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    ?assertEqual([Address], hb_message:signers(Signed, Opts)).
+
 %% The wire contract seen by HTTP clients: plain and attested completions,
 %% streaming refusal, health, the model list, a receipt and its HashPath
 %% verification, all through a node's HTTP server.
@@ -1058,9 +1152,10 @@ http_round_trip_test_() ->
             {200, WithReceipt} = http_post(Node,
                 "~inference_receipt@1.0/v1/chat/completions", Chat),
             #{<<"choices">> := [_], <<"receipt">> := Receipt} = WithReceipt,
-            #{<<"node-address">> := NodeAddress, <<"ao-core">> := AOCore} =
-                Receipt,
+            #{<<"node-address">> := NodeAddress, <<"ao-core">> := AOCore,
+                <<"signed-receipt">> := SignedReceipt} = Receipt,
             ?assertEqual(43, byte_size(NodeAddress)),
+            assert_signed_by(NodeAddress, SignedReceipt, #{}),
             ?assertEqual(<<"verified">>,
                 maps:get(<<"verification-status">>, AOCore)),
             {200, Verification} = http_post(Node,
@@ -1153,6 +1248,72 @@ publish_posts_signed_bundle_before_returning_test_() ->
                 ?assertMatch({ok, #{<<"id">> := _, <<"bundle-id">> := _,
                     <<"bundle-status">> := <<"complete">>}}, Result)
                 after 3000 -> error(no_publish_completion) end
+        after
+            hb_mock_server:stop(Server)
+        end
+    end}.
+
+publisher_allowlist_requires_a_verified_listed_signer_test() ->
+    Publisher = ar_wallet:new(),
+    Address = hb_util:human_id(ar_wallet:to_address(Publisher)),
+    Opts = #{<<"receipt-publishers">> => [Address]},
+    Request = #{<<"receipt">> => <<"{\"type\":\"apus-inference-receipt\"}">>},
+    Signed = hb_message:commit(Request, #{<<"priv-wallet">> => Publisher}),
+    ?assert(authorized_publisher(Signed, Opts)),
+    ?assertNot(authorized_publisher(Request, Opts)),
+    ?assertNot(authorized_publisher(
+        hb_message:commit(Request, #{<<"priv-wallet">> => ar_wallet:new()}),
+        Opts)),
+    %% A commitment that names a listed signer must also verify, and must
+    %% cover the published key.
+    ?assertNot(authorized_publisher(
+        Signed#{<<"receipt">> => <<"{\"type\":\"other\"}">>}, Opts)),
+    ?assertNot(authorized_publisher(
+        (hb_message:commit(#{<<"note">> => <<"x">>},
+            #{<<"priv-wallet">> => Publisher}))#{
+                <<"receipt">> => <<"{}">>}, Opts)),
+    ?assertNot(authorized_publisher(Signed, #{<<"receipt-publishers">> => []})),
+    ?assert(authorized_publisher(Request, #{})),
+    ?assertMatch({error, #{<<"status">> := 403, <<"body">> :=
+            #{<<"error">> := <<"receipt-publisher-not-allowed">>}}},
+        publish(#{}, Request, Opts)).
+
+%% Over HTTP, only a request whose `receipt' a listed address signed is
+%% published. The publisher commits to the published key, not to `path'.
+publish_over_http_honours_the_allowlist_test_() ->
+    {timeout, 60, fun() ->
+        {Server, GatewayOpts} = hb_mock_server:start_arweave_gateway(#{
+            price => {200, <<"12345">>},
+            tx_anchor => {200, hb_util:encode(crypto:strong_rand_bytes(32))},
+            chunk => {200, <<"OK">>}
+        }),
+        try
+            Publisher = ar_wallet:new(),
+            Node = hb_http_server:start_node(GatewayOpts#{
+                <<"port">> => 0,
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"store">> => hb_test_utils:test_store(),
+                <<"receipt-publishers">> =>
+                    [hb_util:human_id(ar_wallet:to_address(Publisher))]
+            }),
+            ClientOpts = #{<<"store">> => hb_test_utils:test_store()},
+            Path = <<"/~inference_receipt@1.0/publish">>,
+            Request = #{<<"receipt">> =>
+                <<"{\"type\":\"apus-inference-receipt\"}">>},
+            Post = fun(Msg) -> hb_http:post(Node, Path, Msg, ClientOpts) end,
+            SignedBy = fun(Wallet, Msg) ->
+                hb_message:commit(Msg, ClientOpts#{<<"priv-wallet">> => Wallet})
+            end,
+            Refused = [
+                Post(Request),
+                Post(SignedBy(ar_wallet:new(), Request)),
+                Post(SignedBy(Publisher, Request#{<<"path">> => Path}))
+            ],
+            [?assertMatch({error, #{<<"status">> := 403}}, Result)
+                || Result <- Refused],
+            ?assertMatch({ok, #{<<"id">> := _, <<"bundle-id">> := _,
+                    <<"bundle-status">> := <<"complete">>}},
+                Post(SignedBy(Publisher, Request)))
         after
             hb_mock_server:stop(Server)
         end
