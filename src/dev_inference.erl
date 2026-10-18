@@ -257,7 +257,7 @@ public_request(Req, Body, Opts) ->
 %% Send one request to the configured runtime through `relay@1.0'. Only node
 %% options select the peer, the path and the credential.
 runtime_call(Method, Path, Body, Opts) ->
-    Peer = hb_opts:get(<<"inference-peer">>, ?DEFAULT_PEER, Opts),
+    Peer = runtime_peer(Opts),
     Request0 = #{<<"method">> => Method, <<"path">> => Path},
     Request1 = case Body of
         undefined -> Request0;
@@ -281,6 +281,11 @@ runtime_call(Method, Path, Body, Opts) ->
     catch Class:Reason ->
         {error, {Class, Reason}}
     end.
+
+%% The configured base URL, without a trailing `/' (paths start with `/').
+runtime_peer(Opts) ->
+    Peer = hb_util:bin(hb_opts:get(<<"inference-peer">>, ?DEFAULT_PEER, Opts)),
+    string:trim(Peer, trailing, "/").
 
 %% Runtime calls and attestations are fresh side effects of this step: they
 %% are neither looked up in nor written to the result cache, and they carry
@@ -866,6 +871,11 @@ retry_after_is_preserved_test() ->
     ?assertEqual(#{<<"retry-after">> => <<"7">>}, Extra),
     {error, Reply} = reply(error, 429, ?JSON, Body, Extra, #{}, #{}),
     ?assertEqual(<<"7">>, maps:get(<<"retry-after">>, Reply)).
+
+runtime_peer_ignores_a_trailing_slash_test() ->
+    ?assertEqual(?DEFAULT_PEER, runtime_peer(#{})),
+    ?assertEqual(<<"http://runtime.test:8000">>, runtime_peer(
+        #{<<"inference-peer">> => <<"http://runtime.test:8000/">>})).
 
 relay_results_are_classified_test() ->
     Body = <<"{\"ok\":true}">>,

@@ -88,7 +88,7 @@ message):
 
 | Option | Default | Meaning |
 |---|---|---|
-| `inference-peer` | `http://localhost:30001` | Base URL of the runtime. |
+| `inference-peer` | `http://localhost:30001` | Base URL of the runtime; a trailing `/` is ignored. |
 | `inference-path` | `/v1/chat/completions` | Path for `completions`. |
 | `inference-models-path` | `/v1/models` | Path for `models`. |
 | `inference-health-path` | `/health` | Path for `health`. |
