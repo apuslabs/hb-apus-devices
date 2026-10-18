@@ -1,102 +1,412 @@
-# inference_receipt@1.0
+# `inference_receipt@1.0` — signed, HashPath-verifiable receipts for `inference@1.0` completions
 
-Receipt decorator for `inference@1.0`.
+- **Depends-on:** `inference@1.0` (the recorded completion step, `models`, `health`), `gpu_inventory@1.0` (`report`), `inference_measurement@1.0` (`fresh`), `bundler@1.0` (`item`, for `publish`), `ans104@1.0` (commitment device for published data items).
+- **Status:** Stable
+- **Maintainer:** Apus Network (https://apus.network)
 
-The device runs a non-streaming chat completion through `inference@1.0`,
-hashes the executed request and the response, collects `gpu_inventory@1.0/report`
-and `inference_measurement@1.0/fresh`, and returns the runtime's JSON with a
-signed `receipt` object added. Streaming requests are rejected.
+## 1. Overview
 
-## Keys
+`inference_receipt@1.0` turns one `inference@1.0` chat completion into
+verifiable evidence. `completions` builds an allowlisted request, executes it
+on `inference@1.0` as a single AO-Core step whose HashPath is always
+generated, and returns the runtime's JSON with a `receipt` added. The receipt
+binds:
+
+- digests of the executed request and of the response;
+- the step's AO-Core transcript (base, request, response) and HashPath;
+- the node's GPU inventory and a fresh system measurement whose nonce is the
+  request digest;
+- the node's signature over all of the above.
+
+`verify-hashpath` recomputes the HashPath of a recorded transcript and
+compares it with the value the receipt recorded. `publish` signs a receipt
+as an ANS-104 data item and submits it to the node's bundler, so the evidence
+can be stored on Arweave.
+
+**Reference deployment (informative).** Apus Network operates this device at
+`https://hb.apus.network`, decorating an SGLang runtime that serves
+`google/gemma-4-26B-A4B-it` inside an AMD SEV-SNP guest with an NVIDIA H100
+in confidential-computing mode.
+
+## 2. Concepts & terminology
+
+- **Generation parameters:** the parameters `inference@1.0` relays, without
+  its `user` identifier: `model`, `prompt`, `messages`, `max_tokens`,
+  `max_completion_tokens`, `temperature`, `top_p`, `n`, `stream`, `stop`,
+  `presence_penalty`, `frequency_penalty`, `logit_bias`, `seed`, `top_k`,
+  `repetition_penalty`, `length_penalty`, `early_stopping`, `tools`,
+  `tool_choice`, `response_format`, `chat_template_kwargs`,
+  `reasoning_effort`.
+- **Declarations:** optional caller statements about the deployed artifacts:
+  `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`,
+  `model-tx`, `workload-manifest-id`, `model-revision`, `runtime-name`,
+  `runtime-version`. They are recorded, not checked.
+- **Execution keys:** the generation parameters, `tee`, `type` and the
+  declarations. Only these keys of a caller's request can enter the executed
+  request.
+- **Executed request:** the AO-Core request message that runs on
+  `inference@1.0` and is recorded (§4, `completions`).
+- **Recorded step:** the resolution of the base message
+  `{"device": "inference@1.0"}` with the executed request.
+- **HashPath:** the AO-Core identifier that commits to a step's base message
+  and request (`hb_path:hashpath/3`). AO-Core places it in the response's
+  private `hashpath`.
+- **Transcript:** the recorded step's base message, executed request and
+  response.
+- **Truthy:** the values `true`, `"true"`, `"1"` and `1`.
+- **Digest:** the unpadded base64url SHA-256 of a binary, or of the JSON
+  encoding of any other value.
+
+## 3. Device interface
+
+- **Dispatch shape:** explicit keys: `completions`, `chat`, `v1`, `models`,
+  `health`, `verify-hashpath` and `publish`. No default handler; any other key
+  resolves under `message@1.0`.
+- **Routing keys:** `v1` and `chat` merge the request into the base message,
+  keep this device and set `chat-mode: true`, so
+  `/~inference_receipt@1.0/v1/chat/completions` and
+  `/~inference_receipt@1.0/chat/completions` reach `completions`.
 
 | Key | Method | Purpose |
 |---|---|---|
-| `v1` | POST | Router. `/~inference_receipt@1.0/v1/chat/completions` reaches `completions`. |
-| `chat` | POST | Marks a chat request and forwards to `completions`. |
-| `completions` | POST | Runs the completion and attaches the receipt. |
-| `models` | GET | Delegates to `inference@1.0/models` without creating a receipt. |
-| `health` | GET | Delegates to `inference@1.0/health` without creating a receipt. |
-| `verify-hashpath` | POST | Recomputes a recorded transcript's HashPath and compares it with the receipt's `ao-core.hashpath`. |
-| `publish` | POST | Signs a receipt as an ANS-104 item and submits it to `bundler@1.0`. |
+| `completions` | POST | Execute an allowlisted completion on `inference@1.0` and attach a receipt. |
+| `chat` | POST | Route to `completions`. |
+| `v1` | POST, GET | Route the OpenAI `/v1/...` prefix to the next key. |
+| `models` | GET | Return `inference@1.0/models`; no receipt. |
+| `health` | GET | Return `inference@1.0/health`; no receipt. |
+| `verify-hashpath` | POST | Recompute a recorded transcript's HashPath and compare it with the recorded value. |
+| `publish` | POST | Sign a receipt as an ANS-104 data item and submit it to `bundler@1.0`. |
 
-## Request (`completions`)
+Node options:
 
-All `inference@1.0` request keys, plus optional execution declarations that
-are copied into the receipt for a verifier to compare against the deployed
-artifacts: `model-sha256`, `model-source`, `model-tx`, `model-revision`,
-`runtime-name`, `runtime-version`, `runtime-build-hash`, `inference-profile`,
-`workload-manifest-id`, `measurement-mode`, `gpu-inventory-root`.
+| Option | Default | Meaning |
+|---|---|---|
+| `receipt-wallet-location` | unset | Path of the wallet file that signs published data items. Unset: the node wallet signs them. |
+| `receipt-publishers` | unset | List of addresses allowed to call `publish` (§4, §7). Unset: any caller. |
+| `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx` | unset | Execution bindings recorded when the request declares none (§5). |
 
-These declarations are recorded, not checked. The device does not download or
-hash the model.
+The runtime route, the attestation device and the inventory and measurement
+configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
+`inference_measurement@1.0`; this device neither sets nor overrides them.
 
-The executed and recorded request is built from an allowlist before the
-`inference@1.0` step runs: the generation parameters, `tee`, the declarations
-above (except `measurement-mode` and `gpu-inventory-root`, which only select
-how the node probes itself), `path`, and a random `request-nonce`. HTTP
-headers such as `cf-connecting-ip`, `x-forwarded-for`, `x-real-ip`,
-`user-agent`, cookies and credentials, the OpenAI `user` identifier and the
-private peer `ip` never enter the HashPath, `request-digest` or the published
-receipt. The nonce keeps identical prompts from sharing a HashPath or a
-cached, previously attested response.
+## 4. Resolved keys (normative)
 
-## Response (`completions`)
+### `completions` — execute and attach a receipt
 
-The runtime JSON plus `receipt`, which contains the request and response
-digests, the node address, the GPU inventory digest, the measurement
-envelope (or an observation-only result when hardware measurement is
-unavailable), and the node's signature. Its `ao-core` object records
-`status` (`captured` or `not-captured`), the `hashpath` AO-Core assigned to
-the response, the `verification-input` messages, and `verification-status`
-(`verified`, `failed`, `not-captured` or `unavailable`). The node computes
-`verification-status` with the same comparison as `verify-hashpath`.
+- **Reads:** the request's `body` and execution keys; the node options
+  above; the node identity wallet.
+- **Behaviour:**
+  1. Build the executed request: the execution keys found in the request's
+     `body` (when it is a JSON object or a map), overridden by the execution
+     keys found on the request itself, with `path: completions` and
+     `request-nonce` (32 random bytes, unpadded base64url). No other key of
+     the caller's request is included.
+  2. If the executed request's `stream` is truthy, return the 400 error
+     `receipt-streaming-unsupported` (§8).
+  3. Resolve `{"device": "inference@1.0"}` with the executed request, using
+     the node options plus `hashpath: update` and `cache-control: no-store,
+     no-cache`. An `{error, _}` result is returned unchanged; any other
+     result that is not `{ok, _}` is returned as `{error, Reason}`.
+  4. Resolve `gpu_inventory@1.0` with `path: report`, and
+     `inference_measurement@1.0` with `path: fresh` and `nonce:
+     <request-digest>`; nothing else is sent. Each `{ok, Result}` is read
+     with this rule:
+     - a map with a `type` key is the result itself (a bare result; bare
+       results MUST carry `type`, and their `body` is never unwrapped);
+     - a map without `type` whose `body` is a map is that `body`;
+     - a map without `type` whose `body` is a binary is that binary decoded
+       as a JSON object, or `{}` when it is not one;
+     - a map without `type` whose `body` is any other value is `{}`;
+     - a map without `type` and without `body` is the result itself;
+     - any other value is `{}`.
 
-## `verify-hashpath`
+     A probe that returns anything but `{ok, _}`, or fails, contributes `{}`
+     and the completion continues.
+  5. Build the receipt (§5), commit it with the node's identity, and return
+     the `inference@1.0` response with `body` and `data` replaced by the
+     response JSON object plus `receipt` (or `{"response": <body>,
+     "receipt": ...}` when the body is not a JSON object), and with a
+     `receipt` key holding the receipt message. A response that is not a
+     message is returned unchanged.
+- **Returns:** `{ok, Response}`; `{error, Error}` from step 2 or step 3.
 
-Send the receipt's `ao-core` object as `ao-core`. A whole receipt under
-`receipt`, or `verification-input` (`base`, `request`, `response`, optional
-`rest`) and `verification-input-term` at the top level, are also accepted.
+### `chat` — route a chat request
 
-The device recomputes the HashPath from `base` and `request` and compares it
-with the HashPath the receipt recorded: `ao-core.hashpath`, and the
-response's private `priv.hashpath` when the transcript arrives as
-`verification-input-term`. HTTP requests cannot carry private keys, so a JSON
-`verification-input` sent without `ao-core.hashpath` has nothing to compare
-against. Every recorded value present must match.
+- **Reads:** the base message and the request.
+- **Behaviour:** deep-merge the request, with `device` set to
+  `inference_receipt@1.0` and `chat-mode` set to `true`, into the base
+  message.
+- **Returns:** `{ok, MergedMessage}`. Never errors.
 
-Returns 200 with `verified`, `expected-hashpath` (the recorded value),
-`hashpath-sources` and `recomputed-hashpath`. When `verified=false`, `reason`
-is `hashpath-mismatch`, `hashpath-chain-mismatch` (a `rest` step failed) or
-`hashpath-not-captured`.
+### `v1` — route the OpenAI `/v1` prefix
 
-`hashpath-not-captured` means the input records no HashPath. This applies to
-receipts with `ao-core.status=not-captured` (for example, those issued by
-HyperBEAM 2c03978a). Such receipts cannot be HashPath-verified, and no
-`expected-hashpath` is returned; `recomputed-hashpath` is informational.
+- **Reads:** the base message and the request.
+- **Behaviour:** identical to `chat`.
+- **Returns:** `{ok, MergedMessage}`. Never errors.
 
-Returns 422 with `error=invalid-hashpath-transcript` when the transcript
-cannot be parsed, or `error=hashpath-verification-input-missing` when no
-transcript is supplied.
+### `models` — model list without a receipt
 
-AO-Core rejects posted messages whose nested `device` keys the node cannot
-load before this device runs. For example, an older receipt's
-`cpu-tee.device=/dev/sev-guest` causes this. Post the `ao-core` object rather
-than the whole receipt.
+- **Reads:** nothing from the base message or the request.
+- **Behaviour:** resolve `inference@1.0` with `path: models` and the node
+  options.
+- **Returns:** the `inference@1.0` result, unchanged.
 
-The recorded step's HashPath is generated even when the node sets
-`hashpath: ignore`, and `request-digest` is the digest of the recorded
-(allowlisted) request.
+### `health` — runtime health without a receipt
 
-## `publish`
+- **Reads:** nothing from the base message or the request.
+- **Behaviour:** resolve `inference@1.0` with `path: health` and the node
+  options.
+- **Returns:** the `inference@1.0` result, unchanged.
 
-Send a receipt in `receipt` or `body`. Returns 200 with the ANS-104 `id`,
-`bundle-id` and `bundle-status=complete`, or 502 with
-`error=receipt-publish-incomplete`. Requires `receipt-wallet-location` or the
-node wallet, and a configured bundler.
+### `verify-hashpath` — recompute a recorded HashPath
 
-## Public gateway behaviour
+- **Reads:** the request and its `body` (when a map) as plain data: the
+  `ao-core` object, a whole receipt under `receipt`, or the keys
+  `verification-input` and `verification-input-term` directly. The recorded
+  HashPath is read only from an `ao-core` object. Posted values are never
+  resolved through a device.
+- **Behaviour:**
+  1. Obtain the transcript. When `verification-input-term` is present (an
+     unpadded base64url Erlang external term with keys `base`, `request` and
+     `response`, decoded in safe mode), it is the transcript, and a term that
+     cannot be decoded makes the input unusable. Otherwise the transcript is
+     `verification-input` with `base`, `request`, `response` and optional
+     `rest`, whose link objects are restored to AO-Core links.
+  2. Recompute the HashPath from `base` and `request`.
+  3. Collect the recorded values: `ao-core.hashpath`, and the response's
+     private `hashpath` when the transcript arrived as
+     `verification-input-term` (HTTP requests cannot carry private keys).
+  4. When `rest` is present, also verify the HashPath chain of
+     `[request, response | rest]`.
+- **Returns:** `{ok, #{status => 200, body => Result}}` where `Result` holds
+  `verified`, `recomputed-hashpath` and, when a value was recorded,
+  `expected-hashpath` (the first recorded value) and `hashpath-sources`
+  (`ao-core.hashpath`, `response.priv.hashpath`). `verified` is `true`
+  exactly when every recorded value equals the recomputed HashPath and the
+  chain check (if any) holds. Otherwise `reason` is `hashpath-mismatch`,
+  `hashpath-chain-mismatch` or `hashpath-not-captured` (nothing recorded;
+  `recomputed-hashpath` is then informational). Unusable input returns
+  `{ok, #{status => 422, body => ...}}` (§8).
 
-On `https://hb.apus.network`, the APUS explorer proxy uploads every
-successful `.../completions` receipt to Arweave and adds `load_dataitem_id`
-to the response. Running a completion recipe through the gateway therefore
-creates an Arweave data item.
+### `publish` — store a receipt as an ANS-104 data item
+
+- **Reads:** the request's `receipt`, else its `body`; the request's
+  commitments; the node options `receipt-publishers` and
+  `receipt-wallet-location`.
+- **Behaviour:**
+  1. When `receipt-publishers` is set, the request MUST carry a commitment by
+     a listed address that covers the published key (`receipt` when the
+     request has it, else `body`) and verifies against the request as the
+     device receives it. Otherwise return the 403 error
+     `receipt-publisher-not-allowed`. A value of `receipt-publishers` that is
+     not a list refuses every request.
+  2. Without `receipt` and `body`, return the 400 error `receipt-required`.
+  3. The data is the value itself when it is a binary, otherwise its JSON
+     encoding. The device commits `{data, content-type: application/json}`
+     with `ans104@1.0`, signed by the publication wallet.
+  4. Resolve `bundler@1.0` with `path: item`, `await: true` and a bundle
+     limit of one item, and wait until the bundle is posted.
+- **Returns:** `{ok, #{id, bundle-id, bundle-status => complete, body =>
+  BundlerResponse}}` (served as HTTP 200), or the errors of §8.
+- **Side effects:** signs a data item and spends the publication wallet's
+  funds on its upload.
+
+## 5. Data formats & encodings
+
+**Receipt.** The `receipt` object has these keys; a key without a value
+(for example `model` when the request names none) is omitted, in the
+`receipt` message and in the JSON body alike:
+
+| Key | Value |
+|---|---|
+| `type` | `apus-inference-receipt` |
+| `version` | `1.0` |
+| `request-id` | 16 random bytes, unpadded base64url. |
+| `request-digest` | Digest of the executed request (including `path` and `request-nonce`). |
+| `response-digest` | Digest of the `inference@1.0` response body, before the receipt is added. |
+| `model` | The executed request's `model`. |
+| `workload-manifest-id` | The executed request's declaration. |
+| `gpu-inventory` | The `gpu_inventory@1.0` report. |
+| `gpu-inventory-digest` | The report's `inventory-digest`. |
+| `measurement-id` | Signed ID of the measurement envelope. |
+| `system-measurement` | Measurement summary (below). |
+| `provenance-class` | The measurement's provenance class; `receipt-observed` when no measurement was obtained. |
+| `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx` | Execution bindings: the executed request's declaration, else the node option of the same name, else (for the first three) the inventory's `model_sha256`, `runtime_build_hash` or `profile`. |
+| `issued-at-unix` | Unix time in seconds. |
+| `sequence` | Unix time in milliseconds. |
+| `ao-core` | Execution evidence (below). |
+| `device-chain` | `status` (`captured`), `receipt-device`, `measurement-device`, `inventory-device` and `loader` (`HyperBEAM Device Forge preloaded-store`). |
+| `receipt-id` | Signed ID of `signed-receipt`. |
+| `signed-receipt` | The receipt above (without `receipt-id`, `signed-receipt` and `node-address`), committed with the node's identity through the node's `commitment-device` (HyperBEAM default `httpsig@1.0`). |
+| `node-address` | The address that signed `signed-receipt`; present when the commitment succeeded. |
+
+`system-measurement` holds `measurement-id`, `status` (`measured` when the
+measurement integrates `measurement@1.0`, otherwise `observed`),
+`measurement-device`, `base-measurement-device`, `measurement-integration`,
+`measurement-protocol`, `provenance-class`, `measurement-envelope`,
+`subject-id`, `nonce-binding`, `cpu-tee`, `gpu-tee`, `system`, `node`,
+`evidence` and `envelope` (the measurement envelope without `cpu-tee`,
+`gpu-tee` and `apus-gpu-composition`). Their meaning is defined by
+`inference_measurement@1.0`.
+
+`ao-core` holds:
+
+| Key | Value |
+|---|---|
+| `status` | `captured` when a HashPath was recorded, else `not-captured`. |
+| `hashpath` | The response's private `hashpath`, else the one `inference@1.0` exposed in its response JSON (`ao-core`, or `attestation.raw` → `ao-core`). |
+| `source` | Source label of that evidence; default `HyperBEAM AO-Core resolve stage 9`. |
+| `hashpath-algorithm` | The response's `hashpath-alg` when present, else `sha-256-chain (AO-Core default)`. |
+| `request-id`, `response-id` | Unsigned message IDs of the executed request and of the response. |
+| `commitment-device`, `signers` | Commitment device and signers of the response (an unsigned response has none). |
+| `verification-input` | The transcript: `base`, `request`, `response`. |
+| `verification-input-term` | The same transcript as an unpadded base64url compressed Erlang external term, which preserves private keys. |
+| `verification-status` | `verified` or `failed` when the recomputed HashPath equals or differs from `hashpath`; `unavailable` when it cannot be recomputed; `not-captured` when nothing was recorded. |
+
+**JSON form.** The receipt is built in its JSON form before it is committed:
+absent values are removed, AO-Core links become `{"id", "type": "link",
+"metadata"}` objects, other tuples become strings, and every value is the
+one a JSON decoder yields after encoding. The `receipt` message and the
+receipt in the JSON body therefore carry the same values, and
+`signed-receipt` taken from the decoded JSON body verifies with
+`hb_message:verify` and has `node-address` as its only signer.
+
+**`verify-hashpath` input and result.** The input is a JSON object with
+`ao-core`, or with `receipt` (whose `ao-core` is used), or with
+`verification-input` and `verification-input-term` at the top level. Link
+objects inside `verification-input` use the JSON form above. In the HTTP
+encoding of the result, `verified` is typed through `ao-types`, so a JSON
+client may read it as the string `"true"` or `"false"`.
+
+## 6. Ordering, freshness & caching
+
+- The recorded step runs with `hashpath: update`, so a HashPath is generated
+  even when the node sets `hashpath: ignore` globally, and with
+  `cache-control: no-store, no-cache`, so it is never served from or written
+  to the result cache.
+- `request-nonce` makes every executed request distinct: identical prompts
+  never share a HashPath, a `request-digest` or an attestation nonce.
+- The measurement is fresh for each receipt: its nonce is the request
+  digest.
+- `models` and `health` add no receipt and inherit the freshness of
+  `inference@1.0`.
+- `verify-hashpath` has no side effects.
+
+## 7. Security & authority
+
+- **Allowlist before execution.** A HashPath commits to every key of the
+  request, so the executed request is built from the execution keys before
+  the step runs. HTTP headers (including `cf-*`, `x-forwarded-*`,
+  `x-real-ip`, `user-agent`, cookies and credentials), the `user` identifier
+  and the caller's private address never enter the HashPath,
+  `request-digest`, the transcript or the receipt.
+- **Operator-only configuration.** The device resolves `inference@1.0` with
+  the node options unchanged and probes the inventory and measurement with
+  `path` and `nonce` only. Keys such as `inference-*`, `agent-api-*`,
+  `gpu-inventory-root` or `measurement-mode` on the request or the base
+  message have no effect.
+- **Declarations are claims.** A declaration in the request takes precedence
+  over the node option of the same name and is signed into the receipt as
+  given. A verifier MUST compare declarations with the deployed artifacts;
+  the device does not download or hash the model.
+- **Signatures.** `signed-receipt` is committed with the node's identity
+  wallet; `node-address` names it. Published data items are signed by the
+  publication wallet: the wallet at `receipt-wallet-location` when set, which
+  keeps upload funds separate from the node's identity, otherwise the node
+  wallet.
+- **Publishing spends funds.** Each `publish` call signs a data item and pays
+  for its upload. Without `receipt-publishers`, any caller that reaches the
+  key can do so. An operator MUST either set `receipt-publishers` or block
+  `publish` for untrusted callers in front of the node.
+- **Publisher authority.** With `receipt-publishers` set, authority comes
+  from a verified commitment by a listed address over the published key.
+  HyperBEAM routes `/~inference_receipt@1.0/publish` to this key with `path:
+  publish`, so a commitment that also covers `path` does not verify and is
+  refused; publishers commit to the published key alone and send the signed
+  message to that path. The device does not detect replays: a captured
+  signed request publishes its data again, so publishers SHOULD send signed
+  requests only over private or encrypted channels.
+- **Posted evidence is data.** `verify-hashpath` reads posted values without
+  device dispatch and decodes Erlang terms in safe mode.
+- **What a HashPath proves.** A verified HashPath shows that the recorded
+  response is linked to the recorded base and request. Hardware provenance
+  and model identity require the measurement and attestation checks.
+
+## 8. Errors
+
+| Key | Condition | Status | Body |
+|---|---|---|---|
+| `completions` | `stream` truthy on the request or in its `body` | 400 | `{"error": "receipt-streaming-unsupported", "message": ...}` |
+| `completions` | `inference@1.0` error | as returned | as returned (see `inference@1.0` §8) |
+| `verify-hashpath` | transcript recomputation fails | 422 | `{"verified": false, "error": "invalid-hashpath-transcript"}` |
+| `verify-hashpath` | no usable transcript | 422 | `{"verified": false, "error": "hashpath-verification-input-missing", "reason": ...}` |
+| `publish` | `receipt-publishers` set and no verified commitment by a listed address over the published key | 403 | `{"error": "receipt-publisher-not-allowed"}` |
+| `publish` | no `receipt` or `body` | 400 | `{"error": "receipt-required"}` |
+| `publish` | bundle not complete | 502 | `{"error": "receipt-publish-incomplete"}` |
+| `publish` | bundler error or failure | 502 | `{"error": "receipt-publish-failed", "reason": ...}` |
+
+- A HashPath mismatch is not an error: `verify-hashpath` returns 200 with
+  `verified: false` and a `reason`.
+- A failed inventory or measurement probe is not an error: the receipt
+  records an empty object and the corresponding identifiers are omitted.
+- A receipt whose nested values contain a `device` key the node cannot load
+  is rejected by AO-Core before `verify-hashpath` runs; post the `ao-core`
+  object instead of the whole receipt.
+
+## 9. Composition
+
+- **`inference@1.0`.** Supplies the completion, `tee=true` attestation,
+  `models` and `health`. The generation parameters of §2 are exactly the
+  parameters `inference@1.0` relays, without `user`.
+- **`gpu_inventory@1.0` and `inference_measurement@1.0`.** Supply the
+  inventory report and the fresh measurement bound to `request-digest`.
+- **`bundler@1.0` and `ans104@1.0`.** Store published receipts on Arweave.
+- **Verification workflow.** A verifier recomputes `request-digest` from the
+  transcript's request, checks the HashPath with `verify-hashpath`, verifies
+  `signed-receipt` (as decoded from the JSON body) and compares its signer
+  with `node-address`, and checks the measurement and the `inference@1.0`
+  attestation with their own devices' rules.
+- **Public gateway (informative).** On the reference deployment a gateway in
+  front of the node publishes, through `publish`, a record of each successful
+  completion that carries an attestation (`tee=true`), and adds
+  `load_dataitem_id` to the response; such a run creates an Arweave data
+  item. The gateway also serves `/~inference@1.0/completions?tee=true`
+  through this device.
+
+## 10. Conformance (normative checklist)
+
+1. The device answers exactly the seven keys of §3, and `info` lists them.
+2. `completions` rejects a truthy `stream`, on the request or in its `body`,
+   with status 400 before executing.
+3. The executed request contains only execution keys, `path` and a fresh
+   `request-nonce`; keys of the request override keys of its `body`.
+4. The recorded step runs on `{"device": "inference@1.0"}` with
+   `hashpath: update` and `cache-control: no-store, no-cache`.
+5. No key of the request or the base message changes the runtime route,
+   credentials, inventory root or measurement mode.
+6. `request-digest` is the digest of the executed request, and the
+   measurement is requested with that digest as its nonce.
+7. The receipt has the keys of §5 and no others, is committed in its JSON
+   form with the node's identity, `node-address` is the committing address,
+   and `signed-receipt` decoded from the JSON body verifies.
+8. The response's `body` carries the runtime's JSON with `receipt` added.
+9. `verify-hashpath` reports `verified: true` exactly when every recorded
+   HashPath equals the one recomputed from `base` and `request` (and the
+   chain check holds when `rest` is given), and 422 for unusable input.
+10. `publish` signs an ANS-104 item with the publication wallet, waits for
+    the bundle and returns the item `id` at the top level; with
+    `receipt-publishers` set, it first refuses with 403 any request without
+    a verified commitment by a listed address over the published key.
+11. `models` and `health` return the `inference@1.0` result unchanged and
+    create no receipt.
+
+## 11. Out of scope
+
+- Model and runtime behaviour, and the content of `inference@1.0` responses.
+- Streaming completions.
+- The format and verification of measurement envelopes and attestation
+  reports, defined by their devices.
+- Checking declarations against deployed artifacts.
+- Indexing, serving and querying published receipts.
+- Authentication and rate limiting of callers, beyond the
+  `receipt-publishers` check of `publish`.
