@@ -59,12 +59,18 @@ info(_Opts) ->
 %% @doc Collect GPU evidence for the request's `nonce', verify it locally and
 %% return the result as a JSON object with `nonce', `evidences', `claims',
 %% `eat' and `verified'.
+%% Failures are returned as `{error, Reply}': a message with the HTTP status
+%% of the failure (§8 of the specification) and the JSON body
+%% `{"error": Code, "detail": Text}'.
 -spec generate(
     #{ _ => _ },
     #{ nonce => binary(), _ => _ },
     map()
-) -> {ok, binary()} | {error, term()}.
-generate(_Base, Req, Opts) ->
+) -> {ok, binary()} | {error, #{ status := integer(), _ => _ }}.
+generate(Base, Req, Opts) ->
+    reply(do_generate(Base, Req, Opts)).
+
+do_generate(_Base, Req, Opts) ->
     maybe
         {ok, Nonce} ?= request_nonce(Req, Opts),
         {ok, Backend} ?= backend(Opts),
@@ -79,8 +85,11 @@ generate(_Base, Req, Opts) ->
     #{ _ => _ },
     #{ body => _, evidences => _, nonce => binary(), _ => _ },
     map()
-) -> {ok, binary()} | {error, term()}.
-verify(_Base, Req, Opts) ->
+) -> {ok, binary()} | {error, #{ status := integer(), _ => _ }}.
+verify(Base, Req, Opts) ->
+    reply(do_verify(Base, Req, Opts)).
+
+do_verify(_Base, Req, Opts) ->
     maybe
         {ok, Evidences} ?= request_evidences(Req, Opts),
         {ok, Nonce} ?= evidence_nonce(Evidences),
@@ -92,6 +101,45 @@ verify(_Base, Req, Opts) ->
                 false -> {ok, false}
             end,
         {ok, atom_to_binary(Verified, utf8)}
+    end.
+
+%%% ------------------------------------------------------------------
+%%% Error replies
+%%% ------------------------------------------------------------------
+
+%% @doc Serve a failure with its HTTP status and a JSON body. Request errors
+%% are 400, a node misconfiguration is 500, and an attestation backend that
+%% cannot produce or check evidence is 503.
+reply({ok, _} = Ok) ->
+    Ok;
+reply({error, Reason}) ->
+    {Code, Detail} = error_code(Reason),
+    Body = case Detail of
+        undefined -> #{ <<"error">> => Code };
+        _ -> #{ <<"error">> => Code, <<"detail">> => Detail }
+    end,
+    {error, #{
+        <<"status">> => error_status(Code),
+        <<"content-type">> => <<"application/json">>,
+        <<"body">> => hb_json:encode(Body)
+    }}.
+
+error_code({Tag, Detail}) when is_atom(Tag), is_binary(Detail) ->
+    {atom_to_binary(Tag, utf8), binary:part(Detail, 0, min(byte_size(Detail), 512))};
+error_code({Tag, _}) when is_atom(Tag) ->
+    {atom_to_binary(Tag, utf8), undefined};
+error_code(Tag) when is_atom(Tag) ->
+    {atom_to_binary(Tag, utf8), undefined};
+error_code(_) ->
+    {<<"attestation_failed">>, undefined}.
+
+error_status(Code) ->
+    case lists:member(Code, [<<"nonce_required">>, <<"invalid_nonce">>,
+            <<"evidence_required">>, <<"invalid_evidence">>,
+            <<"too_many_evidences">>, <<"evidence_too_large">>]) of
+        true -> 400;
+        false when Code =:= <<"invalid_backend">> -> 500;
+        false -> 503
     end.
 
 %%% ------------------------------------------------------------------
@@ -783,18 +831,18 @@ decoded(Result) ->
     hb_json:decode(JSON).
 
 nonce_is_required_test() ->
-    ?assertEqual({error, nonce_required}, generate(#{}, #{}, #{})),
-    ?assertEqual({error, nonce_required}, generate(#{}, #{<<"other">> => 1}, #{})).
+    ?assertEqual({error, nonce_required}, do_generate(#{}, #{}, #{})),
+    ?assertEqual({error, nonce_required}, do_generate(#{}, #{<<"other">> => 1}, #{})).
 
 invalid_nonce_is_rejected_test() ->
-    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => <<"not-hex">>}, #{})),
-    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => <<>>}, #{})),
+    ?assertEqual({error, invalid_nonce}, do_generate(#{}, #{nonce => <<"not-hex">>}, #{})),
+    ?assertEqual({error, invalid_nonce}, do_generate(#{}, #{nonce => <<>>}, #{})),
     Short = binary:part(?TEST_NONCE, 0, 62),
-    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => Short}, #{})),
+    ?assertEqual({error, invalid_nonce}, do_generate(#{}, #{nonce => Short}, #{})),
     ?assertEqual({error, invalid_nonce},
-        generate(#{}, #{nonce => <<?TEST_NONCE/binary, "00">>}, #{})),
+        do_generate(#{}, #{nonce => <<?TEST_NONCE/binary, "00">>}, #{})),
     NonHex = <<"zz", (binary:part(?TEST_NONCE, 2, 62))/binary>>,
-    ?assertEqual({error, invalid_nonce}, generate(#{}, #{nonce => NonHex}, #{})),
+    ?assertEqual({error, invalid_nonce}, do_generate(#{}, #{nonce => NonHex}, #{})),
     ?assert(valid_nonce(string:uppercase(?TEST_NONCE))).
 
 genuine_claims_pass_test() ->
@@ -850,24 +898,24 @@ result_requires_backend_evidence_and_claims_test() ->
 
 backend_option_is_validated_test() ->
     ?assertEqual({error, invalid_backend},
-        generate(#{}, #{nonce => ?TEST_NONCE},
+        do_generate(#{}, #{nonce => ?TEST_NONCE},
             #{ <<"sev-gpu-backend">> => <<"shell">> })).
 
 missing_nvattest_is_reported_test() ->
     Missing = cli_opts("/nonexistent/nvattest", #{}),
     ?assertEqual({error, nvattest_not_found},
-        generate(#{}, #{nonce => ?TEST_NONCE}, Missing)),
+        do_generate(#{}, #{nonce => ?TEST_NONCE}, Missing)),
     Relative = cli_opts("bin/nvattest", #{}),
     ?assertEqual({error, nvattest_not_found},
-        generate(#{}, #{nonce => ?TEST_NONCE}, Relative)),
+        do_generate(#{}, #{nonce => ?TEST_NONCE}, Relative)),
     Body = hb_json:encode([test_evidence(?TEST_NONCE)]),
     ?assertEqual({error, nvattest_not_found},
-        verify(#{}, #{<<"body">> => Body}, Missing)).
+        do_verify(#{}, #{<<"body">> => Body}, Missing)).
 
 nvattest_generate_test() ->
     with_test_dir(fun(Dir) ->
         Opts = cli_opts(fake_nvattest(Dir, 0), #{}),
-        Result = decoded(generate(#{}, #{nonce => ?TEST_NONCE}, Opts)),
+        Result = decoded(do_generate(#{}, #{nonce => ?TEST_NONCE}, Opts)),
         ?assertMatch(
             #{
                 <<"nonce">> := ?TEST_NONCE,
@@ -888,14 +936,14 @@ nvattest_failure_is_not_verified_test() ->
     with_test_dir(fun(Dir) ->
         Opts = cli_opts(fake_nvattest(Dir, 1), #{}),
         ?assertMatch(#{ <<"verified">> := false },
-            decoded(generate(#{}, #{nonce => ?TEST_NONCE}, Opts)))
+            decoded(do_generate(#{}, #{nonce => ?TEST_NONCE}, Opts)))
     end).
 
 nvattest_invalid_output_test() ->
     with_test_dir(fun(Dir) ->
         Script = write_script(Dir, "nvattest", "echo 'not json'\n"),
         ?assertEqual({error, nvattest_invalid_response},
-            generate(#{}, #{nonce => ?TEST_NONCE}, cli_opts(Script, #{})))
+            do_generate(#{}, #{nonce => ?TEST_NONCE}, cli_opts(Script, #{})))
     end).
 
 nvattest_timeout_test() ->
@@ -903,7 +951,7 @@ nvattest_timeout_test() ->
         Script = write_script(Dir, "nvattest", "exec sleep 5\n"),
         Opts = cli_opts(Script, #{ <<"sev-gpu-nvattest-timeout">> => 200 }),
         {Micros, Result} =
-            timer:tc(fun() -> generate(#{}, #{nonce => ?TEST_NONCE}, Opts) end),
+            timer:tc(fun() -> do_generate(#{}, #{nonce => ?TEST_NONCE}, Opts) end),
         ?assertEqual({error, nvattest_timeout}, Result),
         ?assert(Micros < 3000000)
     end).
@@ -911,17 +959,17 @@ nvattest_timeout_test() ->
 nvattest_verify_test() ->
     with_test_dir(fun(Dir) ->
         Opts = cli_opts(fake_nvattest(Dir, 0), #{ <<"sev-gpu-scratch-dir">> => hb_util:bin(Dir) }),
-        Generated = decoded(generate(#{}, #{nonce => ?TEST_NONCE}, Opts)),
+        Generated = decoded(do_generate(#{}, #{nonce => ?TEST_NONCE}, Opts)),
         %% Both the evidence array and the whole `generate' result are accepted.
         Evidences = hb_json:encode(maps:get(<<"evidences">>, Generated)),
-        ?assertEqual({ok, <<"true">>}, verify(#{}, #{<<"body">> => Evidences}, Opts)),
+        ?assertEqual({ok, <<"true">>}, do_verify(#{}, #{<<"body">> => Evidences}, Opts)),
         ?assertEqual({ok, <<"true">>},
-            verify(#{}, #{<<"body">> => hb_json:encode(Generated)}, Opts)),
+            do_verify(#{}, #{<<"body">> => hb_json:encode(Generated)}, Opts)),
         ?assertEqual({ok, <<"true">>},
-            verify(#{}, #{<<"body">> => Evidences, <<"nonce">> => ?TEST_NONCE}, Opts)),
+            do_verify(#{}, #{<<"body">> => Evidences, <<"nonce">> => ?TEST_NONCE}, Opts)),
         %% A JSON request body arrives as request keys rather than `body'.
         ?assertEqual({ok, <<"true">>},
-            verify(#{}, #{<<"evidences">> => maps:get(<<"evidences">>, Generated)}, Opts)),
+            do_verify(#{}, #{<<"evidences">> => maps:get(<<"evidences">>, Generated)}, Opts)),
         %% The scratch file is removed after the run.
         {ok, Logged} = file:read_file(filename:join(Dir, "evidence-file")),
         ?assertNot(filelib:is_regular(string:trim(binary_to_list(Logged))))
@@ -933,48 +981,48 @@ verify_rejects_foreign_nonce_test() ->
         Body = hb_json:encode([test_evidence(?TEST_NONCE)]),
         Other = binary:copy(<<"ef">>, 32),
         ?assertEqual({ok, <<"false">>},
-            verify(#{}, #{<<"body">> => Body, <<"nonce">> => Other}, Opts)),
+            do_verify(#{}, #{<<"body">> => Body, <<"nonce">> => Other}, Opts)),
         ?assertEqual({error, invalid_nonce},
-            verify(#{}, #{<<"body">> => Body, <<"nonce">> => <<"xyz">>}, Opts))
+            do_verify(#{}, #{<<"body">> => Body, <<"nonce">> => <<"xyz">>}, Opts))
     end).
 
 verify_input_is_validated_test() ->
-    ?assertEqual({error, evidence_required}, verify(#{}, #{}, #{})),
+    ?assertEqual({error, evidence_required}, do_verify(#{}, #{}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"body">> => <<"not json">>}, #{})),
+        do_verify(#{}, #{<<"body">> => <<"not json">>}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"body">> => <<"[]">>}, #{})),
+        do_verify(#{}, #{<<"body">> => <<"[]">>}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"body">> => <<"[{\"nonce\":\"00\"}]">>}, #{})),
+        do_verify(#{}, #{<<"body">> => <<"[{\"nonce\":\"00\"}]">>}, #{})),
     Mixed = hb_json:encode([
         test_evidence(?TEST_NONCE),
         test_evidence(binary:copy(<<"ab">>, 32))
     ]),
-    ?assertEqual({error, invalid_evidence}, verify(#{}, #{<<"body">> => Mixed}, #{})).
+    ?assertEqual({error, invalid_evidence}, do_verify(#{}, #{<<"body">> => Mixed}, #{})).
 
 evidence_must_be_text_test() ->
     Good = test_evidence(?TEST_NONCE),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"evidences">> => [Good#{ <<"evidence">> => <<255, 254>> }]}, #{})),
+        do_verify(#{}, #{<<"evidences">> => [Good#{ <<"evidence">> => <<255, 254>> }]}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"evidences">> => [Good#{ <<"arch">> => hopper }]}, #{})),
+        do_verify(#{}, #{<<"evidences">> => [Good#{ <<"arch">> => hopper }]}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"evidences">> => [Good#{ <<"extra">> => {not_json} }]}, #{})),
+        do_verify(#{}, #{<<"evidences">> => [Good#{ <<"extra">> => {not_json} }]}, #{})),
     ?assertEqual({error, invalid_evidence},
-        verify(#{}, #{<<"body">> => <<"[{\"arch\":1}]">>}, #{})).
+        do_verify(#{}, #{<<"body">> => <<"[{\"arch\":1}]">>}, #{})).
 
 evidence_count_is_bounded_test() ->
     Entry = test_evidence(?TEST_NONCE),
     Missing = cli_opts("/nonexistent/nvattest", #{}),
     %% Sixteen entries pass validation and reach the backend.
     ?assertEqual({error, nvattest_not_found},
-        verify(#{}, #{<<"evidences">> => lists:duplicate(16, Entry)}, Missing)),
+        do_verify(#{}, #{<<"evidences">> => lists:duplicate(16, Entry)}, Missing)),
     ?assertEqual({error, too_many_evidences},
-        verify(#{}, #{<<"evidences">> => lists:duplicate(17, Entry)}, Missing)),
+        do_verify(#{}, #{<<"evidences">> => lists:duplicate(17, Entry)}, Missing)),
     ?assertEqual({error, too_many_evidences},
-        verify(#{}, #{<<"body">> => hb_json:encode(lists:duplicate(17, Entry))}, Missing)),
+        do_verify(#{}, #{<<"body">> => hb_json:encode(lists:duplicate(17, Entry))}, Missing)),
     ?assertEqual({error, too_many_evidences},
-        verify(#{}, #{<<"body">> => hb_json:encode(
+        do_verify(#{}, #{<<"body">> => hb_json:encode(
             #{ <<"evidences">> => lists:duplicate(17, Entry) })}, Missing)).
 
 evidence_size_is_bounded_test() ->
@@ -987,16 +1035,16 @@ evidence_size_is_bounded_test() ->
     ?assertEqual(1048576, byte_size(hb_json:encode(Sized(1048576)))),
     %% An evidence array whose JSON encoding is exactly 1 MiB is accepted.
     ?assertEqual({error, nvattest_not_found},
-        verify(#{}, #{<<"evidences">> => Sized(1048576)}, Missing)),
+        do_verify(#{}, #{<<"evidences">> => Sized(1048576)}, Missing)),
     ?assertEqual({error, nvattest_not_found},
-        verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048576))}, Missing)),
+        do_verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048576))}, Missing)),
     ?assertEqual({error, evidence_too_large},
-        verify(#{}, #{<<"evidences">> => Sized(1048577)}, Missing)),
+        do_verify(#{}, #{<<"evidences">> => Sized(1048577)}, Missing)),
     %% A body above 1 MiB is rejected before it is decoded.
     ?assertEqual({error, evidence_too_large},
-        verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048577))}, Missing)),
+        do_verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048577))}, Missing)),
     ?assertEqual({error, evidence_too_large},
-        verify(#{}, #{<<"body">> => binary:copy(<<" ">>, 1048577)}, Missing)).
+        do_verify(#{}, #{<<"body">> => binary:copy(<<" ">>, 1048577)}, Missing)).
 
 nif_calls_are_bounded_test() ->
     ?assertEqual({ok, <<"{}">>}, bounded(fun() -> {ok, <<"{}">>} end, 1000)),
@@ -1039,7 +1087,7 @@ wrapper_origin_is_compared_test() ->
     ?assertNot(same_beam(preloaded, "/opt/hb/dev_sev_gpu/dev_sev_gpu_nif")).
 
 nif_backend_reports_unavailable_test() ->
-    Result = generate(#{}, #{nonce => ?TEST_NONCE},
+    Result = do_generate(#{}, #{nonce => ?TEST_NONCE},
         #{ <<"sev-gpu-backend">> => <<"nif">> }),
     case nif() of
         ok -> ?assertNotEqual({error, nif_unavailable}, Result);
@@ -1051,7 +1099,7 @@ nif_backend_reports_unavailable_test() ->
 %% backend as an error rather than return a result.
 generate_test() ->
     Nonce = hb_util:to_hex(crypto:strong_rand_bytes(32)),
-    case generate(#{}, #{nonce => Nonce}, #{}) of
+    case do_generate(#{}, #{nonce => Nonce}, #{}) of
         {ok, JSON} ->
             ?assertMatch(#{ <<"nonce">> := Nonce, <<"verified">> := true },
                 hb_json:decode(JSON));
@@ -1061,10 +1109,10 @@ generate_test() ->
 
 verify_test() ->
     Nonce = hb_util:to_hex(crypto:strong_rand_bytes(32)),
-    case generate(#{}, #{nonce => Nonce}, #{}) of
+    case do_generate(#{}, #{nonce => Nonce}, #{}) of
         {ok, JSON} ->
             ?assertEqual({ok, <<"true">>},
-                verify(#{}, #{<<"body">> => JSON, <<"nonce">> => Nonce}, #{}));
+                do_verify(#{}, #{<<"body">> => JSON, <<"nonce">> => Nonce}, #{}));
         {error, Reason} ->
             ?assert(attestation_unavailable(Reason))
     end.
@@ -1077,5 +1125,21 @@ attestation_unavailable(nvattest_invalid_response) -> true;
 attestation_unavailable({nvattest_spawn_failed, _}) -> true;
 attestation_unavailable({nvat_error, _}) -> true;
 attestation_unavailable(_) -> false.
+
+%% Exported handlers serve failures with an HTTP status and a JSON body.
+error_replies_carry_status_and_json_test() ->
+    Body = fun({error, #{ <<"status">> := Status, <<"body">> := JSON }}) ->
+        {Status, hb_json:decode(JSON)}
+    end,
+    ?assertEqual({400, #{ <<"error">> => <<"nonce_required">> }},
+        Body(generate(#{}, #{}, #{}))),
+    ?assertEqual({400, #{ <<"error">> => <<"invalid_nonce">> }},
+        Body(generate(#{}, #{ <<"nonce">> => <<"xyz">> }, #{}))),
+    ?assertEqual({400, #{ <<"error">> => <<"evidence_required">> }},
+        Body(verify(#{}, #{}, #{}))),
+    ?assertEqual({500, #{ <<"error">> => <<"invalid_backend">> }},
+        Body(reply({error, invalid_backend}))),
+    ?assertEqual({503, #{ <<"error">> => <<"nvat_error">>, <<"detail">> => <<"x">> }},
+        Body(reply({error, {nvat_error, <<"x">>}}))).
 
 -endif.

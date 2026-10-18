@@ -120,7 +120,7 @@ the node loads the module and library of the current archive.
      the same nonce with NVAT's default evidence policy and local verifier.
      The NVAT verdict is the attestation call's return code. Any other NVAT
      failure (SDK initialization, nonce parsing, evidence collection,
-     serialization or context setup) fails with `{nvat_error, Reason}`. The
+     serialization or context setup) fails with `nvat_error`. The
      call runs in a process of its own, and the device waits for it at most
      `sev-gpu-nif-timeout`; a call that takes longer fails with
      `nif_timeout` (§7). The NIF is not available when the `dev_sev_gpu_nif`
@@ -184,7 +184,7 @@ attests the submitted evidence itself.
   5. **`nvattest` backend.** Write the evidence array as JSON to a new file
      `sev-gpu-evidence-<32 hex characters>.json` in the scratch directory
      (creation fails if the name exists; a write failure fails with
-     `{scratch_unavailable, Reason}`), run
+     `scratch_unavailable`), run
 
      ```text
      <nvattest> --format json attest --gpu-evidence-source file --gpu-evidence-file <file> --nonce <nonce>
@@ -337,30 +337,33 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
 
 ## 8. Errors
 
-Errors are returned as `{error, Reason}`:
+A failure is returned as `{error, Reply}`, where `Reply` carries the HTTP
+`status`, `content-type: application/json` and a JSON body
+`{"error": Code}`, with a `detail` text for the failures that have one
+(`nvat_error` below). In-process callers read the same message.
+Request errors are 400, `invalid_backend` is 500, and every failure of the
+attestation backend is 503.
 
-| Reason | Key | Condition |
+| Code | Key | Condition |
 |---|---|---|
 | `nonce_required` | `generate` | No `nonce` in the request. |
 | `invalid_nonce` | both | `nonce` is not 64 hexadecimal characters. |
 | `invalid_backend` | both | `sev-gpu-backend` is not `auto`, `nif` or `nvattest`. |
 | `nif_unavailable` | both | Backend `nif` and the NIF is not available. |
 | `nif_timeout` | both | A NIF call exceeded `sev-gpu-nif-timeout`. |
-| `{nvat_error, Reason}` | both | The NIF reported a failure; `Reason` is NVAT's return-code text or the NIF's description (for example an unwritable scratch directory), or `NIF call failed` when the call ended without a result. |
+| `nvat_error` | both | The NIF reported a failure; `detail` is NVAT's return-code text or the NIF's description (for example an unwritable scratch directory), or `NIF call failed` when the call ended without a result. |
 | `nvattest_not_found` | both | `nvattest` is needed and the configured path is not an absolute path to a regular file. |
-| `{nvattest_spawn_failed, Reason}` | both | The executable could not be started. |
+| `nvattest_spawn_failed` | both | The executable could not be started. |
 | `nvattest_timeout` | both | A run exceeded `sev-gpu-nvattest-timeout`. |
 | `nvattest_invalid_response` | both | Output was not a JSON object, or exceeded 16 MiB. |
 | `evidence_required` | `verify` | Neither `body` nor `evidences` is present. |
 | `invalid_evidence` | `verify` | The evidence is not a non-empty, JSON-encodable array of well-formed entries (four UTF-8 string fields) with one valid nonce. |
 | `too_many_evidences` | `verify` | The evidence array has more than 16 entries. |
 | `evidence_too_large` | `verify` | A binary larger than 1 MiB, or an evidence array whose compact JSON encoding is larger than 1 MiB. |
-| `{scratch_unavailable, Reason}` | `verify` | The `nvattest` backend could not write the evidence file. |
+| `scratch_unavailable` | `verify` | The `nvattest` backend could not write the evidence file. |
 
 A failed attestation is not an error: `generate` returns `verified` false and
-`verify` returns `false`. HTTP status codes are assigned by the serving node,
-not by this device; HTTP clients MUST check that a `generate` body is a JSON
-object and that a `verify` body is `true`.
+`verify` returns `false`, both with status 200.
 
 ## 9. Composition
 

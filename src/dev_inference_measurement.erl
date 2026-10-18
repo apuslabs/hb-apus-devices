@@ -722,6 +722,18 @@ reason_text({Tag, Detail}) when is_atom(Tag), is_binary(Detail) ->
     reason_text(<<(atom_to_binary(Tag, utf8))/binary, ": ", Detail/binary>>);
 reason_text({Tag, _}) when is_atom(Tag) ->
     atom_to_binary(Tag, utf8);
+reason_text(#{ <<"body">> := Body }) when is_binary(Body) ->
+    try hb_json:decode(Body) of
+        #{ <<"error">> := Error, <<"detail">> := Detail } when is_binary(Error),
+                is_binary(Detail) ->
+            reason_text(<<Error/binary, ": ", Detail/binary>>);
+        #{ <<"error">> := Error } when is_binary(Error) ->
+            reason_text(Error);
+        _ ->
+            <<"unavailable">>
+    catch
+        _:_ -> <<"unavailable">>
+    end;
 reason_text(#{ <<"body">> := #{ <<"error">> := Error } }) when is_binary(Error) ->
     Error;
 reason_text(#{ <<"error">> := Error }) when is_binary(Error) ->
