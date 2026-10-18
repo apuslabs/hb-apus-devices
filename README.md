@@ -52,7 +52,8 @@ Together they form an attestation chain for a single completion:
 
 - `sev_gpu@1.0` collects evidence from the NVIDIA GPU in confidential-computing
   mode for a nonce chosen by the caller. `inference@1.0` attaches it to a
-  completion requested with `tee=true`, bound to the generation parameters.
+  completion requested with `tee=true`, bound to the public request, the
+  runtime's response and the AO-Core execution link.
 - `gpu_inventory@1.0` reports the host's GPU and PCIe layout and a digest that
   is stable for an unchanged layout and driver.
 - `inference_measurement@1.0` reads the inventory from `gpu_inventory@1.0`
@@ -205,12 +206,14 @@ as the bundler accepts it.
 | `scripts/publish-recipes.escript` | Sign and upload the Device-Recipe messages |
 | `scripts/update-store-device.escript` | Repackage one device into an existing preloaded store, signed by the store's signer, and keep the other devices unchanged |
 | `scripts/setup-measurement.sh` | Build the SNP NIF of the vendored `snp@1.0` device |
+| `scripts/agent-test.lua` | Lua checks for `agent@1.0`, run in process through `lua@5.3a` |
 
 ## Repository layout
 
 ```text
 src/                     device modules, one Device Forge root per device
 docs/spec/               device specifications (Device-Specification bodies)
+docs/*.md                operator guides for inference@1.0 and sev_gpu@1.0
 docs/recipes/            Device-Recipe sources, one directory per device
 native/dev_sev_gpu_nif/  NIF that links sev_gpu@1.0 to the NVIDIA attestation SDK
 vendor/permaweb-os/      vendored PermawebOS measurement devices
@@ -246,9 +249,10 @@ The devices are built and tested against:
 | GPU attestation | NVIDIA Attestation SDK (NVAT) 1.2 with `nvattest` on the host; the optional NIF backend builds against [`NVIDIA/attestation-sdk`](https://github.com/NVIDIA/attestation-sdk) at `73efa3ac1bec28ed7d7f0c0811a6c993e722dbd4` (`make setup-cc`) |
 | Model runtime | SGLang with an OpenAI-compatible chat-completions API |
 
-The HyperBEAM pin is the upstream `permaweb/HyperBEAM` edge line at
-`2c03978a3d201444bf7aada3eb35809153e41ef3` with AO-Core `vary`, which projects
-handler inputs through each handler's `-spec`. `rebar.config` pins both the
-dependency and the Device Forge plugin to this commit. `inference@1.0` speaks
+`rebar.config` pins both the HyperBEAM dependency and the Device Forge plugin
+to `apuslabs/HyperBEAM` at `28baa3d27d70c4268f439587ba0398fb7771e0e3`: the
+upstream `permaweb/HyperBEAM` edge commit
+`2c03978a3d201444bf7aada3eb35809153e41ef3` merged with AO-Core `vary`, which
+projects handler inputs through each handler's `-spec`. `inference@1.0` speaks
 the OpenAI chat-completions protocol, so other compatible runtimes plug in
 through node options.
