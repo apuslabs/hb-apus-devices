@@ -73,7 +73,7 @@ directories and limits; no request or base message can.
 |---|---|---|
 | `sev-gpu-backend` | `auto` | `auto`, `nif` or `nvattest`. Any other value fails with `invalid_backend`. |
 | `sev-gpu-nvattest-path` | `/usr/bin/nvattest` | Absolute path of the `nvattest` executable. `PATH` is never searched. |
-| `sev-gpu-nvattest-timeout` | `60000` | Upper bound in milliseconds for one `nvattest` run: a positive integer or decimal string; other values select the default. |
+| `sev-gpu-nvattest-timeout` | `60000` | How long, in milliseconds, the device waits for one `nvattest` run: a positive integer or decimal string; other values select the default. |
 | `sev-gpu-scratch-dir` | `/tmp` | Directory for the evidence file that `verify` hands to NVAT. |
 
 **Native assets.** The NIF backend needs three files from the implementation
@@ -89,11 +89,17 @@ The device looks for `dev_sev_gpu_nif.beam` in these directories, in order:
 `dev_sev_gpu/` below its implementation directory, the implementation
 directory itself, and `priv/dev_sev_gpu/` below the node's working directory.
 On first use it loads the module from the first match and then the library
-next to it. The library's run-time
-search path is `$ORIGIN/lib` and `$ORIGIN/../lib`, so `libnvat` is found
-without changing the node's environment. The `dev_sev_gpu_nif` module always
-carries the name the library declares, so the NIF loads whatever generated
-name Device Forge gives the device module.
+next to it. The library's run-time search path is `$ORIGIN/lib` and
+`$ORIGIN/../lib`, so `libnvat` is found without changing the node's
+environment. The `dev_sev_gpu_nif` module always carries the name the library
+declares, so the NIF loads whatever generated name Device Forge gives the
+device module.
+
+The module and its library stay loaded for the life of the node. When a
+`dev_sev_gpu_nif` module loaded from another directory is already present
+(for example after the implementation archive is upgraded), the device keeps
+using it and prints one line on standard error naming both files; restarting
+the node loads the module and library of the current archive.
 
 ## 4. Resolved keys (normative)
 
@@ -125,11 +131,11 @@ name Device Forge gives the device module.
      <nvattest> --format json collect-evidence --nonce <nonce>
      ```
 
-     Each run is bounded by `sev-gpu-nvattest-timeout`. The device reads
-     standard output only, ignores the exit status, and decodes the output
-     as one non-empty JSON object. The NVAT verdict is `result_code` = 0 in the
-     `attest` output; claims come from its `claims`, the detached EAT from
-     its `detached_eat`, and evidence from `evidences` in the
+     The device waits at most `sev-gpu-nvattest-timeout` for each run (§7),
+     reads standard output only, ignores the exit status, and decodes the
+     output as one non-empty JSON object. The NVAT verdict is `result_code`
+     = 0 in the `attest` output; claims come from its `claims`, the detached
+     EAT from its `detached_eat`, and evidence from `evidences` in the
      `collect-evidence` output.
   5. Build the result (§5.2) and set `verified` per §5.4.
 - **Returns:** `{ok, JSON}` with the result object of §5.2. A negative
@@ -137,7 +143,9 @@ name Device Forge gives the device module.
 
 On both backends NVAT's attestation step collects its own evidence for the
 same nonce, so the returned `evidences` and the `claims` come from two
-collections on the same GPUs with the same nonce.
+collections on the same GPUs with the same nonce. A caller that needs an
+appraisal of exactly the returned evidence submits it to `verify`, which
+attests the submitted evidence itself.
 
 ### `verify` — re-verify serialized GPU evidence
 
@@ -147,8 +155,9 @@ collections on the same GPUs with the same nonce.
   1. If neither `body` nor `evidences` is present, fail with
      `evidence_required`. A binary is decoded as JSON. The value MUST be a
      non-empty array of evidence entries (§2), or an object whose
-     `evidences` member is one (a whole `generate` result qualifies); else
-     fail with `invalid_evidence`.
+     `evidences` member is one (a whole `generate` result qualifies). Each
+     entry's four fields MUST be UTF-8 strings, and the array MUST encode as
+     JSON; else fail with `invalid_evidence`.
   2. Every entry MUST carry the same nonce (letter case ignored), and that
      nonce MUST be 64 hexadecimal characters; else fail with
      `invalid_evidence`. This is the evidence nonce.
@@ -261,11 +270,16 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
 
 - Freshness comes only from the caller's nonce. Each `generate` collects new
   evidence; the device keeps no attestation state between calls and does
-  not cache results. Under the node's default cache settings results are not stored.
-  A caller that wants a fresh report MUST use a fresh nonce.
+  not cache results, and under the node's default cache settings results
+  are not stored. A caller that wants a fresh report MUST use a fresh nonce.
 - `nvattest` runs `attest` before `collect-evidence`; each run has its own
   timeout. The NIF collects first and attests second.
 - EAT tokens carry NVAT's own issue and expiry times.
+- NVAT's default policy fetches reference integrity manifests (RIMs) from
+  NVIDIA's RIM service (`rim.attestation.nvidia.com`) and checks certificate
+  revocation with NVIDIA's OCSP responder (`ocsp.ndis.nvidia.com`) on every
+  `generate` and `verify`. The outcome therefore reflects NVIDIA's revocation
+  data at call time, and both keys depend on those services being reachable.
 
 ## 7. Security & authority
 
@@ -277,8 +291,19 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   scratch directory; these are node options. Request values reach NVAT only
   as a validated hexadecimal nonce and as evidence JSON.
 - `nvattest` runs from an absolute path through an argument vector, never
-  through a shell. Its output is bounded (16 MiB) and its run time is bounded
-  by the timeout; on timeout the device closes the port and stops waiting.
+  through a shell. The device reads at most 16 MiB of its output and waits
+  at most the configured timeout. On timeout it closes the port, which closes
+  the process's standard input and output; the process ends when it next
+  writes output or exits on its own. Operators who need a hard limit on the
+  process lifetime point `sev-gpu-nvattest-path` at a wrapper executable that
+  enforces one.
+- NVAT makes its own outbound HTTPS requests (§6) through its own HTTP
+  client, outside HyperBEAM's HTTP machinery. Their endpoints are NVAT's
+  defaults and no request can change them; the RIM identifiers requested
+  are derived from the evidence under appraisal.
+- `verify` lets any caller start an NVAT appraisal, including the RIM and
+  OCSP requests. Operators that expose the device publicly MAY rate-limit
+  requests to it, for example at a reverse proxy.
 - Evidence files are created under unpredictable names, are never reused, and
   are deleted after each verification. They contain only the submitted
   evidence.
@@ -303,7 +328,7 @@ Errors are returned as `{error, Reason}`:
 | `nvattest_timeout` | both | A run exceeded `sev-gpu-nvattest-timeout`. |
 | `nvattest_invalid_response` | both | Output was not a JSON object, or exceeded 16 MiB. |
 | `evidence_required` | `verify` | Neither `body` nor `evidences` is present. |
-| `invalid_evidence` | `verify` | The evidence is not a non-empty array of well-formed entries with one valid nonce. |
+| `invalid_evidence` | `verify` | The evidence is not a non-empty, JSON-encodable array of well-formed entries (four UTF-8 string fields) with one valid nonce. |
 | `{scratch_unavailable, Reason}` | `verify` | The `nvattest` backend could not write the evidence file. |
 
 A failed attestation is not an error: `generate` returns `verified` false and
@@ -352,15 +377,17 @@ hb_ao:resolve(
 8. Backends, executable paths, timeouts and the scratch directory come only
    from node options.
 9. `nvattest` is run from an absolute path without a shell, with
-   `NVAT_LOG_LEVEL=off`, and is bounded by the configured timeout.
+   `NVAT_LOG_LEVEL=off`; the device waits at most the configured timeout
+   for each run.
 10. With backend `auto`, `nvattest` runs only when the NIF is not available.
 11. Evidence files written by `verify` are removed after use.
 
 ## 11. Out of scope
 
 - NVSwitch attestation and the CoRIM/EAR (`attest-v2`) workflow.
-- NVIDIA's remote attestation service, relying-party policies, and custom
-  RIM, OCSP or evidence-policy settings: NVAT runs with its defaults.
+- NVIDIA's remote attestation service, relying-party policies, a local RIM
+  store, and custom RIM, OCSP or evidence-policy settings: NVAT runs with its
+  defaults.
 - Enabling confidential-computing mode on the GPU and installing the NVIDIA
   driver, NVAT and `nvattest`.
 - Validation of EAT signatures; the tokens are returned as NVAT produced them.

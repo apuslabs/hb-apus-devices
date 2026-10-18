@@ -155,21 +155,34 @@ evidences_from(Term) ->
 evidences_from_term(#{ <<"evidences">> := Evidences }) ->
     evidences_from_term(Evidences);
 evidences_from_term([_ | _] = Evidences) ->
-    case lists:all(fun is_evidence/1, Evidences) of
+    case lists:all(fun is_evidence/1, Evidences) andalso encodable(Evidences) of
         true -> {ok, Evidences};
         false -> {error, invalid_evidence}
     end;
 evidences_from_term(_) ->
     {error, invalid_evidence}.
 
-%% @doc An NVAT GPU evidence entry carries these four string fields.
+%% @doc An NVAT GPU evidence entry carries these four UTF-8 string fields.
 is_evidence(Evidence) when is_map(Evidence) ->
     lists:all(
-        fun(Key) -> is_binary(maps:get(Key, Evidence, undefined)) end,
+        fun(Key) -> is_text(maps:get(Key, Evidence, undefined)) end,
         [<<"arch">>, <<"nonce">>, <<"evidence">>, <<"certificate">>]
     );
 is_evidence(_) ->
     false.
+
+is_text(Value) when is_binary(Value) ->
+    unicode:characters_to_binary(Value) =:= Value;
+is_text(_) ->
+    false.
+
+%% @doc Evidence reaches NVAT as JSON, so it must encode as JSON.
+encodable(Term) ->
+    try hb_json:encode(Term) of
+        _ -> true
+    catch
+        _:_ -> false
+    end.
 
 %% @doc Every evidence entry must carry the same valid nonce.
 evidence_nonce([First | _] = Evidences) ->
@@ -370,16 +383,36 @@ nif() ->
         load_library(Dir)
     end.
 
+%% A wrapper module stays loaded for the life of the node. When it was
+%% loaded from another directory (for example from an earlier implementation
+%% archive), the device keeps using it and reports the difference once: the
+%% module and its library are replaced by restarting the node.
 load_wrapper(Dir) ->
+    Path = filename:join(Dir, ?NIF_FILE),
     case code:is_loaded(?NIF_MODULE) of
-        {file, _} -> ok;
+        {file, Loaded} ->
+            case same_beam(Loaded, Path) of
+                true -> ok;
+                false -> report_once(wrapper_origin, "sev_gpu@1.0: using ~ts.beam; "
+                    "restart the node to load ~ts.beam~n", [loaded_path(Loaded), Path])
+            end;
         false ->
-            Path = filename:join(Dir, ?NIF_FILE),
             case code:load_abs(Path) of
                 {module, ?NIF_MODULE} -> ok;
                 {error, Reason} -> report_nif_failure(Path, Reason)
             end
     end.
+
+%% @doc Whether the loaded object file is `<Path>.beam'.
+same_beam(Loaded, Path) when is_list(Loaded); is_binary(Loaded) ->
+    filename:absname(filename:rootname(Loaded)) =:= filename:absname(Path);
+same_beam(_Loaded, _Path) ->
+    false.
+
+loaded_path(Loaded) when is_list(Loaded); is_binary(Loaded) ->
+    filename:rootname(Loaded);
+loaded_path(Loaded) ->
+    io_lib:format("~p", [Loaded]).
 
 load_library(Dir) ->
     case catch ?NIF_MODULE:loaded() of
@@ -396,17 +429,19 @@ load_library(Dir) ->
 %% example a missing NVAT library). Report it once per node on standard error.
 report_nif_failure(Path, Reason) ->
     ?event(sev_gpu, {nif_load_failed, {path, Path}, {reason, Reason}}),
-    case persistent_term:get({?MODULE, nif_failure_reported}, false) of
+    report_once(nif_failure, "sev_gpu@1.0: NVAT NIF not loaded from ~ts: ~p~n",
+        [Path, Reason]),
+    {error, {nif_load_failed, Reason}}.
+
+%% @doc Print a message on standard error the first time `Tag' is reported.
+report_once(Tag, Format, Args) ->
+    Key = {?MODULE, reported, Tag},
+    case persistent_term:get(Key, false) of
         true -> ok;
         false ->
-            persistent_term:put({?MODULE, nif_failure_reported}, true),
-            io:format(
-                standard_error,
-                "sev_gpu@1.0: NVAT NIF not loaded from ~ts: ~p~n",
-                [Path, Reason]
-            )
-    end,
-    {error, {nif_load_failed, Reason}}.
+            persistent_term:put(Key, true),
+            io:format(standard_error, Format, Args)
+    end.
 
 %% @doc The first directory that holds the wrapper module. Device Forge
 %% extracts the `priv/dev_sev_gpu' resources of the implementation archive
@@ -457,7 +492,9 @@ nvattest(Path, Args, Opts) ->
     end.
 
 %% @doc Run an executable without a shell and collect its standard output
-%% within `Timeout' milliseconds.
+%% for at most `Timeout' milliseconds. On timeout the device closes the port,
+%% which closes the process's standard input and output; the process itself
+%% ends when it next writes output or exits on its own.
 run(Path, Args, Env, Timeout) ->
     PortOpts = [
         {args, [hb_util:list(Arg) || Arg <- Args]},
@@ -853,17 +890,35 @@ verify_input_is_validated_test() ->
     ]),
     ?assertEqual({error, invalid_evidence}, verify(#{}, #{<<"body">> => Mixed}, #{})).
 
+evidence_must_be_text_test() ->
+    Good = test_evidence(?TEST_NONCE),
+    ?assertEqual({error, invalid_evidence},
+        verify(#{}, #{<<"evidences">> => [Good#{ <<"evidence">> => <<255, 254>> }]}, #{})),
+    ?assertEqual({error, invalid_evidence},
+        verify(#{}, #{<<"evidences">> => [Good#{ <<"arch">> => hopper }]}, #{})),
+    ?assertEqual({error, invalid_evidence},
+        verify(#{}, #{<<"evidences">> => [Good#{ <<"extra">> => {not_json} }]}, #{})),
+    ?assertEqual({error, invalid_evidence},
+        verify(#{}, #{<<"body">> => <<"[{\"arch\":1}]">>}, #{})).
+
+wrapper_origin_is_compared_test() ->
+    ?assert(same_beam("/opt/hb/dev_sev_gpu/dev_sev_gpu_nif.beam",
+        "/opt/hb/dev_sev_gpu/dev_sev_gpu_nif")),
+    ?assertNot(same_beam("/opt/hb/old/dev_sev_gpu_nif.beam",
+        "/opt/hb/dev_sev_gpu/dev_sev_gpu_nif")),
+    ?assertNot(same_beam(preloaded, "/opt/hb/dev_sev_gpu/dev_sev_gpu_nif")).
+
 nif_backend_reports_unavailable_test() ->
+    Result = generate(#{}, #{nonce => ?TEST_NONCE},
+        #{ <<"sev-gpu-backend">> => <<"nif">> }),
     case nif() of
-        ok -> {skip, "the NVAT NIF is loaded on this machine"};
-        {error, _} ->
-            ?assertEqual({error, nif_unavailable},
-                generate(#{}, #{nonce => ?TEST_NONCE},
-                    #{ <<"sev-gpu-backend">> => <<"nif">> }))
+        ok -> ?assertNotEqual({error, nif_unavailable}, Result);
+        {error, _} -> ?assertEqual({error, nif_unavailable}, Result)
     end.
 
-%% Hardware tests: they run against the node's real GPU and skip cleanly on
-%% machines without NVIDIA confidential computing.
+%% Hardware tests. On a host with NVIDIA confidential computing they attest
+%% the real GPU end to end; elsewhere `generate' must report the missing
+%% backend as an error rather than return a result.
 generate_test() ->
     Nonce = hb_util:to_hex(crypto:strong_rand_bytes(32)),
     case generate(#{}, #{nonce => Nonce}, #{}) of
@@ -871,20 +926,25 @@ generate_test() ->
             ?assertMatch(#{ <<"nonce">> := Nonce, <<"verified">> := true },
                 hb_json:decode(JSON));
         {error, Reason} ->
-            {skip, iolist_to_binary(io_lib:format("GPU attestation unavailable: ~p", [Reason]))}
+            ?assert(attestation_unavailable(Reason))
     end.
 
 verify_test() ->
     Nonce = hb_util:to_hex(crypto:strong_rand_bytes(32)),
     case generate(#{}, #{nonce => Nonce}, #{}) of
         {ok, JSON} ->
-            case verify(#{}, #{<<"body">> => JSON, <<"nonce">> => Nonce}, #{}) of
-                {ok, Verdict} -> ?assertEqual(<<"true">>, Verdict);
-                {error, Reason} ->
-                    {skip, iolist_to_binary(io_lib:format("GPU verification unavailable: ~p", [Reason]))}
-            end;
+            ?assertEqual({ok, <<"true">>},
+                verify(#{}, #{<<"body">> => JSON, <<"nonce">> => Nonce}, #{}));
         {error, Reason} ->
-            {skip, iolist_to_binary(io_lib:format("GPU attestation unavailable: ~p", [Reason]))}
+            ?assert(attestation_unavailable(Reason))
     end.
+
+attestation_unavailable(nif_unavailable) -> true;
+attestation_unavailable(nvattest_not_found) -> true;
+attestation_unavailable(nvattest_timeout) -> true;
+attestation_unavailable(nvattest_invalid_response) -> true;
+attestation_unavailable({nvattest_spawn_failed, _}) -> true;
+attestation_unavailable({nvat_error, _}) -> true;
+attestation_unavailable(_) -> false.
 
 -endif.
