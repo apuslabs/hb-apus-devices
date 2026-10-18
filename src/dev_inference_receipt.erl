@@ -649,24 +649,37 @@ add_execution_bindings(Receipt, Req, Opts, Inventory) ->
 %% @doc Resolve the node's GPU inventory report. The inventory device reads
 %% its own node options; nothing from the caller's request is forwarded.
 resolve_inventory(Opts) ->
-    case hb_ao:resolve(
-        #{<<"device">> => <<"gpu_inventory@1.0">>},
-        #{<<"path">> => <<"report">>},
-        Opts
-    ) of
-        {ok, Response} -> result_body(Response, Opts);
-        _ -> #{}
-    end.
+    probe(
+        fun() ->
+            {ok, Response} = hb_ao:resolve(
+                #{<<"device">> => <<"gpu_inventory@1.0">>},
+                #{<<"path">> => <<"report">>},
+                Opts
+            ),
+            result_body(Response, Opts)
+        end
+    ).
 
 %% @doc Resolve a fresh measurement bound to this request digest.
 resolve_measurement(RequestDigest, Opts) ->
-    case hb_ao:resolve(
-        #{<<"device">> => <<"inference_measurement@1.0">>},
-        #{<<"path">> => <<"fresh">>, <<"nonce">> => RequestDigest},
-        Opts
-    ) of
-        {ok, Response} -> measurement_fields(result_body(Response, Opts), Opts);
-        _ -> #{}
+    probe(
+        fun() ->
+            {ok, Response} = hb_ao:resolve(
+                #{<<"device">> => <<"inference_measurement@1.0">>},
+                #{<<"path">> => <<"fresh">>, <<"nonce">> => RequestDigest},
+                Opts
+            ),
+            measurement_fields(result_body(Response, Opts), Opts)
+        end
+    ).
+
+%% A probe that fails, or whose device is not loadable on this node,
+%% contributes an empty object instead of failing the completion.
+probe(Fun) ->
+    try Fun()
+    catch Class:Reason ->
+        ?event(inference_receipt, {probe_unavailable, {Class, Reason}}),
+        #{}
     end.
 
 %% @doc The result message of a device that answers either bare or inside a
@@ -1101,6 +1114,12 @@ object_length(<<_, Rest/binary>>, Pos, Depth, false) ->
     object_length(Rest, Pos + 1, Depth, false);
 object_length(<<>>, Pos, _Depth, _InString) ->
     Pos.
+
+unavailable_probes_contribute_empty_objects_test() ->
+    ?assertEqual(#{}, probe(fun() -> error({badmatch, {error, not_found}}) end)),
+    ?assertEqual(#{}, probe(fun() -> throw({device_not_loadable, x}) end)),
+    ?assertEqual(#{<<"type">> => <<"t">>},
+        probe(fun() -> #{<<"type">> => <<"t">>} end)).
 
 publish_requires_a_receipt_test() ->
     ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
