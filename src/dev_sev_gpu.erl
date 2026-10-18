@@ -21,7 +21,8 @@
 %% Forge does not rename it and the library's `ERL_NIF_INIT' name matches.
 -define(NIF_MODULE, dev_sev_gpu_nif).
 -define(NIF_FILE, "dev_sev_gpu_nif").
-%% Archive resources from `priv/dev_sev_gpu' extract below this directory.
+%% Archive resources may extract below this directory of the implementation
+%% directory.
 -define(NATIVE_SUBDIR, "dev_sev_gpu").
 
 -define(DEFAULT_BACKEND, <<"auto">>).
@@ -443,11 +444,10 @@ report_once(Tag, Format, Args) ->
             io:format(standard_error, Format, Args)
     end.
 
-%% @doc The first directory that holds the wrapper module. Device Forge
-%% extracts the `priv/dev_sev_gpu' resources of the implementation archive
-%% to `dev_sev_gpu/' below the implementation directory (or to the directory
-%% itself for a root `priv' layout); a source checkout keeps them in
-%% `priv/dev_sev_gpu' below the working directory.
+%% @doc The first directory that holds the wrapper module: the implementation
+%% directory where Device Forge extracts the archive's `priv' resources (or
+%% its `dev_sev_gpu/' subdirectory), then `src/dev_sev_gpu/priv' below the
+%% working directory of a source checkout.
 native_dir() ->
     ImplDirs =
         try hb_device_archive:implementation_dir(?MODULE) of
@@ -455,7 +455,7 @@ native_dir() ->
         catch
             _:_ -> []
         end,
-    Candidates = ImplDirs ++ [filename:absname(filename:join("priv", ?NATIVE_SUBDIR))],
+    Candidates = ImplDirs ++ [filename:absname(filename:join(["src", ?NATIVE_SUBDIR, "priv"]))],
     case [Dir || Dir <- Candidates, filelib:is_regular(filename:join(Dir, ?NIF_FILE ++ ".beam"))] of
         [Dir | _] -> {ok, Dir};
         [] -> {error, wrapper_missing}

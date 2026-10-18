@@ -302,7 +302,7 @@ client may read it as the string `"true"` or `"false"`.
   `request-digest`, the transcript or the receipt.
 - **Operator-only configuration.** The device resolves `inference@1.0` with
   the node options unchanged and probes the inventory and measurement with
-  `path` and `nonce` only. Keys such as `inference-*`, `agent-api-*`,
+  `path` and `nonce` only. Keys such as `inference-*`,
   `gpu-inventory-root` or `measurement-mode` on the request or the base
   message have no effect.
 - **Declarations are claims.** A declaration in the request takes precedence

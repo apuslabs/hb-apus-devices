@@ -117,7 +117,7 @@ including the vendored ones, together with the HyperBEAM core suites. `make help
 Native assets are built on the Linux target host before packaging:
 
 ```bash
-make setup-cc            # sev_gpu@1.0 NIF and NVIDIA attestation SDK libraries
+make setup-cc            # optional sev_gpu@1.0 NIF backend (NVIDIA attestation SDK)
 make setup-measurement   # SNP NIF of the vendored snp@1.0 device
 ```
 
@@ -243,7 +243,7 @@ The devices are built and tested against:
 | rebar3 | 3.27 |
 | PermawebOS measurement devices | [`permaweb/os`](https://github.com/permaweb/os) at `63f88cc3a73af0e5af13b58887b2870d8b486c48` |
 | Host | Linux x86_64 AMD SEV-SNP guest with an NVIDIA H100 in confidential-computing mode |
-| GPU attestation | [`NVIDIA/attestation-sdk`](https://github.com/NVIDIA/attestation-sdk) at `73efa3ac1bec28ed7d7f0c0811a6c993e722dbd4`, built by `make setup-cc` |
+| GPU attestation | NVIDIA Attestation SDK (NVAT) 1.2 with `nvattest` on the host; the optional NIF backend builds against [`NVIDIA/attestation-sdk`](https://github.com/NVIDIA/attestation-sdk) at `73efa3ac1bec28ed7d7f0c0811a6c993e722dbd4` (`make setup-cc`) |
 | Model runtime | SGLang with an OpenAI-compatible chat-completions API |
 
 The HyperBEAM pin is the upstream `permaweb/HyperBEAM` edge line at

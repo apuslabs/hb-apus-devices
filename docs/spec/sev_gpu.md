@@ -76,18 +76,19 @@ directories and limits; no request or base message can.
 | `sev-gpu-nvattest-timeout` | `60000` | How long, in milliseconds, the device waits for one `nvattest` run: a positive integer or decimal string; other values select the default. |
 | `sev-gpu-scratch-dir` | `/tmp` | Directory for the evidence file that `verify` hands to NVAT. |
 
-**Native assets.** The NIF backend needs three files from the implementation
-archive's `priv/dev_sev_gpu/` resources:
+**Native assets.** The NIF backend uses these resources of the
+implementation archive (the device root's `priv` directory):
 
 ```text
 dev_sev_gpu_nif.beam    the dev_sev_gpu_nif module that owns the NIF
 dev_sev_gpu_nif.so      the NIF, linked against libnvat
-lib/libnvat.so*         the NVAT shared library
+lib/libnvat.so*         optional: the NVAT shared library, when not installed on the host
 ```
 
 The device looks for `dev_sev_gpu_nif.beam` in these directories, in order:
 `dev_sev_gpu/` below its implementation directory, the implementation
-directory itself, and `priv/dev_sev_gpu/` below the node's working directory.
+directory itself, and `src/dev_sev_gpu/priv/` below the node's working
+directory. Without these resources the `auto` backend uses `nvattest`.
 On first use it loads the module from the first match and then the library
 next to it. The library's run-time search path is `$ORIGIN/lib` and
 `$ORIGIN/../lib`, so `libnvat` is found without changing the node's

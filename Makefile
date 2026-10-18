@@ -23,7 +23,7 @@ PRELOADED_STORE ?= _build/apus-device-store
 PRELOAD_MARKER = $(PRELOADED_STORE)/.preloaded
 # Files packaged into the preloaded store: the store is rebuilt when one of
 # them is newer than PRELOAD_MARKER.
-PRELOAD_INPUTS := $(shell find src docs/spec vendor/permaweb-os/src priv \
+PRELOAD_INPUTS := $(shell find src docs/spec vendor/permaweb-os/src \
 	-type f 2>/dev/null) rebar.config rebar.lock
 # Source of the specification IDs that recipes bind to: a preloaded store
 # directory or a publication record written by `make publish` (PUBLISH.md).
@@ -45,7 +45,12 @@ NVAT_SDK_DIR = _build/attestation-sdk
 NVAT_SDK_CHECKOUT = $(NVAT_SDK_DIR)/.checkout-$(NVAT_SDK_REF)
 NVAT_BUILD_DIR = $(NVAT_SDK_DIR)/nv-attestation-sdk-cpp/build
 DEV_SEV_GPU_NIF_DIR = _build/dev_sev_gpu_nif
-DEV_SEV_GPU_PRIV = priv/dev_sev_gpu
+# Native assets of sev_gpu@1.0. Device Forge packages a device root's own
+# `src/<root>/priv` directory into that device's archive only.
+DEV_SEV_GPU_PRIV = src/dev_sev_gpu/priv
+# `yes` also copies the NVAT shared library into the sev_gpu@1.0 archive;
+# `no` uses the host's NVAT installation (the libnvat package).
+NVAT_BUNDLE ?= no
 
 # A recipe target that reads PRELOADED_STORE depends on a complete store.
 store_dep = $(if $(filter $(PRELOADED_STORE),$(1)),$(PRELOAD_MARKER))
@@ -186,9 +191,12 @@ $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so: $(NVAT_BUILD_DIR)/libnvat.so
 		-DNVAT_BUILD_DIR=$(CURDIR)/$(NVAT_BUILD_DIR) \
 		-DNVAT_DEBUG_LOG=OFF
 	cmake --build $(DEV_SEV_GPU_NIF_DIR)
-	mkdir -p $(DEV_SEV_GPU_PRIV)/lib
-	cp $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so $(DEV_SEV_GPU_PRIV)/
-	cp $(NVAT_BUILD_DIR)/libnvat.so* $(DEV_SEV_GPU_PRIV)/lib/ 2>/dev/null || true
+	mkdir -p $(DEV_SEV_GPU_PRIV)
+	cp $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.beam \
+		$(DEV_SEV_GPU_PRIV)/
+	if [ "$(NVAT_BUNDLE)" = yes ]; then \
+		mkdir -p $(DEV_SEV_GPU_PRIV)/lib && cp -P $(NVAT_BUILD_DIR)/libnvat.so* $(DEV_SEV_GPU_PRIV)/lib/; \
+	fi
 
-setup-cc: $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so ## Build the sev_gpu@1.0 NVAT NIF into priv/dev_sev_gpu (Linux)
-	@echo "Installed the sev_gpu@1.0 NIF and NVAT libraries in $(DEV_SEV_GPU_PRIV)."
+setup-cc: $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so ## Build the sev_gpu@1.0 NVAT NIF into src/dev_sev_gpu/priv (Linux)
+	@echo "Installed the sev_gpu@1.0 NIF and its module in $(DEV_SEV_GPU_PRIV)."

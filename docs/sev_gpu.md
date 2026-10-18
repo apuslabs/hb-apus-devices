@@ -32,31 +32,28 @@ builds `native/dev_sev_gpu_nif/` with CMake into `_build/dev_sev_gpu_nif/`:
 | `dev_sev_gpu_nif.so` | The NIF, linked against `libnvat`. |
 | `dev_sev_gpu_nif.beam` | The `dev_sev_gpu_nif` module that owns the NIF. |
 
-Device Forge packages the device's native assets from `priv/dev_sev_gpu/`,
-which must hold the NIF, its module and the NVAT library before
-`make package`:
-
-```bash
-mkdir -p priv/dev_sev_gpu/lib
-cp _build/dev_sev_gpu_nif/dev_sev_gpu_nif.so \
-   _build/dev_sev_gpu_nif/dev_sev_gpu_nif.beam priv/dev_sev_gpu/
-cp -P _build/attestation-sdk/nv-attestation-sdk-cpp/build/libnvat.so* \
-   priv/dev_sev_gpu/lib/
-```
+`make setup-cc` installs both files in `src/dev_sev_gpu/priv/`, the device
+root's own resource directory. Device Forge packages that directory into
+the `sev_gpu@1.0` implementation archive only, so the other devices'
+archives carry no native files:
 
 ```text
-priv/dev_sev_gpu/
+src/dev_sev_gpu/priv/
   dev_sev_gpu_nif.beam
   dev_sev_gpu_nif.so
-  lib/libnvat.so*
+  lib/libnvat.so*        only with make setup-cc NVAT_BUNDLE=yes
 ```
 
-The NIF's run-time search path is `$ORIGIN/lib` and `$ORIGIN/../lib`, so it
-finds `libnvat` in `lib/` next to itself, both in `priv/dev_sev_gpu/` and in
-the extracted implementation archive. No environment variable is needed:
+By default the NIF uses the host's NVAT installation (NVIDIA's `libnvat`
+package, which also provides `nvattest`). `NVAT_BUNDLE=yes` copies the
+library built from the SDK into `lib/` instead, for hosts without the
+package. The NIF's run-time search path is `$ORIGIN/lib` and
+`$ORIGIN/../lib`, so a bundled `libnvat` is found next to the NIF in the
+source tree and in the extracted implementation archive, without any
+environment variable:
 
 ```bash
-readelf -d priv/dev_sev_gpu/dev_sev_gpu_nif.so | grep -E 'RUNPATH|RPATH'
+readelf -d src/dev_sev_gpu/priv/dev_sev_gpu_nif.so | grep -E 'RUNPATH|RPATH'
 ```
 
 Expected: `[$ORIGIN/lib:$ORIGIN/../lib]`.

@@ -62,8 +62,8 @@ The reference deployment is `https://hb.apus.network`.
 | `agent-tools` | tool names (§5.6) | every enabled tool | Narrows the enabled tool set. |
 | `agent-tool-choice` | `auto`, `none`, `required`, or a named-function object | `auto` | `tool_choice` of the model calls (§4, step 5). |
 
-No other request key is read: `agent-api-peer`, `agent-api-path`, `agent-api-key` and
-request keys named like the node options below have no effect.
+No other request key is read: request keys named like the node options below
+have no effect.
 
 | Node option | Default | Effect |
 |---|---|---|

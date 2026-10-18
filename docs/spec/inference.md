@@ -274,8 +274,7 @@ error whose body is a JSON object is returned with that body unchanged.
 
 - **Routing is operator-only.** The device MUST read the runtime's address,
   paths, credential and attestation device only from node options. Keys
-  named `inference-*` or `agent-api-*` on the request or the base message
-  have no effect. A caller therefore cannot make the node contact another
+  named `inference-*` on the request or the base message have no effect. A caller therefore cannot make the node contact another
   host, nor obtain an attestation for a response from another server.
 - **Credential handling.** `inference-api-key` is sent only to the runtime
   origin, as `authorization: Bearer <key>`. It is never recorded in `raw`
@@ -348,8 +347,8 @@ error whose body is a JSON object is returned with that body unchanged.
    `health`, and `info` lists exactly these keys.
 2. The runtime's address, paths, credential and attestation device are read
    only from the node options of §3, with the stated defaults.
-3. Keys named `inference-*` or `agent-api-*` on the request or the base
-   message have no effect on the runtime origin, the paths, the credential
+3. Keys named `inference-*` on the request or the base message have no
+   effect on the runtime origin, the paths, the credential
    or the attestation device.
 4. `completions` rejects a truthy `stream`, on the request or in its `body`,
    with status 400 before contacting the runtime.

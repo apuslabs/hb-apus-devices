@@ -3,6 +3,7 @@
 /_checkouts/
 /.rebar3/
 /priv/
+/src/dev_sev_gpu/priv/
 /vendor/permaweb-os/native/lapee_snp_nif/target/
 /vendor/permaweb-os/src/priv/
 erl_crash.dump
