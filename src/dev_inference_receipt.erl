@@ -1293,6 +1293,8 @@ publish_over_http_honours_the_allowlist_test_() ->
                 <<"port">> => 0,
                 <<"priv-wallet">> => ar_wallet:new(),
                 <<"store">> => hb_test_utils:test_store(),
+                %% Keep signed requests out of the working directory.
+                <<"store-all-signed">> => false,
                 <<"receipt-publishers">> =>
                     [hb_util:human_id(ar_wallet:to_address(Publisher))]
             }),
