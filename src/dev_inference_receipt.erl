@@ -394,7 +394,8 @@ execution_opts(Opts) ->
 %% @doc Reject streaming, execute the allowlisted request and decorate the
 %% complete response.
 decorate(Path, Req, Opts) ->
-    case truthy(hb_ao:get(<<"stream">>, Req, false, Opts)) of
+    ExecutionReq = execution_request(Path, Req, Opts),
+    case truthy(maps:get(<<"stream">>, ExecutionReq, false)) of
         true ->
             {error, #{
                 <<"status">> => 400,
@@ -405,7 +406,6 @@ decorate(Path, Req, Opts) ->
                 }
             }};
         false ->
-            ExecutionReq = execution_request(Path, Req, Opts),
             case hb_ao:resolve(?INFERENCE_BASE, ExecutionReq,
                     execution_opts(Opts)) of
                 {ok, Response} -> add_receipt(Response, ExecutionReq, Opts);
@@ -976,9 +976,14 @@ generation_value(<<"messages">>) ->
 generation_value(_Key) -> <<"value">>.
 
 streaming_request_is_rejected_test() ->
-    ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
-            #{<<"error">> := <<"receipt-streaming-unsupported">>}}},
-        completions(#{}, #{<<"stream">> => true}, #{})).
+    lists:foreach(
+        fun(Req) ->
+            ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
+                    #{<<"error">> := <<"receipt-streaming-unsupported">>}}},
+                completions(#{}, Req, #{}))
+        end,
+        [#{<<"stream">> => true},
+            #{<<"body">> => <<"{\"stream\":true}">>}]).
 
 result_body_accepts_bare_and_enveloped_results_test() ->
     Inventory = #{<<"type">> => <<"apus-gpu-inventory">>,
