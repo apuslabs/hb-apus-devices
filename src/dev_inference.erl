@@ -403,8 +403,9 @@ reply(Outcome, Status, ContentType, Body, Extra, Req, Opts) ->
 %% `raw' is published verbatim and the attestation report binds its SHA-256.
 %% It records only the public generation request, never the HTTP message.
 attested_response(Res, Base, Req, Payload, Opts) ->
+    PublicRequest = public_request(Req, Payload, Opts),
     Raw = hb_json:encode(#{
-        <<"request">> => public_request(Req, Payload, Opts),
+        <<"request">> => PublicRequest,
         <<"response">> => hb_private:reset(Res),
         <<"ao-core">> => ao_core_evidence(Base, Req, Res, Opts),
         <<"timestamp">> => os:system_time(millisecond),
@@ -417,8 +418,7 @@ attested_response(Res, Base, Req, Payload, Opts) ->
     end,
     Additions = #{
         <<"attestation">> => attestation(Raw, Opts),
-        <<"resolved_model">> => resolved_model(
-            Decoded, public_request(Req, Payload, Opts), Opts)
+        <<"resolved_model">> => resolved_model(Decoded, PublicRequest, Opts)
     },
     Enhanced = case Decoded of
         undefined ->
@@ -441,19 +441,25 @@ attestation(Raw, Opts) ->
 attestation_evidence(Nonce, Opts) ->
     Device = hb_opts:get(<<"inference-attestation-device">>,
         ?DEFAULT_ATTESTATION_DEVICE, Opts),
-    try hb_ao:resolve(
-        #{<<"device">> => Device},
-        #{<<"path">> => <<"generate">>, <<"nonce">> => Nonce},
-        auxiliary_opts(Opts)
-    ) of
-        {ok, Result} -> evidence_map(Result, Opts);
-        Other ->
-            ?event(inference, {attestation_unavailable, Other}),
-            #{}
+    try
+        evidence_result(
+            hb_ao:resolve(
+                #{<<"device">> => Device},
+                #{<<"path">> => <<"generate">>, <<"nonce">> => Nonce},
+                auxiliary_opts(Opts)
+            ),
+            Opts
+        )
     catch Class:Reason ->
         ?event(inference, {attestation_unavailable, {Class, Reason}}),
         #{}
     end.
+
+evidence_result({ok, Result}, Opts) ->
+    evidence_map(Result, Opts);
+evidence_result(Other, _Opts) ->
+    ?event(inference, {attestation_unavailable, Other}),
+    #{}.
 
 %% Accept a JSON document, a bare map, or a `{status, body}' envelope.
 evidence_map(Bin, _Opts) when is_binary(Bin) ->
@@ -740,6 +746,11 @@ attestation_failure_keeps_raw_and_nonce_test() ->
         fun(_Base, _Req, _Opts) -> {error, gpu_unavailable} end},
     Crashing = #{<<"generate">> =>
         fun(_Base, _Req, _Opts) -> error(nvml_mismatch) end},
+    Unloadable = #{<<"generate">> =>
+        fun(_Base, _Req, _Opts) ->
+            {ok, #{<<"claims">> =>
+                {link, hb_util:encode(crypto:strong_rand_bytes(32)), #{}}}}
+        end},
     lists:foreach(
         fun(Device) ->
             Attestation = attestation(<<"{\"raw\":1}">>,
@@ -749,7 +760,7 @@ attestation_failure_keeps_raw_and_nonce_test() ->
             ?assertEqual(hb_util:to_hex(hb_crypto:sha256(<<"{\"raw\":1}">>)),
                 maps:get(<<"nonce">>, Attestation))
         end,
-        [Failing, Crashing]).
+        [Failing, Crashing, Unloadable]).
 
 resolved_model_reports_the_served_model_and_declared_facts_test() ->
     Opts = #{<<"inference-opts">> => #{
