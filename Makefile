@@ -2,7 +2,6 @@
 # Run `make help` for the list of targets.
 
 SHELL := /bin/bash
-.SHELLFLAGS := -e -o pipefail -c
 .DEFAULT_GOAL := help
 
 # Device Forge roots of the six devices published by Apus Network.
@@ -81,6 +80,7 @@ publish-dry-run: check-wallet ## Sign the six devices and print their IDs withou
 
 publish: check-wallet check-clean ## Sign and upload the six devices to Arweave, then write PUBLISH.md
 	@mkdir -p $(dir $(PUBLISH_LOG))
+	set -o pipefail; \
 	rebar3 device publish --device-src=$(DEVICE_SOURCES) --devices=$(DEVICES) \
 		--key "$(WALLET)" < /dev/null 2>&1 | tee $(PUBLISH_LOG)
 	scripts/publish-record.sh $(PUBLISH_LOG) $(HYPERBEAM_REF) > $(PUBLISH_LOG).md
