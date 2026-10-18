@@ -1,12 +1,30 @@
-.PHONY: compile package verify test eunit-all local publish recipes publish-recipes setup-inference setup-measurement setup-cc check-nvat-deps clean-publish
+# Build, test, package and publish the Apus Network HyperBEAM devices.
+# Run `make help` for the list of targets.
 
-HYPERBEAM_REF = 28baa3d27d70c4268f439587ba0398fb7771e0e3
-WALLET ?= $(HOME)/.aos.json
+SHELL := /bin/bash
+.SHELLFLAGS := -e -o pipefail -c
+.DEFAULT_GOAL := help
+
+# Device Forge roots of the six devices published by Apus Network.
+DEVICES = dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt
+# Source roots scanned by Device Forge: the Apus devices and the vendored
+# PermawebOS measurement devices they compose with.
+DEVICE_SOURCES = src,vendor/permaweb-os/src
+# HyperBEAM commit pinned in rebar.config.
+HYPERBEAM_REF := $(shell sed -n 's/.*{ref, *"\([0-9a-f]\{40\}\)"}.*/\1/p' rebar.config | head -n 1)
+
+# Signing keyfile for preload, publish and recipe targets. It has no default:
+# pass it explicitly, for example `make publish WALLET=/path/to/wallet.json`.
+WALLET ?=
+# Preloaded store built by `make preload`.
 PRELOADED_STORE ?= _build/preloaded-store
-
-DETERMINISTIC_INFERENCE_BRANCH ?= main
-DETERMINISTIC_INFERENCE_DIR = _build/deterministic-inference
-DETERMINISTIC_INFERENCE_REPO = https://github.com/apuslabs/deterministic-inference.git
+# Source of the specification IDs that recipes bind to: a preloaded store
+# directory, or a publication record written by `make publish` (PUBLISH.md).
+RECIPE_SPECS ?= $(PRELOADED_STORE)
+# Raw output of the last `make publish`.
+PUBLISH_LOG ?= _build/publish.log
+# Node probed by `make smoke`.
+HB_URL ?= http://localhost:8734
 
 NVAT_SDK_BRANCH ?= main
 NVAT_SDK_REPO = https://github.com/NVIDIA/attestation-sdk.git
@@ -14,72 +32,86 @@ NVAT_SDK_DIR = _build/attestation-sdk
 NVAT_BUILD_DIR = $(NVAT_SDK_DIR)/nv-attestation-sdk-cpp/build
 DEV_SEV_GPU_NIF_DIR = _build/dev_sev_gpu_nif
 DEV_SEV_GPU_PRIV = priv/dev_sev_gpu
-DEVICE_SOURCES = src,vendor/permaweb-os/src
 
-compile:
-	rebar3 compile
+ifeq ($(RECIPE_SPECS),$(PRELOADED_STORE))
+RECIPE_SPECS_DEP = $(PRELOADED_STORE)/data.mdb
+endif
 
-package:
-	rebar3 device package --device-src=$(DEVICE_SOURCES)
+.PHONY: help compile test eunit-all package verify preload local smoke \
+	publish-dry-run publish recipes publish-recipes \
+	setup-measurement setup-cc check-nvat-deps check-wallet check-clean
 
-verify:
-	rebar3 device verify --device-src=$(DEVICE_SOURCES)
+help: ## List the available targets
+	@echo "Apus Network HyperBEAM devices (HyperBEAM $(HYPERBEAM_REF))"
+	@echo
+	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | \
+		awk 'BEGIN { FS = ":.*## " } { printf "  %-18s %s\n", $$1, $$2 }'
 
-setup-measurement:
+compile: ## Compile the devices against the pinned HyperBEAM
+	rebar3 compile < /dev/null
+
+test: ## Run the EUnit suites of the six devices against a fresh test store
+	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=$(DEVICES) < /dev/null
+
+eunit-all: ## Run the device suites together with the HyperBEAM core suites
+	rebar3 eunit-all < /dev/null
+
+package: ## Write a BEAM archive per device to _build/device-packages
+	rebar3 device package --device-src=$(DEVICE_SOURCES) < /dev/null
+
+verify: ## Package every device and load each archive with the runtime loader
+	rebar3 device verify --device-src=$(DEVICE_SOURCES) < /dev/null
+
+preload: check-wallet ## Build a signed preloaded store of every device in PRELOADED_STORE
+	rebar3 device preload --device-src=$(DEVICE_SOURCES) --key "$(WALLET)" \
+		--output-dir $(PRELOADED_STORE) < /dev/null
+
+$(PRELOADED_STORE)/data.mdb:
+	@$(MAKE) --no-print-directory preload
+
+local: ## Start an interactive local node with every device preloaded
+	rebar3 device local --device-src=$(DEVICE_SOURCES) $(if $(WALLET),--key "$(WALLET)")
+
+smoke: ## Probe the six devices on a running node at HB_URL
+	HB_URL="$(HB_URL)" scripts/smoke-test.sh
+
+publish-dry-run: check-wallet ## Sign the six devices and print their IDs without uploading
+	rebar3 device publish --device-src=$(DEVICE_SOURCES) --devices=$(DEVICES) \
+		--key "$(WALLET)" --dry-run < /dev/null
+
+publish: check-wallet check-clean ## Sign and upload the six devices to Arweave, then write PUBLISH.md
+	@mkdir -p $(dir $(PUBLISH_LOG))
+	rebar3 device publish --device-src=$(DEVICE_SOURCES) --devices=$(DEVICES) \
+		--key "$(WALLET)" < /dev/null 2>&1 | tee $(PUBLISH_LOG)
+	scripts/publish-record.sh $(PUBLISH_LOG) $(HYPERBEAM_REF) > $(PUBLISH_LOG).md
+	mv $(PUBLISH_LOG).md PUBLISH.md
+	@echo "Wrote PUBLISH.md"
+
+recipes: check-wallet $(RECIPE_SPECS_DEP) ## Sign the recipes in docs/recipes and print their IDs
+	escript scripts/publish-recipes.escript "$(RECIPE_SPECS)" "$(WALLET)"
+
+publish-recipes: check-wallet $(RECIPE_SPECS_DEP) ## Sign and upload the recipes to Arweave
+	escript scripts/publish-recipes.escript "$(RECIPE_SPECS)" "$(WALLET)" --upload
+
+setup-measurement: ## Build the vendored SNP measurement NIF (Linux)
 	bash scripts/setup-measurement.sh
 
-test:
-	rebar3 device test --device-src=$(DEVICE_SOURCES) --devices=dev_agent,dev_inference,dev_sev_gpu,dev_gpu_inventory,dev_inference_measurement,dev_inference_receipt
-
-eunit-all:
-	rebar3 eunit-all
-
-local:
-	rebar3 device local --device-src=$(DEVICE_SOURCES)
-
-publish:
-	@test -f "$(WALLET)" || (echo "Missing wallet: $(WALLET)" && exit 1)
-	@TS=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
-	OUT=$$(mktemp); \
-	set -o pipefail; \
-	rebar3 device publish --device-src=$(DEVICE_SOURCES) --key "$(WALLET)" 2>&1 | tee "$$OUT"; \
-	{ \
-		echo "# Published Apus HyperBEAM Devices"; \
-		echo ""; \
-		echo "- Published at: $$TS"; \
-		echo "- Wallet: $(WALLET)"; \
-		echo "- HyperBEAM ref: $(HYPERBEAM_REF)"; \
-		echo ""; \
-		echo "## Device IDs"; \
-		echo ""; \
-		grep 'device publish:' "$$OUT" | sed -E 's/^.*device publish: /- /'; \
-	} > PUBLISH.md; \
-	rm -f "$$OUT"
-
-recipes:
-	escript scripts/publish-recipes.escript $(PRELOADED_STORE) $(WALLET)
-
-publish-recipes:
-	@test -f "$(WALLET)" || (echo "Missing wallet: $(WALLET)" && exit 1)
-	escript scripts/publish-recipes.escript $(PRELOADED_STORE) $(WALLET) --upload
-
-setup-python:
-	@if ! command -v python3 > /dev/null; then \
-		echo "Error: Python3 is not installed."; \
+check-wallet:
+	@if [ -z "$(WALLET)" ]; then \
+		echo "error: set WALLET to the signing keyfile, for example: make $(firstword $(MAKECMDGOALS)) WALLET=/path/to/wallet.json" >&2; \
 		exit 1; \
 	fi
-	@if ! command -v uv > /dev/null; then \
-		echo "Installing uv package manager..."; \
-		curl -LsSf https://astral.sh/uv/install.sh | sh; \
+	@if [ ! -f "$(WALLET)" ]; then \
+		echo "error: wallet keyfile not found: $(WALLET)" >&2; \
+		exit 1; \
 	fi
 
-$(DETERMINISTIC_INFERENCE_DIR):
-	@echo "Cloning deterministic-inference repository..." && \
-	git clone -b $(DETERMINISTIC_INFERENCE_BRANCH) $(DETERMINISTIC_INFERENCE_REPO) $(DETERMINISTIC_INFERENCE_DIR) --single-branch
-
-setup-inference: setup-python $(DETERMINISTIC_INFERENCE_DIR)
-	@echo "Setting up deterministic-inference..." && \
-	cd $(DETERMINISTIC_INFERENCE_DIR) && uv sync
+check-clean:
+	@if [ -n "$$(git status --porcelain -- src vendor native docs/spec rebar.config rebar.lock)" ]; then \
+		echo "error: commit the device sources before publishing; PUBLISH.md records the commit" >&2; \
+		git status --short -- src vendor native docs/spec rebar.config rebar.lock >&2; \
+		exit 1; \
+	fi
 
 check-nvat-deps:
 	@missing=""; \
@@ -92,12 +124,12 @@ check-nvat-deps:
 	if ! pkg-config --exists xmlsec1 2>/dev/null; then missing="$$missing xmlsec1"; fi; \
 	if ! pkg-config --exists spdlog 2>/dev/null; then missing="$$missing spdlog"; fi; \
 	if [ -n "$$missing" ]; then \
-		echo "Error: Missing dependencies for NVIDIA attestation SDK:$$missing"; \
+		echo "error: missing dependencies for the NVIDIA attestation SDK:$$missing" >&2; \
 		exit 1; \
 	fi
 
 $(NVAT_SDK_DIR):
-	@git clone -b $(NVAT_SDK_BRANCH) $(NVAT_SDK_REPO) $(NVAT_SDK_DIR) --single-branch
+	git clone -b $(NVAT_SDK_BRANCH) --single-branch $(NVAT_SDK_REPO) $(NVAT_SDK_DIR)
 
 $(NVAT_BUILD_DIR)/libnvat.so: check-nvat-deps $(NVAT_SDK_DIR)
 	cmake -S $(NVAT_SDK_DIR)/nv-attestation-sdk-cpp \
@@ -118,8 +150,5 @@ $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so: $(NVAT_BUILD_DIR)/libnvat.so
 	cp $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so $(DEV_SEV_GPU_PRIV)/
 	cp $(NVAT_BUILD_DIR)/libnvat.so* $(DEV_SEV_GPU_PRIV)/lib/ 2>/dev/null || true
 
-setup-cc: $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so
-	@echo "Installed dev_sev_gpu NIF assets in $(DEV_SEV_GPU_PRIV)."
-
-clean-publish:
-	rm -f PUBLISH.md PUBLISH.md.tmp
+setup-cc: $(DEV_SEV_GPU_NIF_DIR)/dev_sev_gpu_nif.so ## Build the sev_gpu@1.0 NVAT NIF into priv/dev_sev_gpu (Linux)
+	@echo "Installed the sev_gpu@1.0 NIF and NVAT libraries in $(DEV_SEV_GPU_PRIV)."
