@@ -1,6 +1,6 @@
 # `inference_measurement@1.0` — GPU-aware system measurement
 
-- **Depends-on:** `gpu_inventory@1.0` (default inventory device: `report`, `snapshot`), `sev_gpu@1.0` (default GPU TEE device: `generate`, `verify`), `measurement@1.0` (default base measurement device: `info`, `boot`, `fresh`, `verify`), `message@1.0` (signers, commitments, verification and IDs of envelopes), `httpsig@1.0` (the node's default commitment device: it signs observation envelopes and verifies their signatures), `json@1.0` (decoding an envelope posted to `verify` as JSON)
+- **Depends-on:** `gpu_inventory@1.0` (default inventory device: `report`, `snapshot`), `sev_gpu@1.0` (default GPU TEE device: `generate`, `verify`), `measurement@1.0` (default base measurement device: `info`, `boot`, `fresh`, `verify`), `message@1.0` (signers, commitments, verification and IDs of envelopes), `httpsig@1.0` (the node's default commitment device: it signs observation envelopes and verifies their signatures), `json@1.0` and `structured@1.0` (decoding an envelope posted to `verify` as JSON text into a message)
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
 
@@ -47,6 +47,13 @@ measurement.
   before the request existed.
 - **Observation envelope:** an envelope of type
   `apus-gpu-system-measurement` built and signed by this node.
+- **Observation commitment:** a commitment of an observation envelope that
+  names a `committer` and covers every key §5.4 lists as always present,
+  plus `failure` when the envelope carries it. The commitment a serving
+  node adds over `hashpath` alone (§5.7) is not one.
+- **Observed view:** an observation envelope restricted to its observation
+  commitments and the keys they cover; without observation commitments, the
+  envelope without commitments.
 - **Provenance classes:**
 
 | Class | Meaning |
@@ -165,16 +172,20 @@ envelopes have `purpose` `boot`.
      Return `verified`, `base-verification` (the base device's result),
      `nonce-binding-verified`, `nonce-binding-hardware-bound`,
      `gpu-tee-verified` and `provenance-class` = `host-measured-subject`.
-  3. **`apus-gpu-system-measurement`.** Restrict the envelope to the keys
-     its commitments cover (the envelope as given when it cannot be
-     restricted). Check that it has at least one signer and that the
-     commitments of its signers verify over those keys
-     (`signature-verified`); keys outside the commitments, such as the
-     `status` an HTTP response adds, do not affect this check. Check the
-     binding (§5.5) of the envelope as given against its `gpu-tee`. Return
-     `verified` = both, `signature-verified`, `signers`,
-     `nonce-binding-verified`, `gpu-tee-verified`, `observation-id` (the
-     envelope's signed ID) and `provenance-class` = `host-observed`.
+  3. **`apus-gpu-system-measurement`.** Build the observed view (§2). Other
+     commitments, such as the one a serving node adds over `hashpath`, and
+     keys no observation commitment covers, such as an HTTP `status`, are
+     not part of it. `signers` lists the committers of the observation
+     commitments, each once. `signature-verified` is true when there is at
+     least one signer and every observation commitment verifies over the
+     view. `nonce-binding-verified` is the binding check (§5.5) of the view
+     against its `gpu-tee`. Return `verified` = both, `signature-verified`,
+     `signers`, `nonce-binding-verified`, `gpu-tee-verified`,
+     `observation-id` and `provenance-class` = `host-observed`.
+     `observation-id` is the signed ID of the view, which combines the IDs
+     of its observation commitments; it equals the signed ID of the
+     envelope `boot` or `fresh` returned. Without observation commitments
+     it is the unsigned ID of the view.
   4. `gpu-tee-verified` is true when `gpu-tee` is available, has non-empty
      `evidences` and a `nonce`, and the GPU TEE device's `verify` returns
      `true` for those evidences and that nonce. It reports a re-verification
@@ -288,9 +299,21 @@ ignores the `nonce` key of `verify`. Changing the recorded binding changes
 
 Request `accept: application/json` and `accept-bundle: true` to receive an
 envelope as one JSON object with nested objects inline. Booleans are rendered
-as `"true"` and `"false"`, typed through `ao-types`. The serving node adds a
-top-level `status` to that object; it is outside the envelope's commitments,
-and `verify` accepts the object exactly as received.
+as `"true"` and `"false"`, typed through `ao-types`.
+
+The serving node adds top-level `status` and `hashpath` keys and
+commitments of its own, including a commitment signed with its key that
+covers `hashpath` alone; the node's address therefore appears twice among
+the object's committers. None of these is an observation commitment or
+covered by one, so `verify` accepts the object exactly as received: it
+reports the node in `signers` once and the same `observation-id` as for the
+envelope `fresh` returned.
+
+To verify the object over HTTP, POST its JSON text unchanged to
+`/~inference_measurement@1.0/verify` as the request body with a content type
+other than `application/json`, such as `text/plain`; it reaches `verify` as
+`body`. A node reads an `application/json` body as the request message
+itself, so with that content type send `{"body": "<the JSON text>"}`.
 
 ## 6. Ordering, freshness & caching
 
@@ -338,9 +361,11 @@ and `verify` accepts the object exactly as received.
 - `verify` checks signatures and bindings; it does not decide whether a
   measured subject or a GPU claim set is acceptable. That policy belongs to
   the verifier.
-- For an observation envelope, `signature-verified` is true when the
-  commitments of all its signers verify, whoever the signers are, and
-  `signers` lists them. A verifier MUST check that `signers` contains the
+- For an observation envelope only observation commitments count:
+  `signature-verified` is true when all of them verify, whoever signed
+  them, and `signers` lists their committers. The node's commitment over
+  `hashpath` alone does not vouch for the observation, so content replaced
+  under it has no signer. A verifier MUST check that `signers` contains the
   address of the node it expects.
 - Requests cannot select dependency devices or file paths. A request or base
   message may select `measurement-mode`, which only chooses between composing
@@ -391,11 +416,13 @@ inference_receipt@1.0 --fresh(nonce = request digest)--> inference_measurement@1
    `measurement-integration` false and `provenance-class` `host-observed`.
 5. An observation envelope is signed by the node when a commitment device and
    key are configured.
-6. For an observation envelope exactly as `fresh` returned it (as a
-   message, or in its `json@1.0` encoding), also with keys outside its
-   commitments added (such as an HTTP `status`), `verify` returns
-   `signature-verified` and `nonce-binding-verified` true; changing a signed
-   key, the binding, or `gpu-tee.nonce` makes `verified` false.
+6. For an observation envelope as `fresh` returned it and as a node serves
+   it over HTTP (§5.7), as a message or in its `json@1.0` encoding,
+   `verify` returns `signature-verified` and `nonce-binding-verified` true,
+   `signers` holding the node's address once, and the same
+   `observation-id`; changing a signed key, the binding, or
+   `gpu-tee.nonce` makes `verified` false. A commitment that does not cover
+   every observation key never makes its committer a signer.
 7. `verify` delegates base measurements to the base device without the keys
    this device adds. For a `measurement-nonce` composition it passes `nonce`
    = base64url(`D`) recomputed from the recorded binding, and reports

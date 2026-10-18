@@ -30,6 +30,14 @@
 -define(MAX_NONCE_BYTES, 1024).
 %% Keys this device adds to a base measurement envelope.
 -define(COMPOSITION_KEYS, [<<"cpu-tee">>, <<"gpu-tee">>, <<"apus-gpu-composition">>]).
+%% Keys every observation envelope carries; `failure' is added when a
+%% composition was attempted and failed.
+-define(OBSERVATION_KEYS, [
+    <<"type">>, <<"version">>, <<"purpose">>, <<"issued-at-unix">>,
+    <<"measurement-integration">>, <<"integration-mode">>, <<"provenance-class">>,
+    <<"cpu-tee">>, <<"gpu-tee">>, <<"gpu-inventory">>, <<"gpu-inventory-digest">>,
+    <<"nonce-binding">>
+]).
 
 %% @doc Return the keys this device resolves.
 -spec info(map()) -> #{ exports := [binary()] }.
@@ -495,36 +503,67 @@ evidence_nonce(Envelope, Opts) ->
             undefined
     end.
 
-%% @doc Verify an observation envelope: the signatures over its committed
-%% keys and the nonce binding of its GPU evidence. Keys outside the
-%% commitments, such as the `status' an HTTP response adds, do not take part
-%% in the signature check.
+%% @doc Verify an observation envelope on its observed view: the signatures
+%% of its observation commitments and the nonce binding of its GPU evidence.
 verify_observation(Envelope, Opts) ->
-    Committed = committed_keys_only(Envelope, Opts),
-    Signers = signers(Committed, Opts),
+    {Observed, Signers} = observed_view(Envelope, Opts),
     SignatureVerified =
         Signers =/= [] andalso
-            (try hb_message:verify(Committed, signers, Opts) catch _:_ -> false end) =:= true,
-    GpuTee = hb_maps:get(<<"gpu-tee">>, Envelope, #{}, Opts),
-    BindingVerified = binding_verified(Envelope, GpuTee, Opts),
+            (try hb_message:verify(Observed, Signers, Opts) catch _:_ -> false end) =:= true,
+    GpuTee = hb_maps:get(<<"gpu-tee">>, Observed, #{}, Opts),
+    BindingVerified = binding_verified(Observed, GpuTee, Opts),
     #{
         <<"verified">> => SignatureVerified andalso BindingVerified,
         <<"signature-verified">> => SignatureVerified,
         <<"signers">> => Signers,
         <<"nonce-binding-verified">> => BindingVerified,
         <<"gpu-tee-verified">> => gpu_evidence_verified(GpuTee, Opts),
-        <<"observation-id">> => message_id(Committed, signed, Opts),
+        <<"observation-id">> => message_id(Observed, signed, Opts),
         <<"provenance-class">> => <<"host-observed">>
     }.
 
-%% @doc The envelope restricted to the keys its commitments cover, or the
-%% envelope itself when it cannot be restricted.
-committed_keys_only(Envelope, Opts) ->
-    try hb_message:with_only_committed(Envelope, Opts) of
-        {ok, Committed} when is_map(Committed) -> Committed;
-        _ -> Envelope
+%% @doc The observed view of an observation envelope and its signers. The
+%% observation commitments are the commitments with a committer that cover
+%% every observation key (and `failure' when the envelope carries it). The
+%% view keeps only those commitments and the keys they cover, so another
+%% commitment (such as the one a serving node adds over `hashpath') and an
+%% uncovered key (such as the `status' of an HTTP response) take no part.
+%% Without observation commitments the view is the envelope without
+%% commitments, and there are no signers.
+observed_view(Envelope, Opts) ->
+    Required = ?OBSERVATION_KEYS ++
+        [<<"failure">> || maps:is_key(<<"failure">>, Envelope)],
+    Covering =
+        maps:filtermap(
+            fun(ID, Commitment) ->
+                Keys = committed_keys(Envelope, ID, Opts),
+                case is_map(Commitment) andalso (Required -- Keys) =:= [] andalso
+                        maps:get(<<"committer">>, Commitment, undefined) of
+                    Committer when is_binary(Committer) -> {true, {Commitment, Keys}};
+                    _ -> false
+                end
+            end,
+            as_map(hb_maps:get(<<"commitments">>, Envelope, #{}, Opts), Opts)
+        ),
+    case maps:size(Covering) of
+        0 ->
+            {maps:remove(<<"commitments">>, Envelope), []};
+        _ ->
+            Covered = lists:usort(lists:append([Keys || {_, Keys} <- maps:values(Covering)])),
+            View = maps:with(Covered ++ [<<Key/binary, "+link">> || Key <- Covered], Envelope),
+            {
+                View#{ <<"commitments">> => maps:map(fun(_, {C, _}) -> C end, Covering) },
+                lists:usort([maps:get(<<"committer">>, C) || {C, _} <- maps:values(Covering)])
+            }
+    end.
+
+%% @doc The keys one commitment of a message covers.
+committed_keys(Msg, CommitmentID, Opts) ->
+    try hb_message:committed(Msg, [CommitmentID], Opts) of
+        Keys when is_list(Keys) -> Keys;
+        _ -> []
     catch
-        _:_ -> Envelope
+        _:_ -> []
     end.
 
 %% @doc `Holder' carries `nonce-binding' and `gpu-inventory-digest'. The
@@ -580,20 +619,13 @@ gpu_evidence_verified(GpuTee, Opts) when is_map(GpuTee) ->
 gpu_evidence_verified(_GpuTee, _Opts) ->
     false.
 
-signers(Envelope, Opts) ->
-    try hb_message:signers(Envelope, Opts) of
-        Signers when is_list(Signers) -> Signers;
-        _ -> []
-    catch
-        _:_ -> []
-    end.
-
 %%% ------------------------------------------------------------------
 %%% Helpers
 %%% ------------------------------------------------------------------
 
-%% @doc Resolve a key on a dependency device. Results are never served from
-%% or written to the cache: every call observes the host afresh.
+%% @doc Resolve a key on a dependency device with `cache-control: no-cache,
+%% no-store', so the result is neither read from nor written to the node's
+%% cache.
 resolve(Device, Request, Opts) ->
     LocalOpts = Opts#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] },
     try hb_ao:resolve(#{ <<"device">> => Device }, Request, LocalOpts) of
@@ -1096,36 +1128,137 @@ observation_verification_test() ->
     ?assertMatch({ok, #{ <<"verified">> := true, <<"signature-verified">> := true }},
         verify(#{}, #{ <<"body">> => JSON }, Opts)).
 
-%% An HTTP response adds a top-level `status' outside the commitments. The
-%% envelope still verifies, as a message and in its JSON form.
-observation_with_http_status_verifies_test() ->
+%% The envelope as a node's HTTP server serves it: the node adds an unsigned
+%% commitment, a signed commitment over `hashpath' alone, and `status'.
+as_served(Envelope, Opts) ->
+    Hashpath = <<(hb_util:human_id(crypto:strong_rand_bytes(32)))/binary, "/",
+        (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Unsigned = hb_message:commit(Envelope, Opts,
+        #{ <<"device">> => <<"httpsig@1.0">>, <<"type">> => <<"unsigned">> }),
+    Served = hb_message:commit(Unsigned#{ <<"hashpath">> => Hashpath }, Opts,
+        #{ <<"device">> => <<"httpsig@1.0">>, <<"committed">> => [<<"hashpath">>] }),
+    Served#{ <<"status">> => 200 }.
+
+node_address(Opts) ->
+    hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))).
+
+%% The served form verifies, as a message and as JSON, with the node listed
+%% once and the same observation ID as the envelope `fresh' returned.
+observation_as_served_verifies_test() ->
     Opts = stub_opts(#{}),
     {ok, Envelope} = fresh(#{}, #{ <<"nonce">> => <<"request-5">> }, Opts),
     {ok, Expected} = verify(#{}, #{ <<"envelope">> => Envelope }, Opts),
-    WithStatus = Envelope#{ <<"status">> => 200 },
-    {ok, FromMessage} = verify(#{}, #{ <<"envelope">> => WithStatus }, Opts),
-    ?assertMatch(
-        #{
-            <<"verified">> := true,
-            <<"signature-verified">> := true,
-            <<"nonce-binding-verified">> := true
-        },
-        FromMessage
+    ?assertEqual(hb_message:id(Envelope, signed, Opts),
+        maps:get(<<"observation-id">>, Expected)),
+    Served = as_served(Envelope, Opts),
+    ?assertEqual([node_address(Opts), node_address(Opts)],
+        hb_message:signers(Served, Opts)),
+    JSON = hb_message:convert(Served, <<"json@1.0">>, Opts),
+    ?assertMatch(#{ <<"status">> := 200, <<"hashpath">> := _ }, hb_json:decode(JSON)),
+    lists:foreach(
+        fun(Request) ->
+            {ok, Result} = verify(#{}, Request, Opts),
+            ?assertMatch(
+                #{
+                    <<"verified">> := true,
+                    <<"signature-verified">> := true,
+                    <<"nonce-binding-verified">> := true
+                },
+                Result
+            ),
+            ?assertEqual([node_address(Opts)], maps:get(<<"signers">>, Result)),
+            ?assertEqual(maps:get(<<"observation-id">>, Expected),
+                maps:get(<<"observation-id">>, Result))
+        end,
+        [#{ <<"envelope">> => Served }, #{ <<"body">> => JSON }]
     ),
-    ?assertEqual(maps:get(<<"signers">>, Expected), maps:get(<<"signers">>, FromMessage)),
-    ?assertEqual(maps:get(<<"observation-id">>, Expected),
-        maps:get(<<"observation-id">>, FromMessage)),
-    JSON = hb_json:encode(
-        (hb_json:decode(hb_message:convert(Envelope, <<"json@1.0">>, Opts)))#{
-            <<"status">> => 200
-        }
-    ),
-    ?assertMatch({ok, #{ <<"verified">> := true, <<"signature-verified">> := true }},
-        verify(#{}, #{ <<"body">> => JSON }, Opts)),
-    %% A changed signed key still fails with the status present.
-    Tampered = WithStatus#{ <<"gpu-inventory-digest">> => <<"other">> },
+    %% A changed signed key still fails in the served form.
+    Tampered = Served#{ <<"gpu-inventory-digest">> => <<"other">> },
     ?assertMatch({ok, #{ <<"verified">> := false, <<"signature-verified">> := false }},
         verify(#{}, #{ <<"envelope">> => Tampered }, Opts)).
+
+%% Only commitments that cover the observation count: the node's commitment
+%% over `hashpath' does not vouch for replaced content, and a key no
+%% observation commitment covers is not accepted.
+forged_observation_is_not_verified_test() ->
+    Opts = stub_opts(#{}),
+    {ok, Envelope} = fresh(#{}, #{ <<"nonce">> => <<"request-6">> }, Opts),
+    Served = as_served(Envelope, Opts),
+    HashpathOnly = maps:filter(
+        fun(_, Commitment) -> maps:get(<<"committed">>, Commitment) =:= [<<"hashpath">>] end,
+        maps:get(<<"commitments">>, Served)
+    ),
+    ?assertEqual(1, map_size(HashpathOnly)),
+    Forged = Served#{
+        <<"commitments">> => HashpathOnly,
+        <<"gpu-inventory-digest">> => <<"forged">>,
+        <<"nonce-binding">> => #{
+            <<"request-nonce">> => <<"request-6">>,
+            <<"gpu-inventory-digest">> => <<"forged">>
+        },
+        <<"gpu-tee">> => #{ <<"available">> => false, <<"verified">> => false }
+    },
+    ?assertMatch(
+        {ok, #{ <<"verified">> := false, <<"signature-verified">> := false, <<"signers">> := [] }},
+        verify(#{}, #{ <<"envelope">> => Forged }, Opts)
+    ),
+    %% Content signed by another key names only that key as signer.
+    Other = stub_opts(#{}),
+    Resigned = hb_message:commit(maps:without([<<"commitments">>, <<"status">>], Forged), Other),
+    WithNodeHashpath = Resigned#{
+        <<"commitments">> => maps:merge(maps:get(<<"commitments">>, Resigned), HashpathOnly)
+    },
+    {ok, ResignedResult} = verify(#{}, #{ <<"envelope">> => WithNodeHashpath }, Opts),
+    ?assertMatch(#{ <<"signature-verified">> := true }, ResignedResult),
+    ?assertEqual([node_address(Other)], maps:get(<<"signers">>, ResignedResult)),
+    %% An added `failure' is outside the observation commitments.
+    ?assertMatch({ok, #{ <<"verified">> := false, <<"signers">> := [] }},
+        verify(#{}, #{ <<"envelope">> => Served#{ <<"failure">> => <<"added">> } }, Opts)).
+
+%% Over a node's HTTP server: the JSON that `fresh' serves, posted unchanged
+%% to `verify' as a text body or as `body' of a JSON request, verifies; a
+%% changed signed key does not.
+observation_http_round_trip_test_() ->
+    {timeout, 60, fun() ->
+        Opts = stub_opts(#{
+            <<"port">> => 0,
+            <<"store">> => hb_test_utils:test_store()
+        }),
+        Node = binary_to_list(hb_http_server:start_node(Opts)),
+        Accept = [{"accept", "application/json"}, {"accept-bundle", "true"}],
+        {ok, {{_, 200, _}, _, Served}} = httpc:request(get,
+            {Node ++ "~inference_measurement@1.0/fresh?nonce=http-1"
+                    "&measurement-mode=observation-only", Accept},
+            [{timeout, 30000}], [{body_format, binary}]),
+        ?assertMatch(#{ <<"status">> := 200, <<"hashpath">> := _ }, hb_json:decode(Served)),
+        PostAs = fun(ContentType, Body) ->
+            {ok, {{_, 200, _}, _, Reply}} = httpc:request(post,
+                {Node ++ "~inference_measurement@1.0/verify", Accept, ContentType, Body},
+                [{timeout, 30000}], [{body_format, binary}]),
+            hb_json:decode(Reply)
+        end,
+        Post = fun(Body) -> PostAs("text/plain", Body) end,
+        lists:foreach(
+            fun(Result) ->
+                ?assertMatch(
+                    #{
+                        <<"verified">> := <<"true">>,
+                        <<"signature-verified">> := <<"true">>,
+                        <<"nonce-binding-verified">> := <<"true">>
+                    },
+                    Result
+                ),
+                ?assertEqual([node_address(Opts)], maps:get(<<"signers">>, Result))
+            end,
+            [
+                Post(Served),
+                PostAs("application/json", hb_json:encode(#{ <<"body">> => Served }))
+            ]
+        ),
+        Tampered = hb_json:encode(
+            (hb_json:decode(Served))#{ <<"gpu-inventory-digest">> => <<"other">> }),
+        ?assertMatch(#{ <<"verified">> := <<"false">> }, Post(Tampered))
+    end}.
 
 verify_rejects_unknown_input_test() ->
     ?assertEqual({400, <<"envelope-required">>}, error_of(verify(#{}, #{}, #{}))),
@@ -1143,5 +1276,6 @@ snapshot_rejects_another_result_test() ->
 snapshot_returns_the_inventory_snapshot_test() ->
     ?assertMatch({ok, #{ <<"type">> := <<"apus-gpu-runtime-snapshot">> }},
         snapshot(#{}, #{}, stub_opts(#{}))).
+
 
 -endif.

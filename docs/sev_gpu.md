@@ -166,6 +166,8 @@ The tests cover nonce validation, the claims rule, both backends (with
 stand-in executables), the evidence limits and the NIF call timeout,
 inventory parsing and the shared inventory collection, the measurement
 binding and its anchoring in the host report, and the verification of
-observation envelopes received over HTTP. Two tests attest the real GPU end
-to end on a confidential-computing host; elsewhere they check that
+observation envelopes as a node serves them over HTTP (including a round
+trip through a node's HTTP server), with replaced content that keeps only
+the node's signature over `hashpath` rejected. Two tests attest the real
+GPU end to end on a confidential-computing host; elsewhere they check that
 `generate` reports the missing attestation backend as an error.
