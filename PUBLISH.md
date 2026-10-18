@@ -6,16 +6,16 @@ whose `implements-device` tag is the specification ID.
 
 | Field | Value |
 |---|---|
-| Published at | 2026-10-18T21:00:39Z |
+| Published at | 2026-10-18T22:00:37Z |
 | Signer | `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8` |
-| Source commit | `8cd4efa261ff97745fbaaa67d25002771aed8a73` |
+| Source commit | `ab8322624ca8b364aae30f7f3b6bbbfac193d9f7` |
 | HyperBEAM | `apuslabs/HyperBEAM` at `28baa3d27d70c4268f439587ba0398fb7771e0e3` |
 
 | Device | Specification ID | Implementation ID |
 |---|---|---|
-| `agent@1.0` | `FqRbb-OQBLpdbjQQ4SV_RZCMrbvm7cOMywQF6Qr1hpc` | `F1bFlkOaK-XHT_KbAZkpu9Rg-TUvWwYavN8bVDPUbo4` |
-| `gpu_inventory@1.0` | `D94bBwlCzQWfMWpkjjO16p-Rx3RvRa3zkORgWFbmNR4` | `LQz-nmQ1llSAnovT91qpq6_DwBdTBtK4gbUanHthJy0` |
-| `inference@1.0` | `L9sHMLqNQrIHA49MO5AoQMG-cnh7yQVQscKi4YSlJzc` | `6I4c_Sys2Tmb7Vn4uW3mq9-XNTWlCHNOIe-AG99yg5o` |
-| `inference_measurement@1.0` | `unDaV0t2w9OWMGB59uy57l5-G1Tz1hPbz7ytB0o6NV4` | `p2Ldi81NTpLndDCivagJ6aW-D9QFVXLap4SZgkKCZQw` |
-| `inference_receipt@1.0` | `xPGNJhitDc-9_p4iQ6OiixpSLbON9e9RMTzqjVkX3Qg` | `GFdPbKYneDrVfP_uNbPReq0fnmvivrzvw14IMtzGssU` |
-| `sev_gpu@1.0` | `MiYhhRSKmJDOtitvJ-A97clyXMDHNq73VCsEBUNYlpk` | `cm9PlzZpbjPeF5e8baVj5kLlYfGclREprkSAUAqiwRM` |
+| `agent@1.0` | `puR2sj2Q2mIkIgJBikyG68i5mu3wOt3RBwbYDgiRBrI` | `Bo9jiTsFFpXw_riKcolCvXE_R_gDXkK1kkbVB_hM8-4` |
+| `gpu_inventory@1.0` | `k1Boi24_QvkaVBxlzgr9b3bvrVbNAE2p4UH6g-nFcpE` | `3HPyfL_PQAAmYIEtWTPcKRtErN7FDnFF9yZFy2zZF0s` |
+| `inference@1.0` | `FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw` | `KMEG4h1IxlMoIM0gq19qFWUjey6bH1BuaKOi5g9Y100` |
+| `inference_measurement@1.0` | `OX2fN8q3JjHJQmca7mZmSqPqRjsosZ8XYGkrire6TdM` | `I3oSsl4cZxXanCYDEiOE_11wf_tPgrU5f1pW2f3Lubs` |
+| `inference_receipt@1.0` | `gzgJCo-icR752odI-YZ8Fpamsh0txzwHOZiHpDrsQKM` | `cyhQqMkFPyHjc0p1aEc2kTrTEWW6pn6cORcCS1Y-rms` |
+| `sev_gpu@1.0` | `dRL0FGlnrLPe_xy-8uMlMnYtv6HyWtxzLbp1YgFkIw0` | `d9lNZizqiQjz2hWbjAuK3Mz_lclLEZr-Zc1R4cVY5EI` |

@@ -25,3 +25,24 @@ Signer: `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8`.
 | J_cUgGBSc0R5Fcjx8GpkckQYgIBh7cPKt5g9Tini9OI | inference_receipt@1.0 | verify-receipt-hashpath | xPGNJhitDc-9_p4iQ6OiixpSLbON9e9RMTzqjVkX3Qg | pending |
 | g8r2o6b-U-W2dWz9jZ70s6C-I5QOtM1GszgdLorYsTc | sev_gpu@1.0 | generate-evidence | MiYhhRSKmJDOtitvJ-A97clyXMDHNq73VCsEBUNYlpk | pending |
 | 0XWm2WTfLadG7GF3BLzFCpVvWAh_vAzo5tOL35SxHpo | sev_gpu@1.0 | verify-evidence | MiYhhRSKmJDOtitvJ-A97clyXMDHNq73VCsEBUNYlpk | pending |
+
+## Published at 2026-10-18T22:00:39Z
+
+Signer: `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8`.
+
+| Recipe ID | Device | Slug | Spec ID | Block |
+|---|---|---|---|---|
+| 65VK66OAaneuslCU8oayFbfutHKkspupffn8nALclEs | agent@1.0 | run-without-tools | puR2sj2Q2mIkIgJBikyG68i5mu3wOt3RBwbYDgiRBrI | pending |
+| OhUK3WMqHWLGFVzbrDXNzIdBHIwE3DVWqQPx5VSUZvI | gpu_inventory@1.0 | inventory-digest | k1Boi24_QvkaVBxlzgr9b3bvrVbNAE2p4UH6g-nFcpE | pending |
+| cA0R1UwhRxDXz1KHdzG1DeWVn1Dfea0X31laOrFefyM | gpu_inventory@1.0 | inventory-report | k1Boi24_QvkaVBxlzgr9b3bvrVbNAE2p4UH6g-nFcpE | pending |
+| u_fWLRx85rdY8OVrUjzE_d1W1VzBRWILwiyRjLtl6Us | inference@1.0 | attested-completion | FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw | pending |
+| BEaBeff-o0xkgR6MqDeRI8jTKLHbZh-2IByo65WXTbM | inference@1.0 | chat-completion | FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw | pending |
+| r-FKm9kH6KhKpolleS2JXaTySWvE1-E8TFORNW6rOhY | inference@1.0 | check-runtime-health | FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw | pending |
+| ahYuRo2eLNgdK2ED2ALH2Qc6NmsYaTrA8FDTMQatjeU | inference@1.0 | list-served-model | FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw | pending |
+| TH1er9aJukKak5IERCpe0M4slnqkQ1_rg3F8Grr62Nw | inference_measurement@1.0 | fresh-measurement | OX2fN8q3JjHJQmca7mZmSqPqRjsosZ8XYGkrire6TdM | pending |
+| _i-7nJgfVDW4GbCgcyMDV3j684DKfPYGeWchyJX24hQ | inference_measurement@1.0 | runtime-snapshot | OX2fN8q3JjHJQmca7mZmSqPqRjsosZ8XYGkrire6TdM | pending |
+| vV_RWwM_QyJ3dG_abq_1OLU3nVYFf10cu-EzUATv2ZA | inference_receipt@1.0 | chat-with-receipt | gzgJCo-icR752odI-YZ8Fpamsh0txzwHOZiHpDrsQKM | pending |
+| dRrrr4GZckz__WvNw_YdM9ovWQQtxy8TNmGHWgieYpM | inference_receipt@1.0 | list-model-through-hyperbeam | gzgJCo-icR752odI-YZ8Fpamsh0txzwHOZiHpDrsQKM | pending |
+| 0_WRF0Skx04dhITWyfseBni6xyFDFo-yQSs2xXUnp54 | inference_receipt@1.0 | verify-receipt-hashpath | gzgJCo-icR752odI-YZ8Fpamsh0txzwHOZiHpDrsQKM | pending |
+| zcWuz2lqwBdhTln7egEmpSq4SHC4R0Kv3gFdSwVzDsg | sev_gpu@1.0 | generate-evidence | dRL0FGlnrLPe_xy-8uMlMnYtv6HyWtxzLbp1YgFkIw0 | pending |
+| _TkpZZcBSbtu2cfZL7BigakD3_AJPMgMDT5N7LJangw | sev_gpu@1.0 | verify-evidence | dRL0FGlnrLPe_xy-8uMlMnYtv6HyWtxzLbp1YgFkIw0 | pending |
