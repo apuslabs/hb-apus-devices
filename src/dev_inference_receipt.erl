@@ -8,8 +8,8 @@
 %%% measurement, and is signed with the node's identity.
 %%%
 %%% `verify-hashpath' recomputes a recorded transcript's HashPath, and
-%%% `publish' signs a receipt as an ANS-104 data item and submits it to the
-%%% node's bundler.
+%%% `publish' signs a document carrying a receipt that names this node as an
+%%% ANS-104 data item and submits it to the node's bundler.
 -module(dev_inference_receipt).
 -implements(<<"inference_receipt@1.0">>).
 -specification("docs/spec/inference_receipt.md").
@@ -18,7 +18,30 @@
 -include_lib("hb/include/hb.hrl").
 
 -define(VERSION, <<"1.0">>).
+-define(RECEIPT_TYPE, <<"apus-inference-receipt">>).
 -define(INFERENCE_BASE, #{<<"device">> => <<"inference@1.0">>}).
+-define(JSON, <<"application/json">>).
+
+%% The AO-Core stage whose function computes the recorded HashPath.
+-define(HASHPATH_SOURCE,
+    <<"HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)">>).
+
+%% Upper bound on the external term of a transcript (1 MiB), and on the
+%% unpadded base64url text of `verification-input-term' (the encoded length
+%% of 1 MiB, so its decoded bytes never exceed 1 MiB).
+-define(MAX_TERM_BYTES, 1048576).
+-define(MAX_TERM_TEXT_BYTES, 1398102).
+
+%% Upper bound on a document submitted to `publish' (8 MiB).
+-define(MAX_PUBLISH_BYTES, 8388608).
+
+%% Keys a document submitted to `publish' must carry in its receipt, with
+%% their JSON types.
+-define(PUBLISH_REQUIRED_KEYS, [
+    {<<"receipt-id">>, string}, {<<"request-digest">>, string},
+    {<<"response-digest">>, string}, {<<"node-address">>, string},
+    {<<"ao-core">>, object}, {<<"signed-receipt">>, object}
+]).
 
 %% Generation parameters `inference@1.0' relays to the runtime, without its
 %% `user' caller identifier. Both specifications state this list.
@@ -30,6 +53,13 @@
     <<"repetition_penalty">>, <<"length_penalty">>, <<"early_stopping">>,
     <<"tools">>, <<"tool_choice">>, <<"response_format">>,
     <<"chat_template_kwargs">>, <<"reasoning_effort">>
+]).
+
+%% Execution bindings: the operator's node option of each name, else the
+%% executed request's declaration.
+-define(BINDING_KEYS, [
+    <<"model-sha256">>, <<"runtime-build-hash">>, <<"inference-profile">>,
+    <<"model-source">>, <<"model-tx">>
 ]).
 
 %% Execution-profile declarations a caller may record in the receipt.
@@ -46,6 +76,11 @@
     ?GENERATION_KEYS ++ [<<"tee">>, <<"type">>] ++ ?DECLARATION_KEYS).
 
 %% @doc Return the public device description.
+-spec info(map()) -> #{
+    exports := [binary()],
+    description := binary(),
+    version := binary()
+}.
 info(_Opts) ->
     #{
         exports => [<<"completions">>, <<"chat">>, <<"v1">>, <<"models">>,
@@ -126,33 +161,128 @@ v1(Base, Req, Opts) ->
         Opts
     )}.
 
-%% @doc Publish a completed receipt through HyperBEAM's bundler. The device
-%% signs the ANS-104 item; callers never handle a wallet or a signature. With
-%% the `receipt-publishers' node option set, only requests signed by one of
-%% the listed addresses are accepted.
+%% @doc Publish a document carrying a receipt that names this node through
+%% HyperBEAM's bundler. The device signs the ANS-104 item; callers never
+%% handle a wallet or a signature. With the `receipt-publishers' node option
+%% set, only requests signed by one of the listed addresses are accepted.
 -spec publish(
     #{ _ => _ },
     #{ receipt => _, body => _, _ => _ },
     map()
 ) -> {ok, #{ id := binary(), 'bundle-id' := binary(), _ => _ }}
-    | {error, #{ status := integer(), body := _ }}.
+    | {error, #{ status := integer(), 'content-type' := binary(),
+        body := binary() }}.
 publish(_Base, Req, Opts) ->
-    Receipt = first_defined([
+    Value = first_defined([
         hb_ao:get(<<"receipt">>, Req, undefined, Opts),
         hb_ao:get(<<"body">>, Req, undefined, Opts)
     ]),
-    case {authorized_publisher(Req, Opts), Receipt} of
+    case {authorized_publisher(Req, Opts), Value} of
         {false, _} ->
-            {error, #{<<"status">> => 403, <<"body">> => #{
-                <<"error">> => <<"receipt-publisher-not-allowed">>
-            }}};
+            error_reply(403, #{<<"error">> => <<"receipt-publisher-not-allowed">>});
         {true, undefined} ->
-            {error, #{<<"status">> => 400, <<"body">> => #{
-                <<"error">> => <<"receipt-required">>
-            }}};
+            error_reply(400, #{<<"error">> => <<"receipt-required">>});
         {true, _} ->
-            publish_receipt(Receipt, Opts)
+            case publishable_document(Value, Opts) of
+                {ok, Data} -> publish_receipt(Data, Opts);
+                {error, Status, Body} -> error_reply(Status, Body)
+            end
     end.
+
+%% @doc The bytes to publish: a binary as given, any other value as the JSON
+%% encoding of its JSON form. The document must fit the size limit and carry
+%% a receipt whose `node-address' is this node (publishable_receipt/2).
+publishable_document(Value, Opts) ->
+    Loaded = try hb_cache:ensure_all_loaded(Value, Opts)
+    catch _:_ -> Value
+    end,
+    Encoded = case Loaded of
+        Bin when is_binary(Bin) -> {ok, Bin};
+        _ ->
+            try {ok, hb_json:encode(json_safe(Loaded))}
+            catch _:_ -> error
+            end
+    end,
+    case Encoded of
+        {ok, Data} when byte_size(Data) > ?MAX_PUBLISH_BYTES ->
+            {error, 413, #{
+                <<"error">> => <<"receipt-too-large">>,
+                <<"limit">> => ?MAX_PUBLISH_BYTES
+            }};
+        {ok, Data} ->
+            case publishable_receipt(Data, Opts) of
+                ok -> {ok, Data};
+                {error, node_mismatch} ->
+                    {error, 422, #{<<"error">> => <<"receipt-node-mismatch">>}};
+                {error, Reason} ->
+                    {error, 422, #{
+                        <<"error">> => <<"receipt-invalid">>,
+                        <<"reason">> => Reason
+                    }}
+            end;
+        error ->
+            {error, 422, #{
+                <<"error">> => <<"receipt-invalid">>,
+                <<"reason">> => <<"not-a-json-object">>
+            }}
+    end.
+
+%% @doc The document is a JSON object that is a receipt (`type' is
+%% `apus-inference-receipt'), or that carries one under `report.receipt'.
+%% The receipt must hold the required keys with their JSON types, and its
+%% `node-address' must be this node's address. `signed-receipt' is not
+%% verified here: a JSON round trip in another language can change committed
+%% values (an integral float such as `1.0' becomes an integer, and integers
+%% beyond 2^53 are rounded), so a signature check would refuse genuine
+%% receipts.
+publishable_receipt(Data, Opts) ->
+    Document = try hb_json:decode(Data) catch _:_ -> undefined end,
+    case Document of
+        #{<<"type">> := ?RECEIPT_TYPE} ->
+            receipt_requirements(Document, Opts);
+        #{<<"report">> := #{<<"receipt">> := Receipt}} when is_map(Receipt) ->
+            receipt_requirements(Receipt, Opts);
+        Map when is_map(Map) ->
+            {error, <<"receipt-not-found">>};
+        _ ->
+            {error, <<"not-a-json-object">>}
+    end.
+
+receipt_requirements(#{<<"type">> := ?RECEIPT_TYPE} = Receipt, Opts) ->
+    Missing = [Key || {Key, Type} <- ?PUBLISH_REQUIRED_KEYS,
+        not json_type(Type, maps:get(Key, Receipt, undefined))],
+    case Missing of
+        [Key | _] -> {error, <<"invalid-", Key/binary>>};
+        [] ->
+            case maps:get(<<"node-address">>, Receipt) =:= node_address(Opts) of
+                true -> ok;
+                false -> {error, node_mismatch}
+            end
+    end;
+receipt_requirements(_Receipt, _Opts) ->
+    {error, <<"invalid-type">>}.
+
+json_type(string, Value) -> is_binary(Value) andalso Value =/= <<>>;
+json_type(object, Value) -> is_map(Value).
+
+%% The address of the node's identity wallet, which signs `signed-receipt'.
+node_address(Opts) ->
+    case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
+        no_viable_wallet -> undefined;
+        Wallet -> hb_util:human_id(ar_wallet:to_address(Wallet))
+    end.
+
+%% An error result that HyperBEAM serves as `Status' with a JSON body. A
+%% `reason' that has no JSON encoding is left out.
+error_reply(Status, Body) ->
+    JSON = try hb_json:encode(json_safe(Body))
+    catch _:_ -> hb_json:encode(json_safe(maps:remove(<<"reason">>, Body)))
+    end,
+    {error, #{
+        <<"status">> => Status,
+        <<"content-type">> => ?JSON,
+        <<"body">> => JSON
+    }}.
 
 %% Without `receipt-publishers' any caller may publish. With it, a listed
 %% address must have committed to the published key (`receipt', else `body'),
@@ -184,11 +314,7 @@ signed_by(Signer, Key, Req, Opts) ->
     catch _:_ -> false
     end.
 
-publish_receipt(Receipt, Opts) ->
-    Data = case Receipt of
-        Bin when is_binary(Bin) -> Bin;
-        Value -> hb_json:encode(Value)
-    end,
+publish_receipt(Data, Opts) ->
     %% `bundler@1.0' accepts signed ANS-104 items: the ANS-104 commitment
     %% device returns the signed structured message it expects.
     Unsigned = #{<<"data">> => Data,
@@ -210,14 +336,12 @@ publish_receipt(Receipt, Opts) ->
                 <<"bundle-status">> => <<"complete">>,
                 <<"body">> => Response}};
         {ok, _Response} ->
-            {error, #{<<"status">> => 502, <<"body">> => #{
-                <<"error">> => <<"receipt-publish-incomplete">>
-            }}};
+            error_reply(502, #{<<"error">> => <<"receipt-publish-incomplete">>});
         {_Status, Reason} ->
-            {error, #{<<"status">> => 502, <<"body">> => #{
+            error_reply(502, #{
                 <<"error">> => <<"receipt-publish-failed">>,
-                <<"reason">> => json_safe(Reason)
-            }}}
+                <<"reason">> => Reason
+            })
     end.
 
 %% Only node configuration selects the publication wallet. The node's
@@ -243,6 +367,11 @@ publish_opts(Opts) ->
 %% (`priv.hashpath'); HyperBEAM drops private keys from HTTP requests, so it
 %% survives only in `verification-input-term'. Every recorded value that is
 %% present must equal the HashPath recomputed from the base and request.
+%%
+%% `verification-input-term' is unauthenticated input. Its text is bounded to
+%% the base64url length of 1 MiB, compressed terms are refused (their
+%% uncompressed size is allocated before decoding), and the term is decoded
+%% in safe mode and must contain only plain data.
 -spec verify_hashpath(
     #{ _ => _ },
     #{
@@ -253,7 +382,9 @@ publish_opts(Opts) ->
         _ => _
     },
     map()
-) -> {ok, #{ status := 200 | 422, body := _ }}.
+) -> {ok, #{ status := 200, body := _ }}
+    | {error, #{ status := 400 | 422, 'content-type' := binary(),
+        body := binary() }}.
 verify_hashpath(_Base, Req, Opts) ->
     %% Callers can post the receipt's `ao-core' object, the whole receipt,
     %% or the verification keys directly. JSON may also arrive under `body'.
@@ -278,25 +409,30 @@ verify_hashpath(_Base, Req, Opts) ->
                 {ok, #{<<"status">> => 200, <<"body">> =>
                     hashpath_result(Recomputed, Recorded, ChainVerified)}}
             catch _:_ ->
-                {ok, #{<<"status">> => 422, <<"body">> => #{
+                error_reply(422, #{
                     <<"verified">> => false,
                     <<"error">> => <<"invalid-hashpath-transcript">>
-                }}}
+                })
             end;
+        {invalid_term, Reason} ->
+            error_reply(400, #{
+                <<"verified">> => false,
+                <<"error">> => <<"invalid-verification-input-term">>,
+                <<"reason">> => Reason
+            });
         {error, Reason} ->
-            {ok, #{<<"status">> => 422, <<"body">> => #{
+            error_reply(422, #{
                 <<"verified">> => false,
                 <<"error">> => <<"hashpath-verification-input-missing">>,
-                <<"reason">> => json_safe(Reason)
-            }}}
+                <<"reason">> => Reason
+            })
     end.
 
 verification_messages(Term, _Input, _Opts) when is_binary(Term) ->
-    try
-        #{base := Base, request := Request, response := Response} =
-            binary_to_term(hb_util:decode(Term), [safe]),
-        {ok, Base, Request, Response, []}
-    catch _:_ -> {error, <<"recorded AO-Core term could not be decoded">>}
+    case decode_transcript_term(Term) of
+        {ok, #{base := Base, request := Request, response := Response}} ->
+            {ok, Base, Request, Response, []};
+        {error, Reason} -> {invalid_term, Reason}
     end;
 verification_messages(_Term, #{<<"base">> := Base,
                         <<"request">> := Request,
@@ -306,6 +442,43 @@ verification_messages(_Term, #{<<"base">> := Base,
         restore_json_links(Response), restore_json_links(Rest)};
 verification_messages(_, _, _Opts) ->
     {error, <<"receipt does not contain recorded AO-Core messages">>}.
+
+%% @doc Decode an unpadded base64url Erlang external term of a transcript
+%% within the size limit. The checks run in this order: text size (which
+%% bounds the decoded bytes to 1 MiB), base64url, compression, safe decoding,
+%% the transcript's keys, and plain data (maps, lists, tuples, binaries,
+%% atoms and numbers only).
+decode_transcript_term(Text) when byte_size(Text) > ?MAX_TERM_TEXT_BYTES ->
+    {error, <<"too-large">>};
+decode_transcript_term(Text) ->
+    case catch hb_util:decode(Text) of
+        <<131, 80, _/binary>> ->
+            {error, <<"compressed">>};
+        Bin when is_binary(Bin) ->
+            try binary_to_term(Bin, [safe]) of
+                #{base := _, request := _, response := _} = Term ->
+                    case plain_term(Term) of
+                        true -> {ok, Term};
+                        false -> {error, <<"unsupported-term">>}
+                    end;
+                _ ->
+                    {error, <<"undecodable">>}
+            catch _:_ -> {error, <<"undecodable">>}
+            end;
+        _ ->
+            {error, <<"undecodable">>}
+    end.
+
+plain_term(Map) when is_map(Map) ->
+    plain_list(maps:keys(Map)) andalso plain_list(maps:values(Map));
+plain_term(List) when is_list(List) -> plain_list(List);
+plain_term(Tuple) when is_tuple(Tuple) -> plain_list(tuple_to_list(Tuple));
+plain_term(Value) ->
+    is_binary(Value) orelse is_atom(Value) orelse is_number(Value).
+
+plain_list([]) -> true;
+plain_list([Value | Rest]) -> plain_term(Value) andalso plain_list(Rest);
+plain_list(_Improper) -> false.
 
 %% The JSON codec stores the nested transcript messages of an HTTP request as
 %% lazy cache links; load them so the messages can be hashed. Links recorded
@@ -434,14 +607,11 @@ decorate(Path, Req, Opts) ->
     ExecutionReq = execution_request(Path, Req, Opts),
     case truthy(maps:get(<<"stream">>, ExecutionReq, false)) of
         true ->
-            {error, #{
-                <<"status">> => 400,
-                <<"body">> => #{
-                    <<"error">> => <<"receipt-streaming-unsupported">>,
-                    <<"message">> =>
-                        <<"receipt v1 requires a complete non-streaming response">>
-                }
-            }};
+            error_reply(400, #{
+                <<"error">> => <<"receipt-streaming-unsupported">>,
+                <<"message">> =>
+                    <<"receipt v1 requires a complete non-streaming response">>
+            });
         false ->
             case hb_ao:resolve(?INFERENCE_BASE, ExecutionReq,
                     execution_opts(Opts)) of
@@ -503,8 +673,9 @@ json_safe(Map) when is_map(Map) ->
 json_safe(List) when is_list(List) -> [json_safe(Value) || Value <- List];
 json_safe({link, ID, Meta}) -> #
     {<<"id">> => ID, <<"type">> => <<"link">>, <<"metadata">> => json_safe(Meta)};
-json_safe(Tuple) when is_tuple(Tuple) ->
-    hb_util:bin(Tuple);
+json_safe(Value) when is_tuple(Value); is_pid(Value); is_reference(Value);
+        is_port(Value); is_function(Value) ->
+    iolist_to_binary(io_lib:format("~w", [Value]));
 json_safe(Value) -> Value.
 
 %% @doc Build and commit a request/response observation. Request-derived
@@ -535,7 +706,7 @@ make_receipt(ExecutionReq, Body, Response, Opts) ->
         <<"sequence">> => erlang:system_time(millisecond),
         <<"provenance-class">> => Provenance
     },
-    Receipt0 = add_execution_bindings(ReceiptBase, ExecutionReq, Opts, Inventory),
+    Receipt0 = add_execution_bindings(ReceiptBase, ExecutionReq, Opts),
     Receipt1 = json_form(Receipt0#{
         <<"system-measurement">> => Measurement,
         <<"ao-core">> =>
@@ -571,11 +742,11 @@ ao_core_evidence(Base, Req, Response, Opts) ->
             _ -> <<"captured">>
         end,
         <<"source">> => case maps:get(<<"source">>, PublicEvidence, undefined) of
-            undefined -> <<"HyperBEAM AO-Core resolve stage 9">>;
+            undefined -> ?HASHPATH_SOURCE;
             Source -> Source
         end,
         <<"hashpath">> => Hashpath,
-        <<"hashpath-algorithm">> => hashpath_algorithm(Req, Response, Opts),
+        <<"hashpath-algorithm">> => hashpath_algorithm(Base),
         <<"request-id">> => safe_message_id(Req, none, Opts),
         <<"response-id">> => safe_message_id(Response, none, Opts),
         <<"commitment-device">> => commitment_device(Response, Opts),
@@ -588,9 +759,8 @@ ao_core_evidence(Base, Req, Response, Opts) ->
         %% JSON is the public transport representation. An opaque Erlang-term
         %% snapshot restores AO-Core private metadata, so the exact HyperBEAM
         %% verifier can run on a published receipt.
-        <<"verification-input-term">> => hb_util:encode(term_to_binary(
-            #{base => Base, request => Req, response => Response},
-            [compressed])),
+        <<"verification-input-term">> =>
+            transcript_term(#{base => Base, request => Req, response => Response}),
         <<"verification-status">> =>
             hashpath_verification(Base, Req, Hashpath, Opts)
     }.
@@ -627,11 +797,18 @@ public_ao_core_evidence(Response, Opts) ->
         _ -> #{}
     end.
 
-hashpath_algorithm(Req, Response, _Opts) ->
-    case first_defined([
-        maps:get(<<"hashpath-alg">>, Req, undefined),
-        maps:get(<<"hashpath-alg">>, Response, undefined)
-    ]) of
+%% The uncompressed external term of the transcript, unpadded base64url, as
+%% `verify-hashpath' accepts it; omitted when it exceeds that key's limit.
+transcript_term(Transcript) ->
+    Bin = term_to_binary(Transcript),
+    case byte_size(Bin) =< ?MAX_TERM_BYTES of
+        true -> hb_util:encode(Bin);
+        false -> undefined
+    end.
+
+%% AO-Core chains a HashPath with the algorithm its base message names.
+hashpath_algorithm(Base) ->
+    case maps:get(<<"hashpath-alg">>, Base, undefined) of
         undefined -> <<"sha-256-chain (AO-Core default)">>;
         Value -> Value
     end.
@@ -655,43 +832,30 @@ safe_message_id(Message, Committers, Opts) ->
     end.
 
 %% @doc Record which devices produced the receipt and its measurement.
+%% `loader' names the toolchain that packages these devices.
 device_chain_evidence() ->
     #{
         <<"status">> => <<"captured">>,
         <<"receipt-device">> => <<"inference_receipt@1.0">>,
         <<"measurement-device">> => <<"inference_measurement@1.0">>,
         <<"inventory-device">> => <<"gpu_inventory@1.0">>,
-        <<"loader">> => <<"HyperBEAM Device Forge preloaded-store">>
+        <<"loader">> => <<"HyperBEAM Device Forge">>
     }.
 
-%% Add execution-profile bindings to the signed receipt: a value the executed
-%% request declares, else the node option of the same name, else the
-%% inventory's field. Absent bindings are omitted.
-add_execution_bindings(Receipt, Req, Opts, Inventory) ->
-    Candidates = [
-        {<<"model-sha256">>, [maps:get(<<"model-sha256">>, Req, undefined),
-            hb_opts:get(<<"model-sha256">>, undefined, Opts),
-            maps:get(<<"model_sha256">>, Inventory, undefined)]},
-        {<<"runtime-build-hash">>, [maps:get(<<"runtime-build-hash">>, Req, undefined),
-            hb_opts:get(<<"runtime-build-hash">>, undefined, Opts),
-            maps:get(<<"runtime_build_hash">>, Inventory, undefined)]},
-        {<<"inference-profile">>, [maps:get(<<"inference-profile">>, Req, undefined),
-            hb_opts:get(<<"inference-profile">>, undefined, Opts),
-            maps:get(<<"profile">>, Inventory, undefined)]},
-        {<<"model-source">>, [maps:get(<<"model-source">>, Req, undefined),
-            hb_opts:get(<<"model-source">>, undefined, Opts)]},
-        {<<"model-tx">>, [maps:get(<<"model-tx">>, Req, undefined),
-            hb_opts:get(<<"model-tx">>, undefined, Opts)]}
-    ],
+%% Add execution-profile bindings to the signed receipt: the operator's node
+%% option of the same name, else the executed request's declaration. Absent
+%% bindings are omitted.
+add_execution_bindings(Receipt, Req, Opts) ->
     lists:foldl(
-        fun({Key, Values}, Acc) ->
-            case first_defined(Values) of
+        fun(Key, Acc) ->
+            case first_defined([hb_opts:get(Key, undefined, Opts),
+                    maps:get(Key, Req, undefined)]) of
                 undefined -> Acc;
                 Value -> Acc#{Key => Value}
             end
         end,
         Receipt,
-        Candidates
+        ?BINDING_KEYS
     ).
 
 %% @doc Resolve the node's GPU inventory report.
@@ -782,14 +946,17 @@ measurement_fields(Body, Opts) when is_map(Body) ->
         end,
         <<"provenance-class">> => maps:get(
             <<"provenance-class">>, Composition, <<"host-observed">>),
-        <<"measurement-envelope">> => case maps:get(<<"type">>, Body, undefined) of
-            <<"lapee-measurement">> -> <<"lapee-measurement">>;
-            _ -> <<"apus-system-measurement">>
-        end,
+        <<"measurement-envelope">> => maps:get(<<"type">>, Body, undefined),
         <<"subject-id">> => maps:get(<<"subject-id">>, Composition, undefined),
-        <<"nonce-binding">> => maps:get(<<"nonce-binding">>, Composition, undefined),
-        <<"envelope">> => materialize_link(maps:without(
-            [<<"cpu-tee">>, <<"gpu-tee">>, <<"apus-gpu-composition">>], Body), Opts),
+        %% A composed envelope records the binding in its composition, an
+        %% observation envelope at its top level.
+        <<"nonce-binding">> => materialize_link(first_defined([
+            maps:get(<<"nonce-binding">>, Composition, undefined),
+            maps:get(<<"nonce-binding">>, Body, undefined)
+        ]), Opts),
+        %% The envelope exactly as `inference_measurement@1.0' returned it, so
+        %% its `verify' key can check it.
+        <<"envelope">> => materialize_link(Body, Opts),
         <<"system">> => maps:get(<<"system">>, Subject, undefined),
         <<"node">> => maps:get(<<"node">>, Subject, undefined),
         <<"evidence">> => Evidence
@@ -809,11 +976,29 @@ materialize_link(List, Opts) when is_list(List) ->
     [materialize_link(Value, Opts) || Value <- List];
 materialize_link(Value, _Opts) -> Value.
 
-%% @doc Hash AO-Core values after canonical JSON encoding.
+%% @doc The unpadded base64url SHA-256 of a binary, or of the canonical JSON
+%% encoding of any other value.
 digest(Value) when is_binary(Value) ->
     hb_util:encode(crypto:hash(sha256, Value));
 digest(Value) ->
-    hb_util:encode(crypto:hash(sha256, hb_json:encode(Value))).
+    hb_util:encode(crypto:hash(sha256, canonical_json(Value))).
+
+%% @doc OTP `json' encoding with the members of every object in ascending
+%% byte order of their keys. `json:encode/1' orders only objects of up to 32
+%% members, so larger objects are ordered here.
+canonical_json(Value) ->
+    iolist_to_binary(json:encode(Value, fun canonical_value/2)).
+
+canonical_value(Map, Encode) when is_map(Map) ->
+    json:encode_key_value_list(
+        lists:sort([{json_key(Key), Value} || {Key, Value} <- maps:to_list(Map)]),
+        Encode);
+canonical_value(Value, Encode) ->
+    json:encode_value(Value, Encode).
+
+json_key(Key) when is_binary(Key) -> Key;
+json_key(Key) when is_atom(Key) -> atom_to_binary(Key, utf8);
+json_key(Key) when is_integer(Key) -> integer_to_binary(Key).
 
 %% @doc Interpret the common boolean encodings accepted by AO requests.
 truthy(true) -> true;
@@ -952,8 +1137,15 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
                 hb_util:human_id(ar_wallet:to_address(
                     maps:get(<<"priv-wallet">>, Opts))),
                 NodeAddress),
+            ?assertEqual(NodeAddress, node_address(Opts)),
             ?assertNot(maps:is_key(<<"implementation-id">>, DeviceChain)),
+            ?assertEqual(<<"HyperBEAM Device Forge">>,
+                maps:get(<<"loader">>, DeviceChain)),
+            ?assertEqual(?HASHPATH_SOURCE, maps:get(<<"source">>, AOCore)),
             Term = maps:get(<<"verification-input-term">>, AOCore),
+            %% The term is uncompressed, as `verify-hashpath' requires.
+            ?assertMatch(<<131, Tag, _/binary>> when Tag =/= 80,
+                hb_util:decode(Term)),
             Transcript = binary_to_term(hb_util:decode(Term), [safe]),
             assert_no_transport_leak(Transcript),
             %% Verifiers can recompute the request digest from the transcript.
@@ -978,11 +1170,146 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
             ?assertEqual(
                 maps:without([<<"signed-receipt">>], maps:get(<<"receipt">>, Result)),
                 maps:without([<<"signed-receipt">>], JsonReceipt)),
+            %% `inference@1.0' publishes in `raw' the HashPath of the step
+            %% AO-Core executed: the executed request carries no client
+            %% metadata.
+            #{<<"ao-core">> := RawAOCore} = hb_json:decode(Raw),
+            ?assertEqual(maps:get(<<"hashpath">>, AOCore),
+                maps:get(<<"hashpath">>, RawAOCore)),
+            ?assertEqual(maps:get(<<"request-id">>, AOCore),
+                maps:get(<<"request-id">>, RawAOCore)),
+            %% `publish' accepts this receipt, bare or inside a publication
+            %% record that carries it under `report.receipt'.
+            Bare = hb_json:encode(JsonReceipt),
+            Record = hb_json:encode(#{
+                <<"report">> => #{<<"receipt">> =>
+                    JsonReceipt#{<<"version">> => <<"1">>}},
+                <<"attestation">> => #{<<"raw">> => Raw}
+            }),
+            ?assertEqual({ok, Bare}, publishable_document(Bare, Opts)),
+            ?assertEqual({ok, Record}, publishable_document(Record, Opts)),
+            ?assertMatch({error, 422, #{<<"error">> := <<"receipt-node-mismatch">>}},
+                publishable_document(hb_json:encode(JsonReceipt#{
+                    <<"node-address">> => hb_util:human_id(
+                        ar_wallet:to_address(ar_wallet:new()))}), Opts)),
             ?assertEqual(hb_util:to_hex(hb_crypto:sha256(Raw)), Nonce),
             ?assertEqual(Nonce,
                 receive {attested_nonce, Ref, Asked} -> Asked
                 after 5000 -> no_attestation_request
                 end)
+        end)
+    end}.
+
+%% Node options that give `inference_measurement@1.0' stand-in inventory,
+%% GPU TEE and base measurement devices.
+measurement_opts(URL, BaseDevice) ->
+    Inventory = #{
+        <<"type">> => <<"apus-gpu-inventory">>,
+        <<"version">> => <<"1.0">>,
+        <<"supported">> => true,
+        <<"devices">> => [#{<<"pci-bdf">> => <<"0000:01:00.0">>}],
+        <<"inventory-digest">> => <<"OQ6jjieUQbTtI-MX-ai4cEGhp-ZwEo9lm1fYxyB51uk">>,
+        <<"errors">> => []
+    },
+    GpuTee = #{
+        <<"generate">> => fun(_Base, Req, _Opts) ->
+            Nonce = hb_maps:get(<<"nonce">>, Req, undefined, #{}),
+            {ok, hb_json:encode(#{
+                <<"nonce">> => Nonce,
+                <<"verified">> => true,
+                <<"evidences">> => [#{<<"nonce">> => Nonce}],
+                <<"claims">> => [#{<<"eat_nonce">> => Nonce}]
+            })}
+        end,
+        <<"verify">> => fun(_Base, _Req, _Opts) -> {ok, <<"true">>} end
+    },
+    (node_opts(URL))#{
+        <<"inference-measurement-inventory-device">> =>
+            #{<<"report">> => fun(_, _, _) -> {ok, Inventory} end},
+        <<"inference-measurement-gpu-tee-device">> => GpuTee,
+        <<"inference-measurement-base-device">> => BaseDevice,
+        <<"inference-measurement-sev-guest-path">> => <<"/nonexistent/sev-guest">>
+    }.
+
+%% A stand-in base measurement device whose report carries the nonce it was
+%% asked to measure, and whose `verify' checks that nonce.
+base_measurement_stub() ->
+    #{
+        <<"info">> => fun(_, _, _) -> {ok, #{<<"version">> => <<"1">>}} end,
+        <<"fresh">> => fun(_, Req, _) ->
+            {ok, #{
+                <<"type">> => <<"lapee-measurement">>,
+                <<"measurement-device">> => <<"snp@1.0">>,
+                <<"body">> => #{<<"system">> => #{<<"os">> => <<"linux">>}},
+                <<"evidence">> => #{
+                    <<"report-raw">> => <<"report">>,
+                    <<"nonce">> => hb_maps:get(<<"nonce">>, Req, undefined, #{})
+                }
+            }}
+        end,
+        <<"verify">> => fun(_, Req, _) ->
+            Envelope = hb_maps:get(<<"envelope">>, Req, #{}, #{}),
+            Evidence = hb_maps:get(<<"evidence">>, Envelope, #{}, #{}),
+            Verified = case hb_maps:get(<<"nonce">>, Req, undefined, #{}) of
+                undefined -> true;
+                Nonce -> Nonce =:= hb_maps:get(<<"nonce">>, Evidence, none, #{})
+            end,
+            {ok, #{<<"status">> => 200, <<"body">> => #{<<"verified">> => Verified}}}
+        end
+    }.
+
+%% The receipt records the measurement envelope exactly as
+%% `inference_measurement@1.0' returned it: posted back to its `verify' key,
+%% the envelope from the JSON body verifies, for an observation and for a
+%% composed measurement. `nonce-binding' binds the request digest.
+receipt_measurement_envelope_verifies_test_() ->
+    {timeout, 60, fun() ->
+        with_runtime(fun(URL, _Handle) ->
+            Chat = #{
+                <<"model">> => <<"test-model">>,
+                <<"messages">> =>
+                    [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+            },
+            lists:foreach(
+                fun({BaseDevice, Type, Status}) ->
+                    Opts = measurement_opts(URL, BaseDevice),
+                    {ok, Result} = completions(#{}, Chat, Opts),
+                    #{<<"receipt">> := Receipt} =
+                        hb_json:decode(maps:get(<<"body">>, Result)),
+                    #{<<"request-digest">> := RequestDigest,
+                        <<"system-measurement">> := Measurement} = Receipt,
+                    #{<<"envelope">> := Envelope} = Measurement,
+                    ?assertEqual(Type, maps:get(<<"type">>, Envelope)),
+                    ?assertEqual(Type,
+                        maps:get(<<"measurement-envelope">>, Measurement)),
+                    ?assertEqual(Status, maps:get(<<"status">>, Measurement)),
+                    ?assertEqual(RequestDigest, maps:get(<<"request-nonce">>,
+                        maps:get(<<"nonce-binding">>, Measurement))),
+                    ?assertEqual(maps:get(<<"gpu-tee">>, Envelope),
+                        maps:get(<<"gpu-tee">>, Measurement)),
+                    ?assertEqual(maps:get(<<"cpu-tee">>, Envelope),
+                        maps:get(<<"cpu-tee">>, Measurement)),
+                    {ok, Verification} = hb_ao:resolve(
+                        #{<<"device">> => <<"inference_measurement@1.0">>},
+                        #{<<"path">> => <<"verify">>, <<"envelope">> => Envelope},
+                        Opts),
+                    ?assertMatch(#{<<"verified">> := true,
+                            <<"nonce-binding-verified">> := true},
+                        Verification),
+                    case Type of
+                        <<"lapee-measurement">> ->
+                            ?assertMatch(#{<<"nonce-binding-hardware-bound">> := true},
+                                Verification);
+                        _ ->
+                            ?assertMatch(#{<<"signature-verified">> := true},
+                                Verification)
+                    end
+                end,
+                [
+                    {#{}, <<"apus-gpu-system-measurement">>, <<"observed">>},
+                    {base_measurement_stub(), <<"lapee-measurement">>,
+                        <<"measured">>}
+                ])
         end)
     end}.
 
@@ -1067,12 +1394,18 @@ generation_value(<<"messages">>) ->
     [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}];
 generation_value(_Key) -> <<"value">>.
 
+%% The status and decoded JSON body of an error result.
+error_json({error, #{<<"status">> := Status, <<"content-type">> := ?JSON,
+        <<"body">> := Body}}) ->
+    {Status, hb_json:decode(Body)}.
+
 streaming_request_is_rejected_test() ->
     lists:foreach(
         fun(Req) ->
-            ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
-                    #{<<"error">> := <<"receipt-streaming-unsupported">>}}},
-                completions(#{}, Req, #{}))
+            ?assertMatch({400, #{
+                    <<"error">> := <<"receipt-streaming-unsupported">>,
+                    <<"message">> := _}},
+                error_json(completions(#{}, Req, #{})))
         end,
         [#{<<"stream">> => true},
             #{<<"body">> => <<"{\"stream\":true}">>}]).
@@ -1146,9 +1479,36 @@ http_round_trip_test_() ->
                     <<"tee">>]),
                 lists:sort(maps:keys(maps:get(<<"request">>,
                     hb_json:decode(Raw))))),
+            %% The published AO-Core evidence does not depend on the caller's
+            %% address or client headers.
+            RawAOCore = fun(Headers) ->
+                {200, #{<<"attestation">> := #{<<"raw">> := R}}} = http_post(
+                    Node, "~inference@1.0/v1/chat/completions?tee=true", Chat,
+                    Headers),
+                maps:get(<<"ao-core">>, hb_json:decode(R))
+            end,
+            First = RawAOCore([{"x-real-ip", "203.0.113.77"},
+                {"x-forwarded-for", "203.0.113.77"}, {"user-agent", "agent-a"}]),
+            ?assertMatch(#{<<"status">> := <<"captured">>, <<"hashpath">> := _,
+                <<"request-id">> := _}, First),
+            ?assertEqual(First, RawAOCore([{"x-real-ip", "203.0.113.78"},
+                {"x-forwarded-for", "198.51.100.20"}, {"user-agent", "agent-b"}])),
             {200, _} = http_get(Node, "~inference@1.0/health"),
             {200, Models} = http_get(Node, "~inference@1.0/v1/models"),
             ?assertMatch(#{<<"object">> := <<"list">>}, Models),
+            %% The receipt device's errors carry their JSON bodies.
+            ?assertMatch({400, #{<<"error">> :=
+                    <<"receipt-streaming-unsupported">>}},
+                http_post(Node, "~inference_receipt@1.0/v1/chat/completions",
+                    Chat#{<<"stream">> => true})),
+            Compressed = hb_util:encode(term_to_binary(#{base => #{},
+                request => #{<<"body">> => binary:copy(<<"a">>, 100000)},
+                response => #{}}, [compressed])),
+            ?assertMatch({400, #{<<"verified">> := false,
+                    <<"error">> := <<"invalid-verification-input-term">>,
+                    <<"reason">> := <<"compressed">>}},
+                http_post(Node, "~inference_receipt@1.0/verify-hashpath",
+                    #{<<"verification-input-term">> => Compressed})),
             {200, WithReceipt} = http_post(Node,
                 "~inference_receipt@1.0/v1/chat/completions", Chat),
             #{<<"choices">> := [_], <<"receipt">> := Receipt} = WithReceipt,
@@ -1169,9 +1529,12 @@ http_round_trip_test_() ->
     end}.
 
 http_post(Node, Path, Json) ->
+    http_post(Node, Path, Json, []).
+
+http_post(Node, Path, Json, Headers) ->
     http_reply(httpc:request(post,
         {binary_to_list(Node) ++ Path,
-            [{"accept", "application/json"}, {"accept-bundle", "true"}],
+            [{"accept", "application/json"}, {"accept-bundle", "true"} | Headers],
             "application/json", hb_json:encode(Json)},
         [{timeout, 60000}], [{body_format, binary}])).
 
@@ -1217,9 +1580,60 @@ unavailable_probes_contribute_empty_objects_test() ->
         probe(fun() -> #{<<"type">> => <<"t">>} end)).
 
 publish_requires_a_receipt_test() ->
-    ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
-            #{<<"error">> := <<"receipt-required">>}}},
-        publish(#{}, leaky_request(), #{})).
+    ?assertEqual({400, #{<<"error">> => <<"receipt-required">>}},
+        error_json(publish(#{}, leaky_request(), #{}))).
+
+%% A receipt document with the keys `publish' requires, naming `Address'.
+receipt_document(Address) ->
+    #{
+        <<"type">> => <<"apus-inference-receipt">>,
+        <<"version">> => <<"1.0">>,
+        <<"receipt-id">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"request-digest">> => digest(<<"request">>),
+        <<"response-digest">> => digest(<<"response">>),
+        <<"node-address">> => Address,
+        <<"ao-core">> => #{<<"status">> => <<"not-captured">>},
+        <<"signed-receipt">> => #{<<"type">> => <<"apus-inference-receipt">>}
+    }.
+
+wallet_address(Wallet) ->
+    hb_util:human_id(ar_wallet:to_address(Wallet)).
+
+%% Only a document that carries a receipt naming this node, within the size
+%% limit, is signed; nothing reaches the bundler otherwise.
+publish_accepts_only_receipts_of_this_node_test() ->
+    Wallet = ar_wallet:new(),
+    Opts = #{<<"priv-wallet">> => Wallet},
+    Receipt = receipt_document(wallet_address(Wallet)),
+    Publish = fun(Value) ->
+        error_json(publish(#{}, #{<<"receipt">> => Value}, Opts))
+    end,
+    Invalid = fun(Reason) ->
+        {422, #{<<"error">> => <<"receipt-invalid">>, <<"reason">> => Reason}}
+    end,
+    ?assertEqual(Invalid(<<"not-a-json-object">>), Publish(<<"not json">>)),
+    ?assertEqual(Invalid(<<"not-a-json-object">>), Publish(<<"[1]">>)),
+    ?assertEqual(Invalid(<<"receipt-not-found">>),
+        Publish(<<"{\"type\":\"other\"}">>)),
+    ?assertEqual(Invalid(<<"invalid-type">>), Publish(hb_json:encode(
+        #{<<"report">> => #{<<"receipt">> => Receipt#{<<"type">> => <<"other">>}}}))),
+    ?assertEqual(Invalid(<<"invalid-signed-receipt">>),
+        Publish(hb_json:encode(maps:remove(<<"signed-receipt">>, Receipt)))),
+    ?assertEqual(Invalid(<<"invalid-node-address">>),
+        Publish(hb_json:encode(Receipt#{<<"node-address">> => 7}))),
+    ?assertEqual({422, #{<<"error">> => <<"receipt-node-mismatch">>}},
+        Publish(hb_json:encode(Receipt#{<<"node-address">> =>
+            wallet_address(ar_wallet:new())}))),
+    ?assertEqual({422, #{<<"error">> => <<"receipt-node-mismatch">>}},
+        error_json(publish(#{}, #{<<"receipt">> => hb_json:encode(Receipt)},
+            #{}))),
+    Oversized = <<"{\"pad\":\"", (binary:copy(<<"a">>, ?MAX_PUBLISH_BYTES))/binary,
+        "\"}">>,
+    ?assertEqual({413, #{<<"error">> => <<"receipt-too-large">>,
+            <<"limit">> => ?MAX_PUBLISH_BYTES}},
+        Publish(Oversized)),
+    ?assertEqual({ok, hb_json:encode(Receipt)},
+        publishable_document(Receipt, Opts)).
 
 publish_posts_signed_bundle_before_returning_test_() ->
     {timeout, 20, fun() ->
@@ -1233,11 +1647,12 @@ publish_posts_signed_bundle_before_returning_test_() ->
             end
         }),
         try
-            Opts = NodeOpts#{<<"priv-wallet">> => ar_wallet:new(),
+            Wallet = ar_wallet:new(),
+            Opts = NodeOpts#{<<"priv-wallet">> => Wallet,
                 <<"store">> => hb_test_utils:test_store()},
             spawn_link(fun() ->
-                Parent ! {published, publish(#{},
-                    #{<<"receipt">> => #{<<"test">> => <<"receipt">>}}, Opts)}
+                Parent ! {published, publish(#{}, #{<<"receipt">> =>
+                    receipt_document(wallet_address(Wallet))}, Opts)}
             end),
             Handler = receive {chunk_started, PID} -> PID
                 after 10000 -> error(no_signed_bundle_submitted) end,
@@ -1274,9 +1689,8 @@ publisher_allowlist_requires_a_verified_listed_signer_test() ->
                 <<"receipt">> => <<"{}">>}, Opts)),
     ?assertNot(authorized_publisher(Signed, #{<<"receipt-publishers">> => []})),
     ?assert(authorized_publisher(Request, #{})),
-    ?assertMatch({error, #{<<"status">> := 403, <<"body">> :=
-            #{<<"error">> := <<"receipt-publisher-not-allowed">>}}},
-        publish(#{}, Request, Opts)).
+    ?assertEqual({403, #{<<"error">> => <<"receipt-publisher-not-allowed">>}},
+        error_json(publish(#{}, Request, Opts))).
 
 %% Over HTTP, only a request whose `receipt' a listed address signed is
 %% published. The publisher commits to the published key, not to `path'.
@@ -1289,9 +1703,10 @@ publish_over_http_honours_the_allowlist_test_() ->
         }),
         try
             Publisher = ar_wallet:new(),
+            NodeWallet = ar_wallet:new(),
             Node = hb_http_server:start_node(GatewayOpts#{
                 <<"port">> => 0,
-                <<"priv-wallet">> => ar_wallet:new(),
+                <<"priv-wallet">> => NodeWallet,
                 <<"store">> => hb_test_utils:test_store(),
                 %% Keep signed requests out of the working directory.
                 <<"store-all-signed">> => false,
@@ -1300,8 +1715,10 @@ publish_over_http_honours_the_allowlist_test_() ->
             }),
             ClientOpts = #{<<"store">> => hb_test_utils:test_store()},
             Path = <<"/~inference_receipt@1.0/publish">>,
-            Request = #{<<"receipt">> =>
-                <<"{\"type\":\"apus-inference-receipt\"}">>},
+            %% A publication record that carries the receipt under
+            %% `report.receipt', sent as JSON text.
+            Request = #{<<"receipt">> => hb_json:encode(#{<<"report">> =>
+                #{<<"receipt">> => receipt_document(wallet_address(NodeWallet))}})},
             Post = fun(Msg) -> hb_http:post(Node, Path, Msg, ClientOpts) end,
             SignedBy = fun(Wallet, Msg) ->
                 hb_message:commit(Msg, ClientOpts#{<<"priv-wallet">> => Wallet})
@@ -1351,10 +1768,92 @@ verify_hashpath_checks_base_and_request_test() ->
 verify_hashpath_rejects_invalid_transcript_test() ->
     Term = hb_util:encode(term_to_binary(
         #{base => 123, request => #{}, response => #{}})),
-    {ok, #{<<"status">> := Status, <<"body">> := Result}} = verify_hashpath(#{},
-        #{<<"verification-input-term">> => Term}, #{}),
-    ?assertEqual(422, Status),
-    ?assertEqual(false, maps:get(<<"verified">>, Result)).
+    ?assertEqual({422, #{<<"verified">> => false,
+            <<"error">> => <<"invalid-hashpath-transcript">>}},
+        error_json(verify_hashpath(#{},
+            #{<<"verification-input-term">> => Term}, #{}))),
+    ?assertMatch({422, #{<<"verified">> := false,
+            <<"error">> := <<"hashpath-verification-input-missing">>}},
+        error_json(verify_hashpath(#{}, #{}, #{}))).
+
+%% `verification-input-term' is unauthenticated: oversized and compressed
+%% terms are refused before decoding, and only plain data is accepted.
+verify_hashpath_bounds_the_erlang_term_test() ->
+    Reason = fun(Text) ->
+        {400, #{<<"verified">> := false,
+            <<"error">> := <<"invalid-verification-input-term">>,
+            <<"reason">> := Result}} = error_json(verify_hashpath(#{},
+                #{<<"verification-input-term">> => Text}, #{})),
+        Result
+    end,
+    Encode = fun(Term, Options) ->
+        hb_util:encode(term_to_binary(Term, Options))
+    end,
+    Transcript = fun(Request) ->
+        #{base => #{}, request => Request, response => #{}}
+    end,
+    ?assertEqual(<<"too-large">>,
+        Reason(binary:copy(<<"A">>, ?MAX_TERM_TEXT_BYTES + 1))),
+    ?assertEqual(<<"too-large">>, Reason(Encode(Transcript(#{<<"body">> =>
+        binary:copy(<<"a">>, ?MAX_TERM_BYTES)}), []))),
+    Compressed = Encode(Transcript(#{<<"body">> =>
+        binary:copy(<<"a">>, 100000)}), [compressed]),
+    ?assertMatch(<<131, 80, _/binary>>, hb_util:decode(Compressed)),
+    ?assertEqual(<<"compressed">>, Reason(Compressed)),
+    ?assertEqual(<<"unsupported-term">>,
+        Reason(Encode(Transcript(#{<<"from">> => self()}), []))),
+    ?assertEqual(<<"unsupported-term">>,
+        Reason(Encode(Transcript(#{<<"f">> => fun() -> ok end}), []))),
+    ?assertEqual(<<"unsupported-term">>,
+        Reason(Encode(Transcript(#{<<"r">> => make_ref()}), []))),
+    ?assertEqual(<<"undecodable">>, Reason(<<"not a term">>)),
+    ?assertEqual(<<"undecodable">>, Reason(Encode(#{other => 1}, []))),
+    %% Within the limits, a plain transcript is recomputed.
+    {ok, #{<<"status">> := 200, <<"body">> := #{<<"reason">> :=
+            <<"hashpath-not-captured">>}}} =
+        verify_hashpath(#{}, #{<<"verification-input-term">> =>
+            Encode(Transcript(#{<<"path">> => <<"x">>, <<"n">> => 1}), [])}, #{}).
+
+%% Operator bindings take precedence over request declarations.
+execution_bindings_prefer_node_options_test() ->
+    Declared = #{
+        <<"model-sha256">> => <<"declared-hash">>,
+        <<"model-tx">> => <<"declared-tx">>,
+        <<"model_sha256">> => <<"ignored">>
+    },
+    ?assertEqual(
+        #{<<"model-sha256">> => <<"operator-hash">>,
+            <<"model-tx">> => <<"declared-tx">>,
+            <<"inference-profile">> => <<"operator-profile">>},
+        add_execution_bindings(#{}, Declared, #{
+            <<"model-sha256">> => <<"operator-hash">>,
+            <<"inference-profile">> => <<"operator-profile">>
+        })),
+    ?assertEqual(#{}, add_execution_bindings(#{}, #{}, #{})).
+
+%% Digests use one encoding for objects of any size: compact JSON with the
+%% members of every object in ascending byte order of their keys.
+digest_is_canonical_for_objects_of_any_size_test() ->
+    Large = maps:from_list([{<<"k", (integer_to_binary(I))/binary>>, I}
+        || I <- lists:seq(1, 40)]),
+    Members = [<<"\"", Key/binary, "\":", (integer_to_binary(Value))/binary>>
+        || {Key, Value} <- lists:sort(maps:to_list(Large))],
+    Object = <<"{", (iolist_to_binary(lists:join(<<",">>, Members)))/binary, "}">>,
+    Expected = <<"{\"a\":[", Object/binary, ",1.0,\"\\u001F/\"],\"b\":",
+        Object/binary, ",\"c\":null}">>,
+    ?assertEqual(Expected, canonical_json(#{
+        <<"b">> => Large,
+        <<"a">> => [Large, 1.0, <<16#1f, "/">>],
+        c => null
+    })),
+    ?assertEqual(hb_util:encode(crypto:hash(sha256, Expected)), digest(#{
+        <<"b">> => Large,
+        <<"a">> => [Large, 1.0, <<16#1f, "/">>],
+        c => null
+    })),
+    %% Small objects encode as `hb_json:encode/1' does.
+    Small = #{<<"b">> => 1, <<"a">> => #{<<"d">> => true, <<"c">> => <<"x">>}},
+    ?assertEqual(hb_json:encode(Small), canonical_json(Small)).
 
 %% Transcript recorded on the reference deployment on 2026-10-12 by
 %% HyperBEAM 28baa3d2 (`ao-core.status=captured'). The HashPath is specific to

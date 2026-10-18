@@ -17,4 +17,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "$HB/~inference@1.0/health"
 
 Expected: `200` while the runtime's health endpoint answers 2xx. A runtime
 that is down or still loading yields its own error status, or `503` when the
-node cannot reach it.
+node cannot reach it. On `hb.apus.network` the gateway serves
+`/~inference@1.0/health` from the runtime directly, so there this probe
+exercises the runtime, while `$HB/~inference_receipt@1.0/health` reaches the
+device on the node.

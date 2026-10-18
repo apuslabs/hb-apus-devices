@@ -24,5 +24,6 @@ AO-Core HashPath of the execution is recorded and matches its transcript, and
 the receipt is signed by that address. The node may return the JSON inside a
 multipart body; the parser reads the first JSON object, so it accepts both.
 Add `"tee": true` to the request to also attach the GPU attestation; on
-`hb.apus.network` the gateway then publishes the record to Arweave and adds
-`load_dataitem_id`, so such a run creates one Arweave data item.
+`hb.apus.network` the gateway then publishes the receipt to Arweave through
+`publish` and adds `load_dataitem_id`, so such a run creates one Arweave data
+item.

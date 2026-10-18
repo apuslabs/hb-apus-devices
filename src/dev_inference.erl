@@ -41,7 +41,28 @@
 
 %% Generation inputs that may appear in the published attestation. `user' is
 %% a caller identifier that does not affect sampling, so it is withheld.
--define(PUBLIC_PARAM_KEYS, ?PARAM_KEYS -- [<<"user">>]).
+-define(PUBLIC_PARAM_KEYS, (?PARAM_KEYS -- [<<"user">>])).
+
+%% Execution-profile declarations `inference_receipt@1.0' admits into the
+%% request it executes here. Both specifications state this list.
+-define(DECLARATION_KEYS, [
+    <<"model-sha256">>, <<"runtime-build-hash">>, <<"inference-profile">>,
+    <<"model-source">>, <<"model-tx">>, <<"workload-manifest-id">>,
+    <<"model-revision">>, <<"runtime-name">>, <<"runtime-version">>
+]).
+
+%% Keys of the public step request whose HashPath and ID `raw' records: the
+%% keys `inference_receipt@1.0' admits into its executed request, plus `path'
+%% and `request-nonce'. Client transport metadata never enters it.
+-define(STEP_KEYS, ?PUBLIC_PARAM_KEYS ++ [<<"tee">>, <<"type">>]
+    ++ ?DECLARATION_KEYS ++ [<<"path">>, <<"request-nonce">>]).
+
+%% Base message of the public step.
+-define(STEP_BASE, #{<<"device">> => <<"inference@1.0">>}).
+
+%% The AO-Core stage whose function computes the recorded HashPath.
+-define(HASHPATH_SOURCE,
+    <<"HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)">>).
 
 %% Model and runtime facts an operator declares under the `inference-opts'
 %% node option. Only these keys are reported in `resolved_model'.
@@ -54,6 +75,11 @@
 %%% Device API
 
 %% @doc Return the device description. `exports' lists every resolvable key.
+-spec info(map()) -> #{
+    exports := [binary()],
+    description := binary(),
+    version := binary()
+}.
 info(_Opts) ->
     #{
         exports => [<<"completions">>, <<"chat">>, <<"v1">>, <<"models">>,
@@ -80,7 +106,7 @@ info(_Opts) ->
     },
     map()
 ) -> {ok, #{ _ => _ }} | {error, #{ _ => _ }}.
-completions(Base, Req, Opts) ->
+completions(_Base, Req, Opts) ->
     case streaming_requested(Req, Opts) of
         true ->
             reply(error, 400, ?JSON,
@@ -90,7 +116,7 @@ completions(Base, Req, Opts) ->
                       "send stream=false or omit stream.">>),
                 #{}, Req, Opts);
         false ->
-            complete(Base, Req, Opts)
+            complete(Req, Opts)
     end.
 
 %% @doc Route `/chat/completions' to `completions': the request is merged into
@@ -177,13 +203,13 @@ health(_Base, _Req, Opts) ->
 %%% Completions
 
 %% Send the generation request and shape the runtime's answer.
-complete(Base, Req, Opts) ->
+complete(Req, Opts) ->
     Payload = backend_payload(Req, Opts),
     case runtime_request(<<"POST">>, <<"inference-path">>, ?DEFAULT_PATH,
             Payload, Opts) of
         {ok, Res} ->
             case truthy(hb_ao:get(<<"tee">>, Req, false, Opts)) of
-                true -> attested_response(Res, Base, Req, Payload, Opts);
+                true -> attested_response(Res, Req, Payload, Opts);
                 false ->
                     reply(ok, success_status(Res, Opts),
                         response_content_type(Res, Opts),
@@ -471,12 +497,12 @@ reply(Outcome, Status, ContentType, Body, Extra, Req, Opts) ->
 
 %% `raw' is published verbatim and the attestation report binds its SHA-256.
 %% It records only the public generation request, never the HTTP message.
-attested_response(Res, Base, Req, Payload, Opts) ->
+attested_response(Res, Req, Payload, Opts) ->
     PublicRequest = public_request(Req, Payload, Opts),
     Raw = hb_json:encode(#{
         <<"request">> => PublicRequest,
         <<"response">> => hb_private:reset(Res),
-        <<"ao-core">> => ao_core_evidence(Base, Req, Res, Opts),
+        <<"ao-core">> => ao_core_evidence(Req, Res, Opts),
         <<"timestamp">> => os:system_time(millisecond),
         <<"nonce">> => hb_util:to_hex(crypto:strong_rand_bytes(32))
     }),
@@ -549,24 +575,66 @@ evidence_map(_Other, _Opts) ->
     #{}.
 
 %% @doc Preserve the AO-Core execution link in the public attestation
-%% envelope: the HashPath of this step's inputs and the IDs of the request
-%% and the runtime response.
-ao_core_evidence(Base, Req, Response, Opts) ->
-    Hashpath = try hb_path:hashpath(Base, Req, Opts)
-    catch _:_ -> undefined
-    end,
-    #{
-        <<"status">> => case Hashpath of
-            undefined -> <<"not-captured">>;
-            _ -> <<"captured">>
+%% envelope: the HashPath and unsigned ID of the public step, and the ID of
+%% the runtime response. The public step is the base message
+%% `{"device": "inference@1.0"}' with the public step request, so client
+%% transport metadata on the HTTP message (headers such as `x-real-ip',
+%% `x-forwarded-for', `user-agent' and `host', and the private peer `ip') is
+%% never bound into published evidence. A value that cannot be computed is
+%% omitted.
+ao_core_evidence(Req, Response, Opts) ->
+    {Hashpath, RequestID} =
+        try public_step_request(Req, Opts) of
+            StepReq ->
+                {
+                    try hb_path:hashpath(?STEP_BASE, StepReq, Opts)
+                    catch _:_ -> undefined
+                    end,
+                    safe_message_id(StepReq, Opts)
+                }
+        catch _:_ -> {undefined, undefined}
         end,
-        <<"source">> => <<"HyperBEAM AO-Core resolve stage 9">>,
-        <<"hashpath">> => Hashpath,
-        <<"hashpath-algorithm">> => <<"sha-256-chain (AO-Core default)">>,
-        <<"request-id">> => safe_message_id(Req, Opts),
-        <<"response-id">> => safe_message_id(Response, Opts),
-        <<"verification-status">> => <<"captured">>
-    }.
+    maps:filter(
+        fun(_Key, Value) -> Value =/= undefined end,
+        #{
+            <<"status">> => case Hashpath of
+                undefined -> <<"not-captured">>;
+                _ -> <<"captured">>
+            end,
+            <<"source">> => ?HASHPATH_SOURCE,
+            <<"hashpath">> => Hashpath,
+            <<"hashpath-algorithm">> => <<"sha-256-chain (AO-Core default)">>,
+            <<"request-id">> => RequestID,
+            <<"response-id">> => safe_message_id(Response, Opts),
+            <<"verification-status">> => <<"captured">>
+        }
+    ).
+
+%% @doc The public step request: the step keys found in a JSON object (or
+%% map) `body', overridden by the step keys on the request, with private keys
+%% removed. A request executed by `inference_receipt@1.0' carries only step
+%% keys, so for it the public step is the executed AO-Core step.
+public_step_request(Req, Opts) ->
+    BodyFields = case hb_maps:get(<<"body">>, Req, undefined, Opts) of
+        Bin when is_binary(Bin) ->
+            case decode_object(Bin) of
+                {ok, Map} -> Map;
+                error -> #{}
+            end;
+        Map when is_map(Map) -> Map;
+        _ -> #{}
+    end,
+    Fields = lists:foldl(
+        fun(Key, Acc) ->
+            case hb_maps:get(Key, Req, not_found, Opts) of
+                not_found -> Acc;
+                Value -> Acc#{Key => Value}
+            end
+        end,
+        maps:with(?STEP_KEYS, BodyFields),
+        ?STEP_KEYS
+    ),
+    hb_private:reset(hb_cache:ensure_all_loaded(Fields, Opts)).
 
 safe_message_id(Message, Opts) ->
     case catch hb_message:id(hb_private:reset(Message), none, Opts) of
@@ -773,8 +841,7 @@ attestation_raw_excludes_transport_fields_test() ->
         <<"body">> => <<"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}">>},
     Opts = #{<<"inference-attestation-device">> =>
         stub_attestation_device(self())},
-    {ok, Result} = attested_response(
-        Res, #{<<"device">> => <<"inference@1.0">>}, Req, Body, Opts),
+    {ok, Result} = attested_response(Res, Req, Body, Opts),
     assert_no_transport_leak(Result),
     #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce}} =
         decode_body(Result),
@@ -790,7 +857,7 @@ attestation_is_bound_to_the_digest_of_raw_test() ->
     Opts = #{<<"inference-attestation-device">> =>
         stub_attestation_device(self(), Ref)},
     Res = #{<<"status">> => 200, <<"body">> => ?CHAT_RESPONSE},
-    {ok, Result} = attested_response(Res, #{}, chat_request(),
+    {ok, Result} = attested_response(Res, chat_request(),
         hb_json:encode(chat_request()), Opts),
     Asked = receive {attested_nonce, Ref, N} -> N after 5000 -> no_nonce end,
     #{<<"attestation">> := Attestation, <<"choices">> := [_]} =
@@ -801,6 +868,55 @@ attestation_is_bound_to_the_digest_of_raw_test() ->
     ?assertEqual(true, maps:get(<<"verified">>, Attestation)),
     ?assertMatch([#{<<"eat_nonce">> := Nonce}],
         maps:get(<<"claims">>, Attestation)).
+
+%% The published HashPath and request ID depend on the public step only:
+%% requests that differ in client transport metadata (address headers,
+%% `user-agent', `host', the private peer address) yield the same `ao-core'.
+ao_core_evidence_excludes_client_metadata_test() ->
+    Res = #{<<"status">> => 200, <<"body">> => ?CHAT_RESPONSE},
+    Other = (leaky_request())#{
+        <<"x-real-ip">> => <<"203.0.113.78">>,
+        <<"x-forwarded-for">> => <<"203.0.113.78">>,
+        <<"cf-connecting-ip">> => <<"203.0.113.78">>,
+        <<"user-agent">> => <<"other-agent">>,
+        <<"host">> => <<"node.example">>,
+        <<"priv">> => #{<<"ip">> => <<"203.0.113.78">>}
+    },
+    Evidence = ao_core_evidence(leaky_request(), Res, #{}),
+    ?assertEqual(Evidence, ao_core_evidence(Other, Res, #{})),
+    assert_no_transport_leak(Evidence),
+    ?assertMatch(#{<<"status">> := <<"captured">>, <<"hashpath">> := _,
+        <<"request-id">> := _, <<"response-id">> := _}, Evidence),
+    ?assertEqual(?HASHPATH_SOURCE, maps:get(<<"source">>, Evidence)),
+    ?assertEqual(
+        lists:sort([<<"max_tokens">>, <<"messages">>, <<"model">>, <<"tee">>]),
+        lists:sort(maps:keys(public_step_request(leaky_request(), #{})))),
+    %% The same request sent as a JSON body gives the same public step.
+    ?assertEqual(Evidence, ao_core_evidence(
+        #{<<"body">> => hb_json:encode(maps:remove(<<"priv">>, leaky_request()))},
+        Res, #{})),
+    %% The `raw' an attested response publishes carries the same evidence
+    %% whatever the caller's address.
+    Opts = #{<<"inference-attestation-device">> =>
+        stub_attestation_device(self())},
+    RawEvidence = fun(Req) ->
+        {ok, Result} = attested_response(Res, Req,
+            backend_payload(Req, #{}), Opts),
+        #{<<"attestation">> := #{<<"raw">> := Raw}} = decode_body(Result),
+        maps:get(<<"ao-core">>, hb_json:decode(Raw))
+    end,
+    ?assertEqual(RawEvidence(leaky_request()), RawEvidence(Other)).
+
+%% Values that cannot be computed are omitted, never published as text.
+ao_core_evidence_omits_unknown_values_test() ->
+    Missing = {link, hb_util:encode(crypto:strong_rand_bytes(32)), #{}},
+    Evidence = ao_core_evidence(#{<<"messages">> => Missing},
+        #{<<"body">> => Missing}, #{<<"store">> => hb_test_utils:test_store()}),
+    ?assertEqual(<<"not-captured">>, maps:get(<<"status">>, Evidence)),
+    ?assertEqual([], [Key || Key <- [<<"hashpath">>, <<"request-id">>,
+        <<"response-id">>], maps:is_key(Key, Evidence)]),
+    ?assertEqual(nomatch,
+        binary:match(hb_json:encode(Evidence), <<"undefined">>)).
 
 attestation_accepts_map_and_envelope_results_test() ->
     Evidence = #{<<"verified">> => true, <<"claims">> => []},

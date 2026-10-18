@@ -1,6 +1,6 @@
 # `inference@1.0` — OpenAI-compatible inference on an operator-configured model runtime
 
-- **Depends-on:** `relay@1.0` (every HTTP call to the runtime), `sev_gpu@1.0` (default attestation device for `tee=true`; the operator may name another device that answers `generate`).
+- **Depends-on:** `relay@1.0` (every HTTP call to the runtime), `sev_gpu@1.0` (default attestation device for `tee=true`; the operator may name another device that answers `generate`), `httpsig@1.0` (HyperBEAM's default ID device, which computes the message IDs and the HashPath recorded in `raw.ao-core`).
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
 
@@ -56,6 +56,22 @@ SEV-SNP guest with an NVIDIA H100 in confidential-computing mode;
 - **Public request:** the public generation parameters found in the runtime
   payload, plus the request's `tee` value. It is the only request data the
   attestation records.
+- **Declarations:** the execution-profile keys that `inference_receipt@1.0`
+  admits into the request it executes on this device: `model-sha256`,
+  `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx`,
+  `workload-manifest-id`, `model-revision`, `runtime-name`,
+  `runtime-version`. This device reads them only to build the public step.
+- **Public step request:** the request keys among the public generation
+  parameters, `tee`, `type`, the declarations, `path` and `request-nonce`,
+  taken from the request's `body` when it is a JSON object (or a map) and
+  overridden by the same keys on the request itself, with private keys
+  removed. Client transport metadata (HTTP headers such as `cf-*`,
+  `x-forwarded-*`, `x-real-ip`, `user-agent` and `host`, cookies and
+  credentials), the `user` identifier and the caller's private address are
+  never part of it.
+- **Public step:** the base message `{"device": "inference@1.0"}` with the
+  public step request. `raw` records its HashPath and request ID (§5). The
+  base message the device is resolved with is not part of it.
 - **`raw`:** the JSON document that the attestation binds (§5).
 - **Attestation nonce:** the lowercase hexadecimal SHA-256 of the `raw` bytes.
 - **Truthy:** the values `true`, `"true"`, `"1"` and `1`.
@@ -125,10 +141,10 @@ runtime that does not answer within them is reported as unreachable (503).
 ### `completions` — run one chat completion
 
 - **Reads:** request keys `stream`, `body`, `tee`, `type` and the generation
-  parameters; node options `inference-peer`, `inference-path`,
-  `inference-api-key`, `inference-attestation-device`, `inference-opts`. The
-  base message is read only when `tee` is truthy, to compute the step's
-  HashPath for `raw`.
+  parameters, and, when `tee` is truthy, the keys of the public step request;
+  node options `inference-peer`, `inference-path`, `inference-api-key`,
+  `inference-attestation-device`, `inference-opts`. The base message is not
+  read.
 - **Behaviour:**
   1. If the request's `stream` is truthy, or the request's `body` is a JSON
      object (or a map) whose `stream` is truthy, return the 400 error
@@ -204,20 +220,26 @@ runtime that does not answer within them is reported as unreachable (503).
 |---|---|
 | `request` | The public request: the public generation parameters present in the runtime payload (when the payload is a JSON object), plus `tee` exactly as the request carried it. |
 | `response` | The runtime's response message as `relay@1.0` returned it (status, response headers as keys, body), without private keys. |
-| `ao-core` | The execution link of this step (below). |
+| `ao-core` | The execution link of the public step (below). |
 | `timestamp` | Unix time in milliseconds when `raw` was built. |
 | `nonce` | 32 random bytes, lowercase hexadecimal. |
 
-`ao-core` holds:
+`ao-core` holds the execution link of the public step (§2):
 
 | Key | Value |
 |---|---|
-| `status` | `captured` when the HashPath of this step's base message and request could be computed, otherwise `not-captured`. |
-| `source` | `HyperBEAM AO-Core resolve stage 9`. |
-| `hashpath` | That HashPath, when captured. |
+| `status` | `captured` when the HashPath of the public step could be computed, otherwise `not-captured`. |
+| `source` | `HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)`: the AO-Core resolution stage that links a result to its inputs, whose function `hb_path:hashpath/3` computes this HashPath. |
+| `hashpath` | The HashPath (`hb_path:hashpath/3`) of the public step. Omitted when `status` is `not-captured`. |
 | `hashpath-algorithm` | `sha-256-chain (AO-Core default)`. |
-| `request-id`, `response-id` | Unsigned message IDs of the request and of the runtime response, private keys removed. |
+| `request-id` | Unsigned message ID of the public step request. Omitted when it cannot be computed. |
+| `response-id` | Unsigned message ID of the runtime response, private keys removed. Omitted when it cannot be computed. |
 | `verification-status` | `captured`. |
+
+A request that `inference_receipt@1.0` executes carries only public step
+keys, so for it the public step is the AO-Core step that ran: `hashpath`
+equals the HashPath AO-Core assigns to the result at stage 8, which the
+receipt records.
 
 **Attestation.** The attestation nonce is the lowercase hexadecimal SHA-256
 of the `raw` bytes (64 characters). The device resolves the attestation
@@ -280,11 +302,14 @@ error whose body is a JSON object is returned with that body unchanged.
   origin, as `authorization: Bearer <key>`. It is never recorded in `raw`
   and never returned. Over `http` it travels in clear text, so a runtime
   outside the node's host SHOULD be reached over `https`.
-- **Published data.** `raw` records only the public request. HTTP headers
-  (including `cf-*`, `x-forwarded-*`, `x-real-ip`, `user-agent`, cookies and
+- **Published data.** `raw` records only the public request and the
+  identifiers of the public step. HTTP headers (including `cf-*`,
+  `x-forwarded-*`, `x-real-ip`, `user-agent`, `host`, cookies and
   credentials), the `user` identifier and the caller's private address are
-  never recorded. Prompts and completions in `raw` become public when a
-  client publishes the attestation.
+  never recorded, and never enter the HashPath or the IDs in `raw.ao-core`,
+  so two requests that differ only in them yield the same `raw.ao-core`.
+  Prompts and completions in `raw` become public when a client publishes the
+  attestation.
 - **What the attestation proves.** A report for the attestation nonce shows
   that the attesting hardware produced it after `raw` existed. It does not by
   itself prove where the runtime ran: that is a property of the deployment
@@ -335,10 +360,22 @@ error whose body is a JSON object is returned with that body unchanged.
 - **AO processes.** `completions` returns a message-shaped result to a
   request with `type: Message`.
 - **Public gateway (informative).** On the reference deployment a gateway
-  sits in front of the node. It sends `/~inference@1.0/*` requests without
-  `tee=true` directly to the runtime, with the device prefix removed, and
-  sends `tee=true` requests to HyperBEAM; for those it publishes the
-  attestation record to Arweave and adds `load_dataitem_id` to the response.
+  sits in front of the node:
+  - `/~inference@1.0/*` requests without `tee=true` (a query parameter or a
+    JSON field) go directly to the runtime with the `/~inference@1.0` prefix
+    removed, and `/ao/~inference@1.0/*` requests go to the runtime with the
+    `/ao/~inference@1.0` prefix removed, with or without `tee=true`, so
+    neither reaches this device;
+  - `/~inference@1.0/*` requests with `tee=true` go to this device on the
+    node, except `/~inference@1.0/completions` with `tee=true`, which the
+    gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
+  - the gateway publishes receipts through the `publish` key of
+    `inference_receipt@1.0` and adds `load_dataitem_id` and `arweave_tx_id`
+    to those responses. `publish` accepts only documents that carry a receipt
+    naming the node in `node-address`, so an attested completion served by
+    this device alone, which carries no receipt, is not published, and the
+    gateway adds `receipt_upload` with `status: failed` to its response.
+
   Address the node itself to exercise every key of this device.
 
 ## 10. Conformance (normative checklist)
@@ -365,14 +402,17 @@ error whose body is a JSON object is returned with that body unchanged.
    become 500; transport failures become 503.
 9. `raw` has exactly the keys of §5, and its `request` contains only public
    generation parameters and `tee`.
-10. The attestation device is asked for the lowercase hexadecimal SHA-256 of
+10. `raw.ao-core` records the HashPath and request ID of the public step,
+    which carries no client transport metadata, and omits each value it
+    cannot compute.
+11. The attestation device is asked for the lowercase hexadecimal SHA-256 of
     the `raw` bytes, and `attestation.nonce` equals that value.
-11. A failed attestation leaves `attestation` with `raw` and `nonce` only, and
+12. A failed attestation leaves `attestation` with `raw` and `nonce` only, and
     the completion still succeeds.
-12. `resolved_model` reports the served model and only the eight declared
+13. `resolved_model` reports the served model and only the eight declared
     fact keys of §5.
-13. `health` is healthy exactly when the runtime answers 2xx.
-14. `completions` answers a request with `type: Message` with `data` and
+14. `health` is healthy exactly when the runtime answers 2xx.
+15. `completions` answers a request with `type: Message` with `data` and
     `action`.
 
 ## 11. Out of scope
@@ -386,4 +426,4 @@ error whose body is a JSON object is returned with that body unchanged.
   attestation device (`sev_gpu@1.0`).
 - Authentication, rate limiting and billing of callers.
 - The public gateway of the reference deployment and its publishing of
-  attestation records.
+  receipts.
