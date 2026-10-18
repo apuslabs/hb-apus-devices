@@ -1,56 +1,57 @@
 --- @module agent-test
---- Tests for dev_agent called via ao.resolve (simulating Lua process usage).
+--- Integration checks for agent@1.0 called through ao.resolve from a Lua
+--- process. Requests carry only agent inputs: the model runtime and its
+--- credentials are node options of the node's inference device. The checks
+--- call the model, so they run only when AGENT_TEST_LIVE is set to a value
+--- other than 0 on a node whose runtime is configured.
+
+local function live()
+    local flag = os.getenv("AGENT_TEST_LIVE")
+    return flag ~= nil and flag ~= "" and flag ~= "0"
+end
+
+local function report(name, status, res)
+    ao.event(name, {
+        status = status,
+        answer = res["agent-answer"],
+        iterations = res["agent-iterations"],
+        error = res["agent-error"]
+    })
+end
 
 --- @function agent_resolve_test
---- Call dev_agent via ao.resolve with real Novita AI API.
---- The agent should use the http_request tool to fetch data and return a result.
+--- The agent fetches a public page with the http_request tool and answers
+--- from the result.
 function agent_resolve_test()
-    local api_key = os.getenv("NOVITA_API_KEY")
-    if not api_key or api_key == "" then
-        ao.event("agent_test", { skipped = "NOVITA_API_KEY is not set" })
+    if not live() then
+        ao.event("agent_test", { skipped = "AGENT_TEST_LIVE is not set" })
         return "ok", { skipped = true }
     end
 
     local status, res = ao.resolve({
         path = "/~agent@1.0/run",
-        ["agent-user-prompt"] = "Use the http_request tool to GET https://httpbin.org/get and tell me what the origin IP address is.",
-        ["agent-model"] = "minimax/minimax-m2.7",
-        ["agent-api-peer"] = "https://api.novita.ai",
-        ["agent-api-path"] = "/openai/v1/chat/completions",
-        ["agent-api-key"] = api_key,
+        ["agent-user-prompt"] = "Use the http_request tool to GET https://example.com/ and reply with the page title.",
+        ["agent-tools"] = "http_request",
         ["agent-max-iterations"] = 5
     })
-    -- Log the result for debugging
-    ao.event("agent_test", {
-        status = status,
-        answer = res["agent-answer"],
-        iterations = res["agent-iterations"]
-    })
+    report("agent_test", status, res)
     return status, res
 end
 
 --- @function agent_simple_test
---- Call dev_agent with a simple question (no tool call needed).
+--- The agent answers a simple question without tools.
 function agent_simple_test()
-    local api_key = os.getenv("NOVITA_API_KEY")
-    if not api_key or api_key == "" then
-        ao.event("agent_simple_test", { skipped = "NOVITA_API_KEY is not set" })
+    if not live() then
+        ao.event("agent_simple_test", { skipped = "AGENT_TEST_LIVE is not set" })
         return "ok", { skipped = true }
     end
 
     local status, res = ao.resolve({
         path = "/~agent@1.0/run",
         ["agent-user-prompt"] = "What is 2+2? Answer with just the number.",
-        ["agent-model"] = "minimax/minimax-m2.7",
-        ["agent-api-peer"] = "https://api.novita.ai",
-        ["agent-api-path"] = "/openai/v1/chat/completions",
-        ["agent-api-key"] = api_key,
+        ["agent-disable-tools"] = true,
         ["agent-max-iterations"] = 3
     })
-    ao.event("agent_simple_test", {
-        status = status,
-        answer = res["agent-answer"],
-        iterations = res["agent-iterations"]
-    })
+    report("agent_simple_test", status, res)
     return status, res
 end
