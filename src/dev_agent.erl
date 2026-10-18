@@ -5,7 +5,8 @@
 %%% device for a chat completion, executes the built-in tools that the model
 %%% calls, appends the observations and repeats until the model answers or the
 %%% iteration limit is reached. The `finish_reason' of each completion decides
-%%% the next step: `stop' answers, `tool_calls' executes tools, `length'
+%%% the next step: the tool calls of a finished completion (`stop' or
+%%% `tool_calls') are executed, `stop' without tool calls answers, `length'
 %%% continues a truncated answer, and every other value ends the run with an
 %%% error code.
 %%%
@@ -35,13 +36,14 @@
 -define(DEFAULT_INFERENCE_DEVICE, <<"inference@1.0">>).
 -define(DEFAULT_MAX_ITERATIONS_LIMIT, 25).
 -define(DEFAULT_MAX_TOOL_RESULT_BYTES, 4000).
+-define(DEFAULT_MAX_TOOL_CALLS_PER_COMPLETION, 16).
+-define(DEFAULT_MAX_TOOL_CALLS_PER_RUN, 64).
 
 %% Request defaults.
 -define(DEFAULT_USER_PROMPT, <<"Hello">>).
 -define(DEFAULT_MAX_ITERATIONS, 10).
 
 %% Constant bounds.
--define(MAX_TOOL_CALLS_PER_TURN, 16).
 -define(PREVIEW_BYTES, 160).
 -define(MAX_DETAIL_BYTES, 512).
 
@@ -62,6 +64,9 @@
 -define(PROMPT_PREAMBLE,
     <<"You are a helpful assistant running on a HyperBEAM node in the AO "
       "network.">>).
+-define(INFERENCE_FAILED, <<"the inference call failed">>).
+-define(TOOL_EXCEPTION, <<"the tool raised an exception">>).
+-define(DEVICE_FAILED, <<"the device returned an error">>).
 -define(CONTINUE_PROMPT,
     <<"Continue exactly where your previous message stopped. Do not repeat "
       "any text you have already written.">>).
@@ -108,7 +113,25 @@ run(Base, Req, Opts) ->
         model => model(Req, Opts),
         tool_choice => initial_tool_choice(Req, Tools, Opts),
         max_iterations => max_iterations(Req, Opts),
-        max_result_bytes => max_tool_result_bytes(Opts),
+        max_result_bytes =>
+            node_limit(
+                <<"agent-max-tool-result-bytes">>,
+                ?DEFAULT_MAX_TOOL_RESULT_BYTES,
+                Opts
+            ),
+        max_calls_per_completion =>
+            node_limit(
+                <<"agent-max-tool-calls-per-completion">>,
+                ?DEFAULT_MAX_TOOL_CALLS_PER_COMPLETION,
+                Opts
+            ),
+        max_calls_per_run =>
+            node_limit(
+                <<"agent-max-tool-calls-per-run">>,
+                ?DEFAULT_MAX_TOOL_CALLS_PER_RUN,
+                Opts
+            ),
+        tool_calls_made => 0,
         messages =>
             initial_messages(Req, system_prompt(Req, Tools, Opts), Opts),
         iteration => 1,
@@ -140,18 +163,24 @@ loop(State = #{ iteration := Iteration }) ->
     end.
 
 %% @doc Apply the outcome of one completion.
+step({answer, <<>>}, State = #{ iteration := Iteration, partial := <<>> }) ->
+    ?event(agent, {empty_answer, Iteration}),
+    {error, Code, Detail} = incomplete(<<"stop">>, <<"empty-content">>),
+    finish_error(Code, Detail, Iteration, State);
 step({answer, Text}, State = #{ iteration := Iteration, partial := Partial }) ->
     ?event(agent, {final_answer, Iteration}),
     finish_answer(<<Partial/binary, Text/binary>>, Iteration, State);
 step({tool_calls, Frame, Calls}, State) ->
-    #{ iteration := Iteration, messages := Messages } = State,
+    #{ iteration := Iteration, messages := Messages, tool_calls_made := Made } =
+        State,
     ?event(agent, {tool_calls, Iteration, length(Calls)}),
-    Results = execute_tool_calls(Calls, State),
+    {Results, Processed} = execute_tool_calls(Calls, State),
     loop(State#{
         messages := Messages ++ [Frame | Results],
         iteration := Iteration + 1,
         partial := <<>>,
-        tool_choice := tool_choice_after_tools(State)
+        tool_choice := tool_choice_after_tools(State),
+        tool_calls_made := Made + Processed
     });
 step({continue, Frame, Text}, State) ->
     #{ iteration := Iteration, messages := Messages, partial := Partial } =
@@ -169,11 +198,14 @@ step({error, Code, Detail}, State = #{ iteration := Iteration }) ->
     ?event(agent, {run_failed, Code, Iteration}),
     finish_error(Code, Detail, Iteration, State).
 
-%% @doc A caller's tool choice applies until the first tool round. Repeating
-%% `required' or a named function would force a tool call on every turn, so
-%% later turns use `auto'.
-tool_choice_after_tools(#{ tool_choice := undefined }) -> undefined;
-tool_choice_after_tools(_) -> <<"auto">>.
+%% @doc `required' and a named function apply until the first tool round;
+%% repeating them would force a tool call on every completion, so later
+%% calls use `auto'. `auto' and `none' are kept for the whole run.
+tool_choice_after_tools(#{ tool_choice := Choice })
+        when Choice =:= undefined; Choice =:= <<"auto">>; Choice =:= <<"none">> ->
+    Choice;
+tool_choice_after_tools(_) ->
+    <<"auto">>.
 
 finish_answer(Answer, Iterations, #{ base := Base, opts := Opts }) ->
     {ok, (result_base(Base, Opts))#{
@@ -232,11 +264,11 @@ model(Req, Opts) ->
 %% capped by the operator ceiling.
 max_iterations(Req, Opts) ->
     Limit =
-        case positive_int(
-                hb_opts:get(<<"agent-max-iterations-limit">>, not_found, Opts)) of
-            {ok, L} -> L;
-            error -> ?DEFAULT_MAX_ITERATIONS_LIMIT
-        end,
+        node_limit(
+            <<"agent-max-iterations-limit">>,
+            ?DEFAULT_MAX_ITERATIONS_LIMIT,
+            Opts
+        ),
     Requested =
         case positive_int(req(<<"agent-max-iterations">>, Req, Opts)) of
             {ok, N} -> N;
@@ -244,11 +276,12 @@ max_iterations(Req, Opts) ->
         end,
     min(Requested, Limit).
 
-max_tool_result_bytes(Opts) ->
-    case positive_int(
-            hb_opts:get(<<"agent-max-tool-result-bytes">>, not_found, Opts)) of
+%% @doc A positive-integer node option, or its default when the option is
+%% absent or invalid.
+node_limit(Key, Default, Opts) ->
+    case positive_int(hb_opts:get(Key, not_found, Opts)) of
         {ok, N} -> N;
-        error -> ?DEFAULT_MAX_TOOL_RESULT_BYTES
+        error -> Default
     end.
 
 %% @doc The built-in tools offered in this run: the operator-enabled table,
@@ -280,10 +313,11 @@ gate_open(none, _Opts) -> true;
 gate_open(Option, Opts) -> truthy(hb_opts:get(Option, false, Opts)).
 
 %% @doc `agent-tools' as a list of names, a JSON array, or a comma-separated
-%% text. Any other value leaves the set unchanged.
+%% text. Elements that are not valid UTF-8 text are skipped, so an empty
+%% list or text selects no tool. Any other value leaves the set unchanged.
 requested_tool_names(not_found) -> all;
 requested_tool_names(List) when is_list(List) ->
-    [string:trim(Name) || Name <- List, is_binary(Name)];
+    [Name || Element <- List, {ok, Name} <- [trimmed(Element)]];
 requested_tool_names(Bin) when is_binary(Bin) ->
     case decode_json(Bin) of
         {ok, List} when is_list(List) -> requested_tool_names(List);
@@ -292,35 +326,41 @@ requested_tool_names(Bin) when is_binary(Bin) ->
                 Name
             ||
                 Part <- binary:split(Bin, <<",">>, [global]),
-                Name <- [string:trim(Part)],
+                {ok, Name} <- [trimmed(Part)],
                 Name =/= <<>>
             ]
     end;
 requested_tool_names(_) -> all.
 
 %% @doc `agent-tool-choice' when tools are offered: `auto', `none',
-%% `required', or a named function object (map or JSON text).
+%% `required', or a named function object (map or JSON text) that names an
+%% enabled tool. Any other value means `auto'.
 initial_tool_choice(_Req, [], _Opts) -> undefined;
-initial_tool_choice(Req, _Tools, Opts) ->
+initial_tool_choice(Req, Tools, Opts) ->
     case req(<<"agent-tool-choice">>, Req, Opts) of
         Mode when is_binary(Mode) ->
             case lists:member(Mode, ?TOOL_CHOICE_MODES) of
                 true -> Mode;
                 false ->
                     case decode_json(Mode) of
-                        {ok, Choice} -> named_tool_choice(Choice);
+                        {ok, Choice} -> named_tool_choice(Choice, Tools);
                         error -> <<"auto">>
                     end
             end;
-        Choice -> named_tool_choice(Choice)
+        Choice -> named_tool_choice(Choice, Tools)
     end.
 
 named_tool_choice(#{ <<"type">> := <<"function">>,
-                     <<"function">> := #{ <<"name">> := Name } })
-        when is_binary(Name), Name =/= <<>> ->
-    #{ <<"type">> => <<"function">>,
-       <<"function">> => #{ <<"name">> => Name } };
-named_tool_choice(_) ->
+                     <<"function">> := #{ <<"name">> := Name } }, Tools)
+        when is_binary(Name) ->
+    case lists:member(Name, [ToolName || #{ name := ToolName } <- Tools]) of
+        true ->
+            #{ <<"type">> => <<"function">>,
+               <<"function">> => #{ <<"name">> => Name } };
+        false ->
+            <<"auto">>
+    end;
+named_tool_choice(_Choice, _Tools) ->
     <<"auto">>.
 
 %% @doc `agent-system-prompt', or the prompt generated from the tool set.
@@ -448,8 +488,9 @@ call_model(State = #{ opts := Opts }) ->
         Other -> {error, <<"model_error">>, error_detail(Other, Opts)}
     catch
         Class:Reason ->
+            ?event(agent, {inference_exception, Class, Reason}),
             {error, <<"model_error">>,
-                #{ <<"message">> => describe({Class, Reason}) }}
+                #{ <<"message">> => <<"the inference call raised an exception">> }}
     end.
 
 %% @doc Interpret the inference device's result message.
@@ -506,32 +547,25 @@ parse_choice(Choice) ->
                 #{ <<"message">> => <<"the first choice has no message">> }}
     end.
 
-%% @doc A missing or null `finish_reason' is inferred from the message.
-finish_reason(Choice, Message) ->
+%% @doc A missing or null `finish_reason' is handled as `stop'.
+finish_reason(Choice, _Message) ->
     case maps:get(<<"finish_reason">>, Choice, null) of
-        null ->
-            case tool_call_list(Message) of
-                [] -> <<"stop">>;
-                _ -> <<"tool_calls">>
-            end;
+        null -> <<"stop">>;
         Reason when is_binary(Reason) -> Reason;
         Other -> describe(Other)
     end.
 
+%% @doc A finished completion (`stop' or `tool_calls') with tool calls is a
+%% tool round: runtimes report a forced tool call with either value.
 dispatch(<<"stop">>, Message) ->
-    {answer, answer_text(Message)};
+    case tool_call_list(Message) of
+        [] -> {answer, answer_text(Message)};
+        RawCalls -> tool_round(Message, RawCalls)
+    end;
 dispatch(<<"tool_calls">>, Message) ->
     case tool_call_list(Message) of
-        [] ->
-            incomplete(<<"tool_calls">>, <<"missing-tool-calls">>);
-        RawCalls ->
-            Calls = normalize_tool_calls(RawCalls),
-            Frame =
-                assistant_frame(
-                    Message,
-                    #{ <<"tool_calls">> => [frame_call(Call) || Call <- Calls] }
-                ),
-            {tool_calls, Frame, Calls}
+        [] -> incomplete(<<"tool_calls">>, <<"missing-tool-calls">>);
+        RawCalls -> tool_round(Message, RawCalls)
     end;
 dispatch(<<"length">>, Message) ->
     case {has_tool_call(Message), content_text(Message)} of
@@ -547,6 +581,15 @@ dispatch(<<"error">>, _Message) ->
 dispatch(Other, _Message) ->
     {error, <<"unsupported_finish_reason">>,
         #{ <<"finish-reason">> => bound_text(Other, ?MAX_DETAIL_BYTES) }}.
+
+tool_round(Message, RawCalls) ->
+    Calls = normalize_tool_calls(RawCalls),
+    Frame =
+        assistant_frame(
+            Message,
+            #{ <<"tool_calls">> => [frame_call(Call) || Call <- Calls] }
+        ),
+    {tool_calls, Frame, Calls}.
 
 incomplete(FinishReason, Cause) ->
     {error, <<"incomplete_response">>,
@@ -682,8 +725,9 @@ detail_value(Value) when is_binary(Value) -> bound_text(Value, ?MAX_DETAIL_BYTES
 detail_value(Value) -> Value.
 
 %% @doc Describe a failed inference call: its status and the runtime's error
-%% message when available.
+%% message when available. Other error terms are logged, not returned.
 error_detail(Reason, Opts) when is_map(Reason) ->
+    ?event(agent, {inference_error, Reason}),
     Status =
         case status_code(hb_maps:get(<<"status">>, Reason, not_found, Opts)) of
             Code when is_integer(Code) -> #{ <<"status">> => Code };
@@ -713,11 +757,12 @@ error_detail(Reason, Opts) when is_map(Reason) ->
             {_, Text} when is_binary(Text) ->
                 #{ <<"message">> => bound_text(Text, ?MAX_DETAIL_BYTES) };
             _ when map_size(Status) > 0 -> #{};
-            _ -> #{ <<"message">> => describe(Reason) }
+            _ -> #{ <<"message">> => ?INFERENCE_FAILED }
         end,
     maps:merge(maps:merge(Status, FromBody), Message);
 error_detail(Reason, _Opts) ->
-    #{ <<"message">> => describe(Reason) }.
+    ?event(agent, {inference_error, Reason}),
+    #{ <<"message">> => reason_text(Reason, ?INFERENCE_FAILED) }.
 
 body_message(Body) ->
     #{ <<"message">> => bound_text(Body, ?MAX_DETAIL_BYTES) }.
@@ -878,30 +923,56 @@ tool_device(#{ name := Name, device := Default }, Opts) ->
         _ -> Default
     end.
 
-%% @doc Execute the tool calls of one completion, in order. Calls beyond
-%% the per-turn bound are answered without being executed.
-execute_tool_calls(Calls, State = #{ max_result_bytes := MaxBytes }) ->
-    {Executed, Skipped} =
-        lists:split(min(length(Calls), ?MAX_TOOL_CALLS_PER_TURN), Calls),
-    [
-        tool_message(Call, execute_tool_call(Call, State), MaxBytes)
-    ||
-        Call <- Executed
-    ] ++
-    [
-        tool_message(
-            Call,
-            rejected_text(
-                Name,
+%% @doc Process the tool calls of one completion, in order, and return
+%% their tool messages and the number of calls processed. Calls beyond the
+%% per-completion or per-run bound are answered without being executed;
+%% under tool choice `none' no call is executed.
+execute_tool_calls(Calls, State = #{ tool_choice := <<"none">> }) ->
+    #{ max_result_bytes := MaxBytes } = State,
+    {
+        [
+            tool_message(
+                Call,
+                rejected_text(Name, <<"the tool choice of this run is none">>),
+                MaxBytes
+            )
+        ||
+            Call = #{ name := Name } <- Calls
+        ],
+        0
+    };
+execute_tool_calls(Calls, State) ->
+    #{
+        max_result_bytes := MaxBytes,
+        max_calls_per_completion := PerCompletion,
+        max_calls_per_run := PerRun,
+        tool_calls_made := Made
+    } = State,
+    Left = PerRun - Made,
+    Count = lists:min([length(Calls), PerCompletion, Left]),
+    {Processed, Skipped} = lists:split(Count, Calls),
+    Why =
+        case Left < PerCompletion of
+            true ->
+                <<"a run may make at most ",
+                  (integer_to_binary(PerRun))/binary, " tool calls">>;
+            false ->
                 <<"a completion may request at most ",
-                  (integer_to_binary(?MAX_TOOL_CALLS_PER_TURN))/binary,
-                  " tool calls">>
-            ),
-            MaxBytes
-        )
-    ||
-        Call = #{ name := Name } <- Skipped
-    ].
+                  (integer_to_binary(PerCompletion))/binary, " tool calls">>
+        end,
+    {
+        [
+            tool_message(Call, execute_tool_call(Call, State), MaxBytes)
+        ||
+            Call <- Processed
+        ] ++
+        [
+            tool_message(Call, rejected_text(Name, Why), MaxBytes)
+        ||
+            Call = #{ name := Name } <- Skipped
+        ],
+        Count
+    }.
 
 tool_message(#{ id := Id }, Content, MaxBytes) ->
     #{
@@ -960,7 +1031,9 @@ invoke(Tool = #{ name := Name, executor := Executor }, Args, Opts) ->
         {rejected, Why} -> rejected_text(Name, Why);
         {error, Why} -> failed_text(Name, Why)
     catch
-        Class:Reason -> failed_text(Name, describe({Class, Reason}))
+        Class:Reason ->
+            ?event(agent, {tool_exception, Name, Class, Reason}),
+            failed_text(Name, ?TOOL_EXCEPTION)
     end.
 
 rejected_text(Name, Why) ->
@@ -1008,7 +1081,11 @@ http_request(Args, Device, Opts) ->
 
 http_method(null) -> {ok, <<"GET">>};
 http_method(Method) when is_binary(Method) ->
-    Upper = string:uppercase(Method),
+    Upper =
+        case valid_utf8(Method) of
+            true -> string:uppercase(Method);
+            false -> Method
+        end,
     case lists:member(Upper, ?HTTP_METHODS) of
         true -> {ok, Upper};
         false -> {rejected, <<"method must be GET, POST, PUT or DELETE">>}
@@ -1079,10 +1156,8 @@ http_result({_Status, Response}, Opts) when is_map(Response) ->
         end,
     {ok, <<"status: ", (hb_util:bin(Status))/binary, "\n", TypeLine/binary,
            "\n", Body/binary>>};
-http_result({error, Reason}, _Opts) ->
-    {error, describe(Reason)};
-http_result(Other, _Opts) ->
-    {error, describe(Other)}.
+http_result(Other, Opts) ->
+    device_error(Other, Opts).
 
 %% @doc `lookup_data' through the cache device's `read' key.
 lookup_data(Args, Device, Opts) ->
@@ -1094,7 +1169,7 @@ lookup_data(Args, Device, Opts) ->
                 no_cache(Opts)) of
             {ok, Result} -> {ok, render(Result, Opts)};
             {error, not_found} -> {ok, <<"Not found: ", ID/binary>>};
-            Other -> {error, describe(Other)}
+            Other -> device_error(Other, Opts)
         end
     end.
 
@@ -1113,7 +1188,7 @@ search_messages(Args, Device, Opts) ->
                 no_cache(Opts)) of
             {ok, Result} -> {ok, render(Result, Opts)};
             {error, not_found} -> {ok, <<"No matching messages.">>};
-            Other -> {error, describe(Other)}
+            Other -> device_error(Other, Opts)
         end
     end.
 
@@ -1122,7 +1197,7 @@ match_spec(Match) when is_map(Match), map_size(Match) > 0 ->
         lists:all(
             fun({Key, Value}) ->
                 is_binary(Key) andalso
-                    (is_binary(Value) orelse is_integer(Value) orelse
+                    (is_binary(Value) orelse is_number(Value) orelse
                         is_boolean(Value))
             end,
             maps:to_list(Match)
@@ -1157,7 +1232,7 @@ get_arweave_tx(Args, Device, Opts) ->
                 no_cache(Opts)) of
             {ok, Result} -> {ok, render(Result, Opts)};
             {error, not_found} -> {ok, <<"Transaction not found: ", ID/binary>>};
-            Other -> {error, describe(Other)}
+            Other -> device_error(Other, Opts)
         end
     end.
 
@@ -1184,9 +1259,38 @@ bundle_item(Args, Device, Opts) ->
                 },
                 no_cache(Opts)) of
             {ok, Result} -> {ok, bundle_text(Result, Opts)};
-            Other -> {error, describe(Other)}
+            Other -> device_error(Other, Opts)
         end
     end.
+
+%% @doc A failed device call as a tool failure. Status and text of an error
+%% message, and atom or text reasons, are shown; other terms are not.
+device_error({error, Reason}, Opts) when is_map(Reason) ->
+    Status =
+        case status_code(hb_maps:get(<<"status">>, Reason, not_found, Opts)) of
+            Code when is_integer(Code) ->
+                <<"status ", (integer_to_binary(Code))/binary>>;
+            _ -> <<>>
+        end,
+    Body =
+        case hb_maps:get(<<"body">>, Reason, not_found, Opts) of
+            Text when is_binary(Text), Text =/= <<>> -> Text;
+            _ -> <<>>
+        end,
+    case {Status, Body} of
+        {<<>>, <<>>} ->
+            ?event(agent, {tool_device_error, Reason}),
+            {error, ?DEVICE_FAILED};
+        {<<>>, _} -> {error, Body};
+        {_, <<>>} -> {error, Status};
+        _ -> {error, <<Status/binary, ": ", Body/binary>>}
+    end;
+device_error({error, Reason}, _Opts) ->
+    ?event(agent, {tool_device_error, Reason}),
+    {error, reason_text(Reason, ?DEVICE_FAILED)};
+device_error(Other, _Opts) ->
+    ?event(agent, {tool_device_result, Other}),
+    {error, ?DEVICE_FAILED}.
 
 bundle_text(Result, Opts) when is_map(Result) ->
     case hb_maps:get(<<"id">>, Result, not_found, Opts) of
@@ -1238,21 +1342,44 @@ no_cache(Opts) ->
         <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
     }.
 
+%% @doc `true', `1', or the text `true' or `1' (any case, surrounding
+%% whitespace ignored). Every other value, including text that is not valid
+%% UTF-8, is false.
 truthy(true) -> true;
 truthy(1) -> true;
 truthy(Bin) when is_binary(Bin) ->
-    lists:member(string:lowercase(string:trim(Bin)), [<<"true">>, <<"1">>]);
+    case trimmed(Bin) of
+        {ok, Text} -> lists:member(string:lowercase(Text), [<<"true">>, <<"1">>]);
+        error -> false
+    end;
 truthy(_) -> false.
+
+%% @doc Text without surrounding whitespace, or `error' for values that are
+%% not valid UTF-8 text.
+trimmed(Bin) when is_binary(Bin) ->
+    case valid_utf8(Bin) of
+        true -> {ok, unicode:characters_to_binary(string:trim(Bin))};
+        false -> error
+    end;
+trimmed(_) ->
+    error.
+
+valid_utf8(Bin) ->
+    unicode:characters_to_binary(Bin) =:= Bin.
 
 %% @doc A positive integer from an integer, an integral float, or decimal
 %% text.
 positive_int(N) when is_integer(N), N > 0 -> {ok, N};
 positive_int(F) when is_float(F), F >= 1.0, F == trunc(F) -> {ok, trunc(F)};
 positive_int(Bin) when is_binary(Bin) ->
-    try binary_to_integer(string:trim(Bin)) of
-        N when N > 0 -> {ok, N};
-        _ -> error
-    catch _:_ -> error
+    case trimmed(Bin) of
+        {ok, Text} ->
+            try binary_to_integer(Text) of
+                N when N > 0 -> {ok, N};
+                _ -> error
+            catch _:_ -> error
+            end;
+        error -> error
     end;
 positive_int(_) -> error.
 
@@ -1286,6 +1413,15 @@ clean(Map) when is_map(Map) ->
         maps:without([<<"commitments">>], Map));
 clean(List) when is_list(List) -> [clean(Value) || Value <- List];
 clean(Value) -> Value.
+
+%% @doc The text of an atom or binary error reason; `Generic' for any other
+%% term, so that internal state is never shown.
+reason_text(Reason, _Generic) when is_atom(Reason) ->
+    bound_text(atom_to_binary(Reason), ?MAX_DETAIL_BYTES);
+reason_text(Reason, _Generic) when is_binary(Reason), Reason =/= <<>> ->
+    bound_text(Reason, ?MAX_DETAIL_BYTES);
+reason_text(_Reason, Generic) ->
+    Generic.
 
 %% @doc A short, printable description of a term.
 describe(Bin) when is_binary(Bin) -> bound_text(Bin, ?MAX_DETAIL_BYTES);
@@ -1605,7 +1741,7 @@ multiple_tool_calls_test() ->
             <- maps:get(<<"messages">>, Second)]
     ).
 
-tool_calls_per_turn_are_bounded_test() ->
+tool_calls_per_completion_are_bounded_test() ->
     Calls = [http_call(integer_to_binary(N)) || N <- lists:seq(1, 20)],
     {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
     _ = run_agent(#{}, Opts),
@@ -1613,7 +1749,26 @@ tool_calls_per_turn_are_bounded_test() ->
     [_, Second] = model_requests(Table),
     Contents = tool_contents(maps:get(<<"messages">>, Second)),
     ?assertEqual(20, length(Contents)),
-    ?assert(contains(lists:last(Contents), <<"at most 16 tool calls">>)).
+    ?assert(contains(lists:last(Contents), <<"at most 16 tool calls">>)),
+    {Limited, LimitedOpts} =
+        setup([tool_reply(Calls), answer_reply(<<"ok">>)],
+              #{ <<"agent-max-tool-calls-per-completion">> => <<"3">> }),
+    _ = run_agent(#{}, LimitedOpts),
+    ?assertEqual(3, length(tool_requests(Limited, http))).
+
+tool_calls_per_run_are_bounded_test() ->
+    TwoCalls = tool_reply([http_call(<<"a">>), http_call(<<"b">>)]),
+    {Table, Opts} =
+        setup([TwoCalls, TwoCalls, TwoCalls, answer_reply(<<"done">>)],
+              #{ <<"agent-max-tool-calls-per-run">> => 3 }),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"done">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(3, length(tool_requests(Table, http))),
+    [_, _, Third, Fourth] = model_requests(Table),
+    [_, _, _, Skipped] = tool_contents(maps:get(<<"messages">>, Third)),
+    ?assert(contains(Skipped, <<"a run may make at most 3 tool calls">>)),
+    [_, _, _, _, _, Last] = tool_contents(maps:get(<<"messages">>, Fourth)),
+    ?assert(contains(Last, <<"was not executed">>)).
 
 tool_failure_is_reported_to_the_model_test() ->
     Failing = #{ <<"call">> => fun(_, _, _) -> throw(upstream_unavailable) end },
@@ -1624,8 +1779,34 @@ tool_failure_is_reported_to_the_model_test() ->
     ?assertEqual(<<"It failed.">>, maps:get(<<"agent-answer">>, Result)),
     [_, Second] = model_requests(Table),
     [Content] = tool_contents(maps:get(<<"messages">>, Second)),
-    ?assert(contains(Content, <<"`http_request` failed">>)),
-    ?assert(contains(Content, <<"upstream_unavailable">>)).
+    ?assertEqual(
+        <<"Tool error: `http_request` failed: the tool raised an exception.">>,
+        Content
+    ).
+
+tool_device_errors_hide_internal_terms_test() ->
+    Reply = fun(Error) -> #{ <<"read">> => fun(_, _, _) -> Error end } end,
+    ID = binary:copy(<<"a">>, 43),
+    Content = fun(Error) ->
+        {Table, Opts0} =
+            setup([tool_reply([tool_call(<<"l">>, <<"lookup_data">>,
+                                         #{ <<"id">> => ID })]),
+                   answer_reply(<<"ok">>)]),
+        Opts = Opts0#{ <<"agent-tool-devices">> =>
+                           #{ <<"lookup_data">> => Reply(Error) } },
+        _ = run_agent(#{}, Opts),
+        [_, Second] = model_requests(Table),
+        [Text] = tool_contents(maps:get(<<"messages">>, Second)),
+        Text
+    end,
+    ?assert(contains(Content({error, timeout}), <<"failed: timeout.">>)),
+    ?assert(contains(
+        Content({error, #{ <<"status">> => 502, <<"body">> => <<"bad gateway">> }}),
+        <<"failed: status 502: bad gateway.">>
+    )),
+    Hidden = Content({error, {internal, #{ <<"priv-wallet">> => <<"secret">> }}}),
+    ?assert(contains(Hidden, <<"failed: the device returned an error.">>)),
+    ?assertNot(contains(Hidden, <<"secret">>)).
 
 http_error_status_is_an_observation_test() ->
     NotFound =
@@ -1882,6 +2063,38 @@ missing_finish_reason_is_inferred_test() ->
     ?assertEqual(<<"inferred">>, maps:get(<<"agent-answer">>, Result)),
     ?assertEqual(1, length(tool_requests(Table, http))).
 
+stop_with_tool_calls_executes_them_test() ->
+    Named = #{ <<"type">> => <<"function">>,
+               <<"function">> => #{ <<"name">> => <<"http_request">> } },
+    Forced =
+        reply_with(
+            #{ <<"content">> => <<>>, <<"tool_calls">> => [http_call(<<"f">>)] },
+            <<"stop">>),
+    {Table, Opts} = setup([Forced, answer_reply(<<"Fetched.">>)]),
+    Result = run_agent(#{ <<"agent-tool-choice">> => Named }, Opts),
+    ?assertEqual(<<"Fetched.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertNot(maps:is_key(<<"agent-error">>, Result)),
+    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual(1, length(tool_requests(Table, http))),
+    [First, Second] = model_requests(Table),
+    ?assertEqual(Named, maps:get(<<"tool_choice">>, First)),
+    ?assertEqual(<<"auto">>, maps:get(<<"tool_choice">>, Second)).
+
+empty_stop_is_incomplete_test() ->
+    {_Table, Opts} = setup([answer_reply(<<>>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"incomplete_response">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"finish-reason">> => <<"stop">>, <<"cause">> => <<"empty-content">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ),
+    {_, ContinuedOpts} =
+        setup([reply_with(#{ <<"content">> => <<"whole">> }, <<"length">>),
+               answer_reply(<<>>)]),
+    Continued = run_agent(#{}, ContinuedOpts),
+    ?assertEqual(<<"whole">>, maps:get(<<"agent-answer">>, Continued)),
+    ?assertNot(maps:is_key(<<"agent-error">>, Continued)).
+
 tool_calls_finish_without_calls_test() ->
     {_Table, Opts} =
         setup([reply_with(#{ <<"content">> => <<"x">> }, <<"tool_calls">>)]),
@@ -1962,13 +2175,32 @@ invalid_response_test() ->
     ).
 
 inference_device_failure_test() ->
-    Crashing = #{ <<"completions">> => fun(_, _, _) -> error(runtime_down) end },
+    Crashing =
+        #{ <<"completions">> =>
+            fun(_, _, _) -> error({runtime_down, <<"http://10.0.0.7:30001">>}) end },
     Result = run_agent(#{}, #{ <<"agent-inference-device">> => Crashing }),
     ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
     ?assertEqual(<<"The model call failed.">>, maps:get(<<"agent-answer">>, Result)),
     ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)),
-    Detail = maps:get(<<"agent-error-detail">>, Result),
-    ?assert(contains(maps:get(<<"message">>, Detail), <<"runtime_down">>)).
+    ?assertEqual(
+        #{ <<"message">> => <<"the inference call raised an exception">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ).
+
+inference_error_terms_are_not_shown_test() ->
+    Detail = fun(Reply) ->
+        {_Table, Opts} = setup([Reply]),
+        maps:get(<<"agent-error-detail">>, run_agent(#{}, Opts))
+    end,
+    ?assertEqual(#{ <<"message">> => <<"timeout">> }, Detail({error, timeout})),
+    ?assertEqual(
+        #{ <<"message">> => <<"the inference call failed">> },
+        Detail({error, {connect_failed, <<"http://10.0.0.7:30001">>}})
+    ),
+    ?assertEqual(
+        #{ <<"message">> => <<"the inference call failed">> },
+        Detail({error, #{ <<"peer">> => <<"http://10.0.0.7:30001">> }})
+    ).
 
 %%% Routing and authority.
 
@@ -2083,7 +2315,32 @@ agent_tools_selects_a_subset_test() ->
                  Names([<<"get_arweave_tx">>, <<"http_request">>])),
     ?assertEqual([<<"search_messages">>], Names(<<"[\"search_messages\"]">>)),
     ?assertEqual([], Names(<<"unknown_tool">>)),
-    ?assertEqual([], Names(<<"bundle_item">>)).
+    ?assertEqual([], Names(<<"bundle_item">>)),
+    ?assertEqual([], Names(<<>>)),
+    ?assertEqual([], Names([])),
+    ?assertEqual([], Names(<<"[]">>)),
+    ?assertEqual(4, length(Names(#{}))).
+
+invalid_utf8_inputs_test() ->
+    {Table, Opts} = setup([answer_reply(<<"ok">>)]),
+    Result =
+        run_agent(
+            #{ <<"agent-disable-tools">> => <<"tr", 255, "ue">>,
+               <<"agent-tools">> => <<"lookup_data,", 255, " b">>,
+               <<"agent-max-iterations">> => <<"2", 255>> },
+            Opts
+        ),
+    ?assertEqual(<<"ok">>, maps:get(<<"agent-answer">>, Result)),
+    [Request] = model_requests(Table),
+    ?assertEqual(
+        [<<"lookup_data">>],
+        [Name || #{ <<"function">> := #{ <<"name">> := Name } }
+            <- maps:get(<<"tools">>, Request)]
+    ),
+    Names = [Name || #{ name := Name }
+                <- enabled_tools(
+                       #{ <<"agent-tools">> => [<<"http_request">>, <<255>>] }, #{})],
+    ?assertEqual([<<"http_request">>], Names).
 
 bundle_item_is_disabled_by_default_test() ->
     Call = tool_call(<<"b">>, <<"bundle_item">>, #{ <<"data">> => <<"hello">> }),
@@ -2136,7 +2393,22 @@ tool_choice_passthrough_test() ->
     ?assertEqual([<<"required">>, <<"auto">>], Choice(<<"required">>)),
     ?assertEqual([Named, <<"auto">>], Choice(hb_json:encode(Named))),
     ?assertEqual([Named, <<"auto">>], Choice(Named)),
-    ?assertEqual([<<"auto">>, <<"auto">>], Choice(<<"sometimes">>)).
+    ?assertEqual([<<"auto">>, <<"auto">>], Choice(<<"sometimes">>)),
+    Disabled = #{ <<"type">> => <<"function">>,
+                  <<"function">> => #{ <<"name">> => <<"bundle_item">> } },
+    ?assertEqual([<<"auto">>, <<"auto">>], Choice(Disabled)).
+
+tool_choice_none_executes_nothing_test() ->
+    {Table, Opts} =
+        setup([tool_reply([http_call(<<"c">>)]), answer_reply(<<"No tools.">>)]),
+    Result = run_agent(#{ <<"agent-tool-choice">> => <<"none">> }, Opts),
+    ?assertEqual(<<"No tools.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual([], tool_requests(Table, http)),
+    [First, Second] = model_requests(Table),
+    ?assertEqual(<<"none">>, maps:get(<<"tool_choice">>, First)),
+    ?assertEqual(<<"none">>, maps:get(<<"tool_choice">>, Second)),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"the tool choice of this run is none">>)).
 
 %%% Conversation inputs.
 
@@ -2303,18 +2575,24 @@ search_executor_test() ->
         tool_call(<<"n">>, <<"search_messages">>,
             #{ <<"match">> => #{ <<"nested">> => #{ <<"a">> => 1 } } }),
         tool_call(<<"r">>, <<"search_messages">>,
-            #{ <<"match">> => #{ <<"a">> => 1 }, <<"return">> => <<"everything">> })
+            #{ <<"match">> => #{ <<"a">> => 1 }, <<"return">> => <<"everything">> }),
+        tool_call(<<"f">>, <<"search_messages">>,
+            #{ <<"match">> => #{ <<"ratio">> => 1.5, <<"live">> => true } })
     ],
     {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
     _ = run_agent(#{}, Opts),
-    [Search] = tool_requests(Table, search),
+    [Search, Numbers] = tool_requests(Table, search),
     ?assertEqual(
         #{ <<"path">> => <<"only">>, <<"only">> => #{ <<"type">> => <<"Process">> },
            <<"return">> => <<"count">> },
         Search
     ),
+    ?assertEqual(
+        #{ <<"ratio">> => 1.5, <<"live">> => true },
+        maps:get(<<"only">>, Numbers)
+    ),
     [_, Second] = model_requests(Table),
-    [Found, Nested, Return] = tool_contents(maps:get(<<"messages">>, Second)),
+    [Found, Nested, Return, _] = tool_contents(maps:get(<<"messages">>, Second)),
     ?assertEqual(<<"[\"path-a\",\"path-b\"]">>, Found),
     ?assert(contains(Nested, <<"was not executed">>)),
     ?assert(contains(Return, <<"return must be paths, messages or count">>)).
@@ -2338,7 +2616,8 @@ truthy_test() ->
     lists:foreach(fun(V) -> ?assert(truthy(V)) end,
         [true, 1, <<"true">>, <<"TRUE">>, <<"1">>, <<" true ">>]),
     lists:foreach(fun(V) -> ?assertNot(truthy(V)) end,
-        [false, 0, <<"false">>, <<"yes">>, not_found, <<>>]).
+        [false, 0, <<"false">>, <<"yes">>, not_found, <<>>, <<"tr", 255, "ue">>,
+         <<"1", 255>>]).
 
 %%% Live check. It runs only when AGENT_TEST_INFERENCE_PEER names an
 %%% OpenAI-compatible runtime; AGENT_TEST_INFERENCE_PATH,
