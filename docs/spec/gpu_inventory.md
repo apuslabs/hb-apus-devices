@@ -255,11 +255,14 @@ rendered as the strings `"true"` and `"false"`, typed through `ao-types`.
   waits at most the configured timeout. On timeout it closes the port, which
   closes the process's standard input and output; the process ends when it
   next writes output or exits on its own.
-- While the coordinator runs (§6), for each configuration at most one
-  report collection and one snapshot collection are in progress at a time,
-  and a new report collection starts no earlier than
-  `gpu-inventory-cache-ms` after the previous one returned its report.
-  Concurrent requests therefore do not multiply `nvidia-smi` runs.
+- While the coordinator runs (§6), for each configuration it runs at most
+  one report collection and one snapshot collection at a time, and it
+  starts a new report collection no earlier than `gpu-inventory-cache-ms`
+  after the previous one returned its report. Concurrent requests therefore
+  share `nvidia-smi` runs. When a collection process or the coordinator
+  stops without a result, each request that was waiting for it collects for
+  itself in its own process, so those requests run `nvidia-smi`
+  concurrently.
 - The report contains PCI identities, driver and firmware versions and GPU
   UUIDs. It contains no credentials and no file paths.
 
