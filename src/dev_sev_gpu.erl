@@ -8,9 +8,10 @@
 %%% The SDK is reached through the `dev_sev_gpu_nif' wrapper module and its
 %%% shared library, both shipped in the implementation archive. When they are
 %%% not available the device runs the operator-configured `nvattest'
-%%% executable directly, without a shell. Executable paths, limits and the
-%%% backend choice are node options: a request supplies only the nonce and
-%%% the evidence to verify.
+%%% executable directly, without a shell. Every NVAT call is bounded by a
+%%% node-option timeout, and `verify' accepts a bounded amount of evidence.
+%%% Executable paths, limits and the backend choice are node options: a
+%%% request supplies only the nonce and the evidence to verify.
 -module(dev_sev_gpu).
 -implements(<<"sev_gpu@1.0">>).
 -specification("docs/spec/sev_gpu.md").
@@ -31,6 +32,10 @@
 -define(DEFAULT_SCRATCH_DIR, <<"/tmp">>).
 %% Upper bound on the bytes read from one `nvattest' run.
 -define(MAX_NVATTEST_OUTPUT, 16777216).
+%% Upper bounds on the evidence `verify' accepts: the number of entries, and
+%% the bytes of a JSON body and of the evidence array's JSON encoding.
+-define(MAX_EVIDENCES, 16).
+-define(MAX_EVIDENCE_BYTES, 1048576).
 %% NVIDIA GPU attestation reports bind a 32-byte nonce.
 -define(NONCE_HEX_LENGTH, 64).
 
@@ -144,6 +149,8 @@ first_defined([undefined | Rest]) -> first_defined(Rest);
 first_defined([not_found | Rest]) -> first_defined(Rest);
 first_defined([Value | _]) -> Value.
 
+evidences_from(Bin) when is_binary(Bin), byte_size(Bin) > ?MAX_EVIDENCE_BYTES ->
+    {error, evidence_too_large};
 evidences_from(Bin) when is_binary(Bin) ->
     try hb_json:decode(Bin) of
         Decoded -> evidences_from_term(Decoded)
@@ -156,12 +163,26 @@ evidences_from(Term) ->
 evidences_from_term(#{ <<"evidences">> := Evidences }) ->
     evidences_from_term(Evidences);
 evidences_from_term([_ | _] = Evidences) ->
-    case lists:all(fun is_evidence/1, Evidences) andalso encodable(Evidences) of
-        true -> {ok, Evidences};
-        false -> {error, invalid_evidence}
+    maybe
+        {ok, Count} ?= entry_count(Evidences, 0),
+        true ?= Count =< ?MAX_EVIDENCES orelse {error, too_many_evidences},
+        true ?= lists:all(fun is_evidence/1, Evidences),
+        {ok, Size} ?= encoded_size(Evidences),
+        true ?= Size =< ?MAX_EVIDENCE_BYTES orelse {error, evidence_too_large},
+        {ok, Evidences}
+    else
+        {error, _} = Error -> Error;
+        _ -> {error, invalid_evidence}
     end;
 evidences_from_term(_) ->
     {error, invalid_evidence}.
+
+%% @doc The number of list entries, counted up to one past the limit, or
+%% `error' for an improper list.
+entry_count([], Count) -> {ok, Count};
+entry_count(_, Count) when Count > ?MAX_EVIDENCES -> {ok, Count};
+entry_count([_ | Rest], Count) -> entry_count(Rest, Count + 1);
+entry_count(_, _Count) -> error.
 
 %% @doc An NVAT GPU evidence entry carries these four UTF-8 string fields.
 is_evidence(Evidence) when is_map(Evidence) ->
@@ -177,12 +198,13 @@ is_text(Value) when is_binary(Value) ->
 is_text(_) ->
     false.
 
-%% @doc Evidence reaches NVAT as JSON, so it must encode as JSON.
-encodable(Term) ->
+%% @doc Evidence reaches NVAT as JSON: the byte size of its compact JSON
+%% encoding, or `error' when it does not encode as JSON.
+encoded_size(Term) ->
     try hb_json:encode(Term) of
-        _ -> true
+        JSON -> {ok, iolist_size(JSON)}
     catch
-        _:_ -> false
+        _:_ -> error
     end.
 
 %% @doc Every evidence entry must carry the same valid nonce.
@@ -214,8 +236,8 @@ collect(auto, Nonce, Opts) ->
         {error, nif_unavailable} -> collect(nvattest, Nonce, Opts);
         Result -> Result
     end;
-collect(nif, Nonce, _Opts) ->
-    case nif_call(collect_evidence, [Nonce]) of
+collect(nif, Nonce, Opts) ->
+    case nif_call(collect_evidence, [Nonce], Opts) of
         {ok, JSON} ->
             Report = decode_object(JSON),
             {ok,
@@ -228,6 +250,7 @@ collect(nif, Nonce, _Opts) ->
                 )
             };
         {error, nif_unavailable} = Error -> Error;
+        {error, nif_timeout} = Error -> Error;
         {error, Reason} -> {error, {nvat_error, Reason}}
     end;
 collect(nvattest, Nonce, Opts) ->
@@ -260,7 +283,7 @@ check(nif, Evidences, Nonce, Opts) ->
             <<"evidences">> => Evidences,
             <<"scratch-dir">> => scratch_dir(Opts)
         }),
-    case nif_call(verify_evidence, [Request]) of
+    case nif_call(verify_evidence, [Request], Opts) of
         {ok, JSON} ->
             Report = decode_object(JSON),
             {ok,
@@ -268,6 +291,7 @@ check(nif, Evidences, Nonce, Opts) ->
                     claims_verified(as_list(maps:get(<<"claims">>, Report, [])), Nonce)
             };
         {error, nif_unavailable} = Error -> Error;
+        {error, nif_timeout} = Error -> Error;
         {error, Reason} -> {error, {nvat_error, Reason}}
     end;
 check(nvattest, Evidences, Nonce, Opts) ->
@@ -362,18 +386,38 @@ same_hex(_, _) ->
 %%% NIF backend
 %%% ------------------------------------------------------------------
 
-%% @doc Call a function of the NIF wrapper, loading it on first use.
-nif_call(Function, Args) ->
+%% @doc Call a function of the NIF wrapper, loading it on first use, and
+%% wait at most the NIF timeout (`nif_timeout/1') for its result.
+nif_call(Function, Args, Opts) ->
     case nif() of
         ok ->
-            try apply(?NIF_MODULE, Function, Args)
-            catch
-                error:not_loaded -> {error, nif_unavailable};
-                error:{not_loaded, _} -> {error, nif_unavailable};
-                error:undef -> {error, nif_unavailable}
-            end;
+            bounded(fun() -> nif_apply(Function, Args) end, nif_timeout(Opts));
         {error, _} ->
             {error, nif_unavailable}
+    end.
+
+nif_apply(Function, Args) ->
+    try apply(?NIF_MODULE, Function, Args)
+    catch
+        error:not_loaded -> {error, nif_unavailable};
+        error:{not_loaded, _} -> {error, nif_unavailable};
+        error:undef -> {error, nif_unavailable}
+    end.
+
+%% @doc Run `Fun' in a monitored process and return its result, or
+%% `{error, nif_timeout}' when it has not returned within `Timeout'
+%% milliseconds. The process is then killed and its result discarded; a NIF
+%% call it is running finishes on its dirty scheduler before the process
+%% exits. A process that ends without a result yields an error text.
+bounded(Fun, Timeout) ->
+    {Pid, Monitor} = spawn_monitor(fun() -> exit({nif_result, Fun()}) end),
+    receive
+        {'DOWN', Monitor, process, Pid, {nif_result, Result}} -> Result;
+        {'DOWN', Monitor, process, Pid, _Reason} -> {error, <<"NIF call failed">>}
+    after Timeout ->
+        exit(Pid, kill),
+        erlang:demonitor(Monitor, [flush]),
+        {error, nif_timeout}
     end.
 
 %% @doc Make sure the wrapper module and its NVAT library are loaded.
@@ -444,22 +488,29 @@ report_once(Tag, Format, Args) ->
             io:format(standard_error, Format, Args)
     end.
 
-%% @doc The first directory that holds the wrapper module: the implementation
-%% directory where Device Forge extracts the archive's `priv' resources (or
-%% its `dev_sev_gpu/' subdirectory), then `src/dev_sev_gpu/priv' below the
-%% working directory of a source checkout.
+%% @doc The first directory of `native_dirs/1' that holds the wrapper
+%% module.
 native_dir() ->
-    ImplDirs =
-        try hb_device_archive:implementation_dir(?MODULE) of
-            ImplDir -> [filename:join(ImplDir, ?NATIVE_SUBDIR), ImplDir]
-        catch
-            _:_ -> []
-        end,
-    Candidates = ImplDirs ++ [filename:absname(filename:join(["src", ?NATIVE_SUBDIR, "priv"]))],
+    Candidates = native_dirs(hb_device_name:is_generated(?MODULE)),
     case [Dir || Dir <- Candidates, filelib:is_regular(filename:join(Dir, ?NIF_FILE ++ ".beam"))] of
         [Dir | _] -> {ok, Dir};
         [] -> {error, wrapper_missing}
     end.
+
+%% @doc Where the wrapper module may be. A device loaded from an
+%% implementation archive, whose module carries a Device Forge generated
+%% name, uses only the archive's extracted resources: `dev_sev_gpu/' below
+%% its implementation directory, then that directory itself. A device
+%% compiled under its source name uses `src/dev_sev_gpu/priv' below the
+%% node's working directory.
+native_dirs(true) ->
+    try hb_device_archive:implementation_dir(?MODULE) of
+        ImplDir -> [filename:join(ImplDir, ?NATIVE_SUBDIR), ImplDir]
+    catch
+        _:_ -> []
+    end;
+native_dirs(false) ->
+    [filename:absname(filename:join(["src", ?NATIVE_SUBDIR, "priv"]))].
 
 %%% ------------------------------------------------------------------
 %%% nvattest backend
@@ -480,7 +531,7 @@ nvattest_path(Opts) ->
 %% The exit status is not used: NVAT reports its outcome in `result_code'.
 nvattest(Path, Args, Opts) ->
     FullArgs = [<<"--format">>, <<"json">> | Args],
-    case run(Path, FullArgs, [{"NVAT_LOG_LEVEL", "off"}], timeout(Opts)) of
+    case run(Path, FullArgs, [{"NVAT_LOG_LEVEL", "off"}], nvattest_timeout(Opts)) of
         {ok, _Status, Output} ->
             case decode_object(Output) of
                 Decoded when map_size(Decoded) > 0 -> {ok, Decoded};
@@ -564,16 +615,27 @@ scratch_dir(Opts) ->
         Dir -> Dir
     end.
 
-timeout(Opts) ->
-    case hb_opts:get(<<"sev-gpu-nvattest-timeout">>, ?DEFAULT_NVATTEST_TIMEOUT_MS, Opts) of
-        Timeout when is_integer(Timeout), Timeout > 0 -> Timeout;
+%% @doc The limit, in milliseconds, for one `nvattest' run.
+nvattest_timeout(Opts) ->
+    positive_option(<<"sev-gpu-nvattest-timeout">>, ?DEFAULT_NVATTEST_TIMEOUT_MS, Opts).
+
+%% @doc The limit, in milliseconds, for one NIF call. It defaults to the
+%% `nvattest' limit.
+nif_timeout(Opts) ->
+    positive_option(<<"sev-gpu-nif-timeout">>, nvattest_timeout(Opts), Opts).
+
+%% @doc A positive integer node option, given as an integer or a decimal
+%% string; other values select `Default'.
+positive_option(Key, Default, Opts) ->
+    case hb_opts:get(Key, Default, Opts) of
+        Value when is_integer(Value), Value > 0 -> Value;
         Bin when is_binary(Bin) ->
             try binary_to_integer(Bin) of
-                Timeout when Timeout > 0 -> Timeout;
-                _ -> ?DEFAULT_NVATTEST_TIMEOUT_MS
-            catch _:_ -> ?DEFAULT_NVATTEST_TIMEOUT_MS
+                Value when Value > 0 -> Value;
+                _ -> Default
+            catch _:_ -> Default
             end;
-        _ -> ?DEFAULT_NVATTEST_TIMEOUT_MS
+        _ -> Default
     end.
 
 %% @doc Read a node option as a binary; non-text values read as `<<>>'.
@@ -901,6 +963,74 @@ evidence_must_be_text_test() ->
     ?assertEqual({error, invalid_evidence},
         verify(#{}, #{<<"body">> => <<"[{\"arch\":1}]">>}, #{})).
 
+evidence_count_is_bounded_test() ->
+    Entry = test_evidence(?TEST_NONCE),
+    Missing = cli_opts("/nonexistent/nvattest", #{}),
+    %% Sixteen entries pass validation and reach the backend.
+    ?assertEqual({error, nvattest_not_found},
+        verify(#{}, #{<<"evidences">> => lists:duplicate(16, Entry)}, Missing)),
+    ?assertEqual({error, too_many_evidences},
+        verify(#{}, #{<<"evidences">> => lists:duplicate(17, Entry)}, Missing)),
+    ?assertEqual({error, too_many_evidences},
+        verify(#{}, #{<<"body">> => hb_json:encode(lists:duplicate(17, Entry))}, Missing)),
+    ?assertEqual({error, too_many_evidences},
+        verify(#{}, #{<<"body">> => hb_json:encode(
+            #{ <<"evidences">> => lists:duplicate(17, Entry) })}, Missing)).
+
+evidence_size_is_bounded_test() ->
+    Missing = cli_opts("/nonexistent/nvattest", #{}),
+    Empty = test_evidence(?TEST_NONCE),
+    Overhead = byte_size(hb_json:encode([Empty#{ <<"evidence">> => <<>> }])),
+    Sized = fun(Bytes) ->
+        [Empty#{ <<"evidence">> => binary:copy(<<"A">>, Bytes - Overhead) }]
+    end,
+    ?assertEqual(1048576, byte_size(hb_json:encode(Sized(1048576)))),
+    %% An evidence array whose JSON encoding is exactly 1 MiB is accepted.
+    ?assertEqual({error, nvattest_not_found},
+        verify(#{}, #{<<"evidences">> => Sized(1048576)}, Missing)),
+    ?assertEqual({error, nvattest_not_found},
+        verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048576))}, Missing)),
+    ?assertEqual({error, evidence_too_large},
+        verify(#{}, #{<<"evidences">> => Sized(1048577)}, Missing)),
+    %% A body above 1 MiB is rejected before it is decoded.
+    ?assertEqual({error, evidence_too_large},
+        verify(#{}, #{<<"body">> => hb_json:encode(Sized(1048577))}, Missing)),
+    ?assertEqual({error, evidence_too_large},
+        verify(#{}, #{<<"body">> => binary:copy(<<" ">>, 1048577)}, Missing)).
+
+nif_calls_are_bounded_test() ->
+    ?assertEqual({ok, <<"{}">>}, bounded(fun() -> {ok, <<"{}">>} end, 1000)),
+    {Micros, Result} = timer:tc(fun() ->
+        bounded(fun() -> timer:sleep(5000), {ok, <<"late">>} end, 100)
+    end),
+    ?assertEqual({error, nif_timeout}, Result),
+    ?assert(Micros < 2000000),
+    ?assertEqual({error, <<"NIF call failed">>}, bounded(fun() -> exit(stopped) end, 1000)),
+    %% No monitor message is left behind.
+    receive {'DOWN', _, process, _, _} = Stray -> ?assertEqual(none, Stray)
+    after 0 -> ok
+    end.
+
+nif_timeout_option_test() ->
+    ?assertEqual(60000, nif_timeout(#{})),
+    ?assertEqual(5000, nif_timeout(#{ <<"sev-gpu-nvattest-timeout">> => 5000 })),
+    ?assertEqual(250, nif_timeout(#{
+        <<"sev-gpu-nvattest-timeout">> => 5000,
+        <<"sev-gpu-nif-timeout">> => <<"250">>
+    })),
+    ?assertEqual(5000, nif_timeout(#{
+        <<"sev-gpu-nvattest-timeout">> => 5000,
+        <<"sev-gpu-nif-timeout">> => 0
+    })),
+    ?assertEqual(60000, nvattest_timeout(#{ <<"sev-gpu-nvattest-timeout">> => <<"soon">> })).
+
+native_dirs_follow_the_module_origin_test() ->
+    Checkout = filename:absname("src/dev_sev_gpu/priv"),
+    ?assertEqual([Checkout], native_dirs(false)),
+    ImplDir = hb_device_archive:implementation_dir(?MODULE),
+    ?assertEqual([filename:join(ImplDir, "dev_sev_gpu"), ImplDir], native_dirs(true)),
+    ?assertNot(lists:member(Checkout, native_dirs(true))).
+
 wrapper_origin_is_compared_test() ->
     ?assert(same_beam("/opt/hb/dev_sev_gpu/dev_sev_gpu_nif.beam",
         "/opt/hb/dev_sev_gpu/dev_sev_gpu_nif")),
@@ -940,6 +1070,7 @@ verify_test() ->
     end.
 
 attestation_unavailable(nif_unavailable) -> true;
+attestation_unavailable(nif_timeout) -> true;
 attestation_unavailable(nvattest_not_found) -> true;
 attestation_unavailable(nvattest_timeout) -> true;
 attestation_unavailable(nvattest_invalid_response) -> true;
