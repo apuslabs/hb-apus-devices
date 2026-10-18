@@ -82,6 +82,7 @@ Node options:
 | Option | Default | Meaning |
 |---|---|---|
 | `receipt-wallet-location` | unset | Path of the wallet file that signs published data items. Unset: the node wallet signs them. |
+| `receipt-publishers` | unset | List of addresses allowed to call `publish` (§4, §7). Unset: any caller. |
 | `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx` | unset | Execution bindings recorded when the request declares none (§5). |
 
 The runtime route, the attestation device and the inventory and measurement
@@ -104,11 +105,23 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      `receipt-streaming-unsupported` (§8).
   3. Resolve `{"device": "inference@1.0"}` with the executed request, using
      the node options plus `hashpath: update` and `cache-control: no-store,
-     no-cache`. An error from this step is returned unchanged.
+     no-cache`. An `{error, _}` result is returned unchanged; any other
+     result that is not `{ok, _}` is returned as `{error, Reason}`.
   4. Resolve `gpu_inventory@1.0` with `path: report`, and
      `inference_measurement@1.0` with `path: fresh` and `nonce:
-     <request-digest>`. Each result is accepted bare or inside a
-     `{status, body}` envelope; a failed probe contributes an empty object.
+     <request-digest>`; nothing else is sent. Each `{ok, Result}` is read
+     with this rule:
+     - a map with a `type` key is the result itself (a bare result; bare
+       results MUST carry `type`, and their `body` is never unwrapped);
+     - a map without `type` whose `body` is a map is that `body`;
+     - a map without `type` whose `body` is a binary is that binary decoded
+       as a JSON object, or `{}` when it is not one;
+     - a map without `type` whose `body` is any other value is `{}`;
+     - a map without `type` and without `body` is the result itself;
+     - any other value is `{}`.
+
+     A probe that returns anything but `{ok, _}`, or fails, contributes `{}`
+     and the completion continues.
   5. Build the receipt (§5), commit it with the node's identity, and return
      the `inference@1.0` response with `body` and `data` replaced by the
      response JSON object plus `receipt` (or `{"response": <body>,
@@ -177,14 +190,21 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 
 ### `publish` — store a receipt as an ANS-104 data item
 
-- **Reads:** the request's `receipt`, else its `body`; the node option
+- **Reads:** the request's `receipt`, else its `body`; the request's
+  commitments; the node options `receipt-publishers` and
   `receipt-wallet-location`.
 - **Behaviour:**
-  1. Without `receipt` and `body`, return the 400 error `receipt-required`.
-  2. The data is the value itself when it is a binary, otherwise its JSON
+  1. When `receipt-publishers` is set, the request MUST carry a commitment by
+     a listed address that covers the published key (`receipt` when the
+     request has it, else `body`) and verifies against the request as the
+     device receives it. Otherwise return the 403 error
+     `receipt-publisher-not-allowed`. A value of `receipt-publishers` that is
+     not a list refuses every request.
+  2. Without `receipt` and `body`, return the 400 error `receipt-required`.
+  3. The data is the value itself when it is a binary, otherwise its JSON
      encoding. The device commits `{data, content-type: application/json}`
      with `ans104@1.0`, signed by the publication wallet.
-  3. Resolve `bundler@1.0` with `path: item`, `await: true` and a bundle
+  4. Resolve `bundler@1.0` with `path: item`, `await: true` and a bundle
      limit of one item, and wait until the bundle is posted.
 - **Returns:** `{ok, #{id, bundle-id, bundle-status => complete, body =>
   BundlerResponse}}` (served as HTTP 200), or the errors of §8.
@@ -194,7 +214,8 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 ## 5. Data formats & encodings
 
 **Receipt.** The `receipt` object has these keys; a key without a value
-(for example `model` when the request names none) is omitted:
+(for example `model` when the request names none) is omitted, in the
+`receipt` message and in the JSON body alike:
 
 | Key | Value |
 |---|---|
@@ -216,7 +237,7 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 | `ao-core` | Execution evidence (below). |
 | `device-chain` | `status` (`captured`), `receipt-device`, `measurement-device`, `inventory-device` and `loader` (`HyperBEAM Device Forge preloaded-store`). |
 | `receipt-id` | Signed ID of `signed-receipt`. |
-| `signed-receipt` | The receipt above (without `receipt-id`, `signed-receipt` and `node-address`), committed with the node's identity. |
+| `signed-receipt` | The receipt above (without `receipt-id`, `signed-receipt` and `node-address`), committed with the node's identity through the node's `commitment-device` (HyperBEAM default `httpsig@1.0`). |
 | `node-address` | The address that signed `signed-receipt`; present when the commitment succeeded. |
 
 `system-measurement` holds `measurement-id`, `status` (`measured` when the
@@ -242,9 +263,13 @@ measurement integrates `measurement@1.0`, otherwise `observed`),
 | `verification-input-term` | The same transcript as an unpadded base64url compressed Erlang external term, which preserves private keys. |
 | `verification-status` | `verified` or `failed` when the recomputed HashPath equals or differs from `hashpath`; `unavailable` when it cannot be recomputed; `not-captured` when nothing was recorded. |
 
-In the JSON body, values are made JSON-safe: absent values are omitted,
-AO-Core links become `{"id", "type": "link", "metadata"}` objects, and other
-tuples become strings.
+**JSON form.** The receipt is built in its JSON form before it is committed:
+absent values are removed, AO-Core links become `{"id", "type": "link",
+"metadata"}` objects, other tuples become strings, and every value is the
+one a JSON decoder yields after encoding. The `receipt` message and the
+receipt in the JSON body therefore carry the same values, and
+`signed-receipt` taken from the decoded JSON body verifies with
+`hb_message:verify` and has `node-address` as its only signer.
 
 **`verify-hashpath` input and result.** The input is a JSON object with
 `ao-core`, or with `receipt` (whose `ao-core` is used), or with
@@ -289,10 +314,18 @@ client may read it as the string `"true"` or `"false"`.
   publication wallet: the wallet at `receipt-wallet-location` when set, which
   keeps upload funds separate from the node's identity, otherwise the node
   wallet.
-- **Publishing spends funds.** The device does not authenticate callers of
-  `publish`; anyone who can reach it can have the node sign and pay for a
-  data item. Operators SHOULD restrict `publish` to trusted clients, for
-  example at the gateway.
+- **Publishing spends funds.** Each `publish` call signs a data item and pays
+  for its upload. Without `receipt-publishers`, any caller that reaches the
+  key can do so. An operator MUST either set `receipt-publishers` or block
+  `publish` for untrusted callers in front of the node.
+- **Publisher authority.** With `receipt-publishers` set, authority comes
+  from a verified commitment by a listed address over the published key.
+  HyperBEAM routes `/~inference_receipt@1.0/publish` to this key with `path:
+  publish`, so a commitment that also covers `path` does not verify and is
+  refused; publishers commit to the published key alone and send the signed
+  message to that path. The device does not detect replays: a captured
+  signed request publishes its data again, so publishers SHOULD send signed
+  requests only over private or encrypted channels.
 - **Posted evidence is data.** `verify-hashpath` reads posted values without
   device dispatch and decodes Erlang terms in safe mode.
 - **What a HashPath proves.** A verified HashPath shows that the recorded
@@ -307,6 +340,7 @@ client may read it as the string `"true"` or `"false"`.
 | `completions` | `inference@1.0` error | as returned | as returned (see `inference@1.0` §8) |
 | `verify-hashpath` | transcript recomputation fails | 422 | `{"verified": false, "error": "invalid-hashpath-transcript"}` |
 | `verify-hashpath` | no usable transcript | 422 | `{"verified": false, "error": "hashpath-verification-input-missing", "reason": ...}` |
+| `publish` | `receipt-publishers` set and no verified commitment by a listed address over the published key | 403 | `{"error": "receipt-publisher-not-allowed"}` |
 | `publish` | no `receipt` or `body` | 400 | `{"error": "receipt-required"}` |
 | `publish` | bundle not complete | 502 | `{"error": "receipt-publish-incomplete"}` |
 | `publish` | bundler error or failure | 502 | `{"error": "receipt-publish-failed", "reason": ...}` |
@@ -328,9 +362,10 @@ client may read it as the string `"true"` or `"false"`.
   inventory report and the fresh measurement bound to `request-digest`.
 - **`bundler@1.0` and `ans104@1.0`.** Store published receipts on Arweave.
 - **Verification workflow.** A verifier recomputes `request-digest` from the
-  transcript's request, checks the HashPath with `verify-hashpath`, checks
-  `signed-receipt` against `node-address`, and checks the measurement and the
-  `inference@1.0` attestation with their own devices' rules.
+  transcript's request, checks the HashPath with `verify-hashpath`, verifies
+  `signed-receipt` (as decoded from the JSON body) and compares its signer
+  with `node-address`, and checks the measurement and the `inference@1.0`
+  attestation with their own devices' rules.
 - **Public gateway (informative).** On the reference deployment a gateway in
   front of the node publishes, through `publish`, a record of each successful
   completion that carries an attestation (`tee=true`), and adds
@@ -351,14 +386,17 @@ client may read it as the string `"true"` or `"false"`.
    credentials, inventory root or measurement mode.
 6. `request-digest` is the digest of the executed request, and the
    measurement is requested with that digest as its nonce.
-7. The receipt has the keys of §5 and no others, is committed with the
-   node's identity, and `node-address` is the committing address.
+7. The receipt has the keys of §5 and no others, is committed in its JSON
+   form with the node's identity, `node-address` is the committing address,
+   and `signed-receipt` decoded from the JSON body verifies.
 8. The response's `body` carries the runtime's JSON with `receipt` added.
 9. `verify-hashpath` reports `verified: true` exactly when every recorded
    HashPath equals the one recomputed from `base` and `request` (and the
    chain check holds when `rest` is given), and 422 for unusable input.
 10. `publish` signs an ANS-104 item with the publication wallet, waits for
-    the bundle and returns the item `id` at the top level.
+    the bundle and returns the item `id` at the top level; with
+    `receipt-publishers` set, it first refuses with 403 any request without
+    a verified commitment by a listed address over the published key.
 11. `models` and `health` return the `inference@1.0` result unchanged and
     create no receipt.
 
@@ -370,4 +408,5 @@ client may read it as the string `"true"` or `"false"`.
   reports, defined by their devices.
 - Checking declarations against deployed artifacts.
 - Indexing, serving and querying published receipts.
-- Authentication and rate limiting of callers.
+- Authentication and rate limiting of callers, beyond the
+  `receipt-publishers` check of `publish`.

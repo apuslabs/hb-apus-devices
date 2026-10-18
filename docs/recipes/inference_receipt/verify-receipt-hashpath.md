@@ -28,5 +28,5 @@ node encodes `verified` as the string `true` (typed through `ao-types`). The
 recorded response is linked to the recorded base message and request; both
 recorded copies of the HashPath (the public `ao-core.hashpath` and the private
 copy inside `verification-input-term`) match the recomputed value. A
-transcript whose request differs from the recorded one yields `False` with
+transcript whose request differs from the recorded one yields `false` with
 `reason` `hashpath-mismatch`.

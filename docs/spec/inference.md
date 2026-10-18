@@ -39,6 +39,8 @@ SEV-SNP guest with an NVIDIA H100 in confidential-computing mode;
 - **Runtime:** the OpenAI-compatible HTTP server that performs inference. It
   is addressed by the node options in §3 and reached only through
   `relay@1.0`.
+- **Runtime origin:** the `scheme://host:port` the device derives from the
+  `inference-peer` node option (§3).
 - **Generation parameters:** the OpenAI request fields the device relays when
   it builds the runtime payload itself: `model`, `prompt`, `messages`,
   `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `n`,
@@ -88,13 +90,35 @@ message):
 
 | Option | Default | Meaning |
 |---|---|---|
-| `inference-peer` | `http://localhost:30001` | Base URL of the runtime; a trailing `/` is ignored. |
+| `inference-peer` | `http://localhost:30001` | Origin of the runtime (rules below). |
 | `inference-path` | `/v1/chat/completions` | Path for `completions`. |
 | `inference-models-path` | `/v1/models` | Path for `models`. |
 | `inference-health-path` | `/health` | Path for `health`. |
 | `inference-api-key` | unset | Bearer token sent to the runtime when set to a non-empty binary. |
 | `inference-attestation-device` | `sev_gpu@1.0` | Device resolved with `generate` and `nonce` for `tee=true`. |
 | `inference-opts` | unset | Map of declared model and runtime facts reported in `resolved_model` (§5). |
+
+**Runtime origin.** HyperBEAM's HTTP clients connect to a peer's host and
+port only, and use TLS exactly when the port is 443. `inference-peer` is
+therefore an origin, not a base URL:
+
+- the scheme is `http` or `https` (any letter case);
+- the port is explicit, or implied: 80 for `http`, 443 for `https`;
+- `https` requires port 443, and `http` MUST NOT use port 443;
+- there is no path other than `/`, no query, no fragment and no user
+  information, and the host is non-empty and not an IPv6 literal.
+
+A runtime served under a path prefix is configured through the three path
+options, for example `inference-path: /openai/v1/chat/completions`. A path
+without a leading `/` gets one. When `inference-peer` breaks these rules,
+`completions`, `models` and `health` answer the 500 error
+`runtime_misconfigured` (§8) and send nothing.
+
+**HTTP client.** Runtime calls use the node's `http-client` option (HyperBEAM
+default `hackney`) in place of `relay@1.0`'s `relay-http-client`, so the
+node's HTTP client timeouts apply; for `hackney` these are
+`http-client-connect-timeout` and `http-client-hackney-recv-timeout`. A
+runtime that does not answer within them is reported as unreachable (503).
 
 ## 4. Resolved keys (normative)
 
@@ -108,13 +132,14 @@ message):
 - **Behaviour:**
   1. If the request's `stream` is truthy, or the request's `body` is a JSON
      object (or a map) whose `stream` is truthy, return the 400 error
-     `streaming_unsupported` (§8). The runtime is not called.
+     `streaming_unsupported` (§8). The runtime is not called. An unusable
+     `inference-peer` is reported next, as in §3.
   2. Build the runtime payload. If the request has a binary `body`, it is the
      payload, unchanged. If `body` is a map, the payload is that map encoded
      as JSON after removing `commitments` and private keys. Otherwise the
      payload is a JSON object of the generation parameters present on the
      request.
-  3. Send `POST <inference-peer><inference-path>` through `relay@1.0` with
+  3. Send `POST <runtime origin><inference-path>` through `relay@1.0` with
      `content-type: application/json` and, when `inference-api-key` is set,
      `authorization: Bearer <key>`.
   4. A runtime response with status 200-299 is a success (a relay result
@@ -153,8 +178,9 @@ message):
 
 - **Reads:** node options `inference-peer`, `inference-models-path`,
   `inference-api-key`. Nothing from the base message or the request.
-- **Behaviour:** send `GET <inference-peer><inference-models-path>` through
-  `relay@1.0`. The device adds, removes and rewrites nothing in the answer.
+- **Behaviour:** send `GET <runtime origin><inference-models-path>` through
+  `relay@1.0`, with `authorization` as for `completions`. The device adds,
+  removes and rewrites nothing in the answer.
 - **Returns:** on a 2xx answer, `{ok, Result}` with the runtime's status,
   `content-type` (default `application/json`) and body; otherwise the error
   of §8, HTTP-shaped.
@@ -163,8 +189,9 @@ message):
 
 - **Reads:** node options `inference-peer`, `inference-health-path`,
   `inference-api-key`. Nothing from the base message or the request.
-- **Behaviour:** send `GET <inference-peer><inference-health-path>` through
-  `relay@1.0`. A 2xx answer is healthy.
+- **Behaviour:** send `GET <runtime origin><inference-health-path>` through
+  `relay@1.0`, with `authorization` as for `completions`. A 2xx answer is
+  healthy.
 - **Returns:** when healthy, `{ok, #{healthy => true, runtime-status =>
   <status>, checked-at => <Unix milliseconds>}}` (served as HTTP 200);
   otherwise the error of §8, HTTP-shaped.
@@ -237,8 +264,11 @@ error whose body is a JSON object is returned with that body unchanged.
   answered from, or written to, the result cache.
 - Every `raw` contains a fresh `timestamp` and random `nonce`, so two
   attestations never share an attestation nonce, even for identical prompts.
-- `health` reports the runtime's state at call time. A node that caches
-  resolution results SHOULD exclude this device's keys.
+- `health` reports the runtime's state at call time. Because runtime calls
+  carry the node HTTP client's timeouts (§3), a runtime that accepts the
+  connection and never answers is reported as unavailable once the receive
+  timeout expires. A node that caches resolution results SHOULD exclude this
+  device's keys.
 
 ## 7. Security & authority
 
@@ -247,9 +277,10 @@ error whose body is a JSON object is returned with that body unchanged.
   named `inference-*` or `agent-api-*` on the request or the base message
   have no effect. A caller therefore cannot make the node contact another
   host, nor obtain an attestation for a response from another server.
-- **Credential handling.** `inference-api-key` is sent only to
-  `inference-peer`, as `authorization: Bearer <key>`. It is never recorded
-  in `raw` and never returned.
+- **Credential handling.** `inference-api-key` is sent only to the runtime
+  origin, as `authorization: Bearer <key>`. It is never recorded in `raw`
+  and never returned. Over `http` it travels in clear text, so a runtime
+  outside the node's host SHOULD be reached over `https`.
 - **Published data.** `raw` records only the public request. HTTP headers
   (including `cf-*`, `x-forwarded-*`, `x-real-ip`, `user-agent`, cookies and
   credentials), the `user` identifier and the caller's private address are
@@ -278,7 +309,8 @@ error whose body is a JSON object is returned with that body unchanged.
 | Runtime answers 400-599 with a JSON object | runtime status | — | The runtime's body, unchanged. |
 | Runtime answers 400-599 with another body | runtime status | `runtime_error` / `runtime_error` | Device error object. |
 | Runtime answers a status outside 200-299 and 400-599 | 500 | `runtime_error` / `runtime_error` | Device error object, or the runtime's JSON object. |
-| Runtime unreachable, or the relay fails | 503 | `runtime_unavailable` / `runtime_unavailable` | Device error object. |
+| Runtime unreachable, a client timeout expires, or the relay fails | 503 | `runtime_unavailable` / `runtime_unavailable` | Device error object. |
+| `inference-peer` is not a supported runtime origin (§3) | 500 | `server_error` / `runtime_misconfigured` | Device error object. |
 
 - When the runtime's error response carries `retry-after`, the HTTP-shaped
   error result carries the same `retry-after` key.
@@ -290,8 +322,9 @@ error whose body is a JSON object is returned with that body unchanged.
 ## 9. Composition
 
 - **`relay@1.0`.** Every runtime call is a `relay@1.0` `call` with the
-  configured peer; the relay's node options (for example
-  `relay-http-client`) apply.
+  runtime origin as `peer` and the configured path. The device sets the
+  relay's HTTP client to the node's `http-client` (§3); the relay's other
+  node options apply.
 - **Attestation device.** The default `sev_gpu@1.0` answers `generate` with
   NVIDIA GPU evidence for the nonce. Any device that answers `generate` with
   a JSON object or a map can be configured instead.
@@ -315,14 +348,17 @@ error whose body is a JSON object is returned with that body unchanged.
    `health`, and `info` lists exactly these keys.
 2. The runtime's address, paths, credential and attestation device are read
    only from the node options of §3, with the stated defaults.
-3. A request or base message carrying `inference-*` or `agent-api-*` keys
-   produces the same runtime traffic as one without them.
+3. Keys named `inference-*` or `agent-api-*` on the request or the base
+   message have no effect on the runtime origin, the paths, the credential
+   or the attestation device.
 4. `completions` rejects a truthy `stream`, on the request or in its `body`,
    with status 400 before contacting the runtime.
 5. The runtime payload is the binary `body` unchanged, a map `body` without
    `commitments` and private keys, or the generation parameters present on
    the request.
-6. All runtime calls go through `relay@1.0`.
+6. All runtime calls go through `relay@1.0`, use the node's `http-client`,
+   and go to the runtime origin; an `inference-peer` outside the rules of §3
+   yields 500 `runtime_misconfigured` without any runtime call.
 7. A 2xx runtime answer to `models`, or to `completions` without `tee`, is
    returned with the runtime's status, content type and body.
 8. Runtime statuses 400-599 are passed through, with the runtime's JSON
@@ -345,8 +381,8 @@ error whose body is a JSON object is returned with that body unchanged.
 - The runtime's own behaviour: model semantics, sampling, tokenization,
   tool-call formats and the fields of its responses.
 - Streaming responses (server-sent events).
-- Transport details of `relay@1.0`: HTTP client, timeouts, retries and
-  connection reuse.
+- Transport details of `relay@1.0` and of HyperBEAM's HTTP clients: timeout
+  values, retries and connection reuse.
 - The format and verification of attestation reports, defined by the
   attestation device (`sev_gpu@1.0`).
 - Authentication, rate limiting and billing of callers.

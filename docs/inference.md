@@ -24,7 +24,7 @@ Only node options select the runtime. Requests cannot override them.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `inference-peer` | `http://localhost:30001` | Runtime base URL. |
+| `inference-peer` | `http://localhost:30001` | Runtime origin, `scheme://host:port`. |
 | `inference-path` | `/v1/chat/completions` | Chat-completions path. |
 | `inference-models-path` | `/v1/models` | Model-list path. |
 | `inference-health-path` | `/health` | Health path; any 2xx answer is healthy. |
@@ -32,6 +32,17 @@ Only node options select the runtime. Requests cannot override them.
 | `inference-attestation-device` | `sev_gpu@1.0` | Device asked for a report on `tee=true`. |
 | `inference-opts` | unset | Declared model and runtime facts, reported in `resolved_model`. |
 | `receipt-wallet-location` | unset | Wallet file that signs published receipts; the node wallet signs them when unset. |
+| `receipt-publishers` | unset | Addresses allowed to call `publish`; any caller when unset. |
+
+`inference-peer` is an origin, not a base URL: HyperBEAM's HTTP clients
+connect to its host and port and use TLS exactly on port 443. Use
+`http://host:port`, or `https://host` for TLS on port 443; a path prefix
+belongs in the path options (for example
+`"inference-path": "/openai/v1/chat/completions"`). A peer with a path, or
+`https` on another port, makes every key answer 500 `runtime_misconfigured`.
+Runtime calls use the node's `http-client` (default `hackney`) and its
+connect and receive timeouts (`http-client-connect-timeout`,
+`http-client-hackney-recv-timeout`).
 
 An example JSON node configuration (load it with `HB_CONFIG=config.json`):
 
@@ -72,7 +83,8 @@ runtime's own model list.
 ## Errors
 
 Runtime error statuses (400-599) are passed through, with the runtime's JSON
-error body and `retry-after` when present. An unreachable runtime answers 503.
+error body and `retry-after` when present. An unreachable runtime, or one that
+does not answer within the client timeouts, answers 503.
 Errors produced by the device use the OpenAI error shape:
 
 ```json
@@ -139,8 +151,15 @@ request. Hardware provenance and model identity need the measurement and
 attestation checks.
 
 `publish` signs a receipt as an ANS-104 data item and submits it to the node's
-bundler; it spends the publication wallet's funds. Restrict access to it, for
-example at the gateway in front of the node.
+bundler; it spends the publication wallet's funds. Either set
+`receipt-publishers` or block `publish` for untrusted callers in front of the
+node. With `receipt-publishers` set, the publisher signs a message holding
+only `receipt` and posts it to `/~inference_receipt@1.0/publish`; a request
+whose signature also covers `path` is refused with 403, because HyperBEAM
+delivers it to the device with `path: publish`.
+
+The receipt's `signed-receipt` verifies after the JSON body is decoded: check
+it with `hb_message:verify` and compare its signer with `node-address`.
 
 ## Reference deployment
 
