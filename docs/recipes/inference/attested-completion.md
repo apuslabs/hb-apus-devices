@@ -25,5 +25,7 @@ Expected: `pong True True ['max_tokens', 'messages', 'model', 'tee',
 the attestation nonce is the SHA-256 of `raw`; the next value is the node's
 own check of the GPU report. `raw` records the generation parameters and the
 runtime's response, never HTTP headers or the caller's address. On
-`hb.apus.network` the gateway publishes the attestation record to Arweave and
-adds `load_dataitem_id`, so each run creates one Arweave data item.
+`hb.apus.network` the gateway sends this request to `inference@1.0` on the
+node; its response carries no receipt, so the gateway does not publish it to
+Arweave. The `chat-with-receipt` recipe with `"tee": true` publishes a
+receipt.

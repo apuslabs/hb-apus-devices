@@ -14,7 +14,7 @@ behaviour of each key is defined in the device specifications:
 - `inference_receipt@1.0` executes a completion as a recorded AO-Core step and
   returns a receipt signed by the node: request and response digests, the
   step's HashPath and transcript, the GPU inventory and a fresh measurement.
-  It also verifies HashPaths and publishes receipts to Arweave.
+  It also verifies HashPaths and publishes the node's receipts to Arweave.
 
 Both devices answer with complete responses; `stream=true` is rejected.
 
@@ -33,13 +33,15 @@ Only node options select the runtime. Requests cannot override them.
 | `inference-opts` | unset | Declared model and runtime facts, reported in `resolved_model`. |
 | `receipt-wallet-location` | unset | Wallet file that signs published receipts; the node wallet signs them when unset. |
 | `receipt-publishers` | unset | Addresses allowed to call `publish`; any caller when unset. |
+| `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx` | unset | Execution bindings signed into receipts; each takes precedence over a request's declaration of the same name. |
 
 `inference-peer` is an origin, not a base URL: HyperBEAM's HTTP clients
 connect to its host and port and use TLS exactly on port 443. Use
 `http://host:port`, or `https://host` for TLS on port 443; a path prefix
 belongs in the path options (for example
 `"inference-path": "/openai/v1/chat/completions"`). A peer with a path, or
-`https` on another port, makes every key answer 500 `runtime_misconfigured`.
+`https` on another port, makes `completions`, `models` and `health` answer
+500 `runtime_misconfigured`.
 Runtime calls use the node's `http-client` (default `hackney`) and its
 connect and receive timeouts (`http-client-connect-timeout`,
 `http-client-hackney-recv-timeout`).
@@ -101,9 +103,11 @@ Send `tee=true` (a query parameter or a JSON field). The response gains:
   declared `inference-opts` facts.
 
 `raw` records the public generation parameters, `tee`, the runtime's response
-and the AO-Core execution link. HTTP headers, the `user` identifier and the
-caller's address are never recorded. Prompts and completions in `raw` become
-public when an attestation is published.
+and the AO-Core execution link: the HashPath and request ID of the public
+step, which holds the generation parameters and never the HTTP message. HTTP
+headers, the `user` identifier and the caller's address are never recorded or
+bound into that HashPath. Prompts and completions in `raw` become public when
+an attestation is published.
 
 To check the binding, recompute the nonce from `raw`:
 
@@ -128,9 +132,16 @@ with a `receipt`. Execution-profile declarations (`model-sha256`,
 `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx`,
 `workload-manifest-id`, `model-revision`, `runtime-name`,
 `runtime-version`) may be sent with the request; they are recorded, not
-checked. The node options `model-sha256`, `runtime-build-hash`,
-`inference-profile`, `model-source` and `model-tx` supply the corresponding
-bindings when a request declares none.
+checked. The receipt's bindings `model-sha256`, `runtime-build-hash`,
+`inference-profile`, `model-source` and `model-tx` take the node option of
+the same name when it is set, and the request's declaration otherwise.
+
+`request-digest` and `response-digest` are SHA-256 digests over a canonical
+JSON encoding (compact, object keys in byte order at every depth) defined in
+the receipt specification, so a verifier can recompute them. The receipt's
+`system-measurement.envelope` is the measurement envelope exactly as
+`inference_measurement@1.0` returned it; post it as `envelope` to
+`/~inference_measurement@1.0/verify` to check it.
 
 To verify a receipt's HashPath, post its `ao-core` object:
 
@@ -148,15 +159,20 @@ curl -s -X POST "$HB/~inference_receipt@1.0/v1/chat/completions" \
 The answer's `body.verified` is `true` (the string `"true"` in the typed
 HTTP encoding) when the recorded response is linked to the recorded base and
 request. Hardware provenance and model identity need the measurement and
-attestation checks.
+attestation checks. A `verification-input-term` larger than 1 MiB, or a
+compressed one, is refused with 400 before it is decoded.
 
-`publish` signs a receipt as an ANS-104 data item and submits it to the node's
-bundler; it spends the publication wallet's funds. Either set
-`receipt-publishers` or block `publish` for untrusted callers in front of the
-node. With `receipt-publishers` set, the publisher signs a message holding
-only `receipt` and posts it to `/~inference_receipt@1.0/publish`; a request
-whose signature also covers `path` is refused with 403, because HyperBEAM
-delivers it to the device with `path: publish`.
+`publish` signs a document that carries a receipt of this node as an ANS-104
+data item and submits it to the node's bundler; it spends the publication
+wallet's funds. It accepts a receipt, or a JSON object that carries one under
+`report.receipt`, of at most 8 MiB, whose `node-address` is this node. These
+are structural checks, not a signature check, so restrict `publish` to your
+gateway: set `receipt-publishers` to the gateway's signing address, or refuse
+`/~inference_receipt@1.0/publish` to every other caller in front of the node.
+With `receipt-publishers` set, the publisher signs a message holding only
+`receipt` and posts it to `/~inference_receipt@1.0/publish`; a request whose
+signature also covers `path` is refused with 403, because HyperBEAM delivers
+it to the device with `path: publish`.
 
 The receipt's `signed-receipt` verifies after the JSON body is decoded: check
 it with `hb_message:verify` and compare its signer with `node-address`.
@@ -165,11 +181,23 @@ it with `hb_message:verify` and compare its signer with `node-address`.
 
 Apus Network runs both devices at `https://hb.apus.network`: SGLang serves
 `google/gemma-4-26B-A4B-it`, and HyperBEAM and SGLang run in one AMD SEV-SNP
-guest with an NVIDIA H100 in confidential-computing mode. A gateway in front
-of the node sends `/~inference@1.0/*` requests without `tee=true` directly to
-the runtime, sends `tee=true` requests to HyperBEAM, and publishes each
-attested completion's record to Arweave, adding `load_dataitem_id` to the
-response.
+guest with an NVIDIA H100 in confidential-computing mode. A gateway sits in
+front of the node:
+
+- `/~inference@1.0/*` requests without `tee=true` (a query parameter or a JSON
+  field) go directly to the runtime with the `/~inference@1.0` prefix
+  removed, so `/~inference@1.0/health` and `/~inference@1.0/v1/models`
+  exercise the runtime, not the device;
+- `/~inference@1.0/*` requests with `tee=true` go to `inference@1.0` on the
+  node, except `/~inference@1.0/completions` with `tee=true`, which the
+  gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
+- every other path goes to the node, except
+  `/~inference_receipt@1.0/publish`, which the gateway refuses to outside
+  callers;
+- the gateway publishes receipts through `inference_receipt@1.0/publish` and
+  adds `load_dataitem_id` and `arweave_tx_id` to the response. An attested
+  completion served by `inference@1.0` alone carries no receipt and is not
+  published.
 
 ## Tests
 
