@@ -8,14 +8,13 @@ Ask the node which model its inference runtime is serving.
 
 Prerequisites:
 - HyperBEAM node reachable with `HB=${HB:-https://hb.apus.network}`.
-- `curl`.
+- `curl` and `python3`.
 
 ```bash
 HB=${HB:-https://hb.apus.network}
-curl -s "$HB/~inference@1.0/v1/models"
+curl -s "$HB/~inference@1.0/v1/models" \
+  | python3 -c 'import json,sys; t=sys.stdin.read(); d=json.JSONDecoder().raw_decode(t[t.index("{"):])[0]; print([m["id"] for m in d["data"]])'
 ```
 
-Expected: an OpenAI model list. On `hb.apus.network` it contains
-`google/gemma-4-26B-A4B-it` with `owned_by: sglang` and `max_model_len: 32768`.
-The public gateway sends `/~inference@1.0/*` straight to the runtime, so this
-is the runtime's `/v1/models`.
+Expected: the model IDs from the runtime's own `/v1/models` list, unchanged by
+the device. On `hb.apus.network` the list is `['google/gemma-4-26B-A4B-it']`.
