@@ -28,23 +28,24 @@ request and response formats, node options, errors and security model.
 
 ## How the devices compose
 
-Arrows point from a device to the devices it resolves through AO-Core.
+Arrows point from a device to the Apus and measurement devices it resolves
+through AO-Core. The **Depends-on** header of each specification also lists
+the HyperBEAM core devices it uses, such as `relay@1.0`.
 
 ```text
 agent@1.0
-  |
-  v
-inference@1.0 ---------------- tee=true ----------> sev_gpu@1.0
-  ^                                                   NVIDIA GPU TEE evidence
-  |
-inference_receipt@1.0 ----------------------------> gpu_inventory@1.0
-  |                                                   GPU and PCIe inventory
-  |
-  +-----------------------------------------------> inference_measurement@1.0
-                                                      |  inventory digest bound
-                                                      |  into a fresh measurement
-                                                      v
-                                                    measurement@1.0 (AMD SEV-SNP)
+   |
+   v
+inference@1.0 ------------- tee=true -------------> sev_gpu@1.0
+   ^                                                     ^
+   |                                                     |
+inference_receipt@1.0 -----> gpu_inventory@1.0           |
+   |                              ^                      |
+   |                              |                      |
+   +--------------------> inference_measurement@1.0 -----+
+                                  |
+                                  v
+                          measurement@1.0 (AMD SEV-SNP)
 ```
 
 Together they form an attestation chain for a single completion:
@@ -54,10 +55,11 @@ Together they form an attestation chain for a single completion:
   completion requested with `tee=true`, bound to the generation parameters.
 - `gpu_inventory@1.0` reports the host's GPU and PCIe layout and a digest that
   is stable for an unchanged layout and driver.
-- `inference_measurement@1.0` binds the inventory digest and the caller's
-  nonce into the nonce of a fresh AMD SEV-SNP measurement produced by
-  `measurement@1.0`. Without `measurement@1.0` it returns an explicitly
-  lower-trust observation.
+- `inference_measurement@1.0` reads the inventory from `gpu_inventory@1.0`
+  and binds its digest and the caller's nonce into the nonce of a fresh AMD
+  SEV-SNP measurement produced by `measurement@1.0`, and requests fresh GPU
+  evidence from `sev_gpu@1.0` for the measurement envelope. Without
+  `measurement@1.0` it returns an explicitly lower-trust observation.
 - `inference_receipt@1.0` runs the completion through `inference@1.0`,
   collects the inventory and a fresh measurement, and signs a receipt that a
   third party can check against the AO-Core HashPath of the execution.
@@ -72,11 +74,14 @@ in confidential-computing mode. It runs the six devices and the vendored
 measurement devices from one preloaded store, and its model runtime is SGLang
 serving `google/gemma-4-26B-A4B-it`.
 
-The public endpoint is fronted by a gateway operated by Apus Network. The
-gateway publishes the record of every successful attested completion
-(`tee=true`) and every successful `inference_receipt@1.0` completion to
-Arweave as a permanent data item. Call a node port directly to exercise the
-devices without that step.
+The public endpoint is served through a gateway operated by Apus Network,
+which is not part of this repository. The gateway answers `/~inference@1.0/`
+requests without `tee=true` from the model runtime directly; attested
+completions (`tee=true`) and every other path are resolved by the HyperBEAM
+node. For each attested completion, the gateway publishes the request's chat
+messages and generation parameters, the model response and the GPU
+attestation to Arweave as a permanent, public data item. Do not send content
+that must stay private as an attested completion to the public endpoint.
 
 ## Vendored PermawebOS devices
 
@@ -106,7 +111,8 @@ make verify    # load every archive with HyperBEAM's runtime loader
 
 `make test` packages every device, builds a fresh test store and runs the
 suites against it. It needs no GPU, SEV-SNP guest or model runtime.
-`make help` lists every target.
+`make eunit-all` runs the suites of every device in the repository,
+including the vendored ones, together with the HyperBEAM core suites. `make help` lists every target.
 
 Native assets are built on the Linux target host before packaging:
 
@@ -137,6 +143,13 @@ make smoke                           # probe the six devices
 scripts/local-node.sh stop
 ```
 
+`make preload` writes the store to `_build/apus-device-store` (set
+`PRELOADED_STORE` to change it) and marks it complete only after every
+device is written; `scripts/local-node.sh` starts only from a complete
+store. The path differs from HyperBEAM's built-in default store
+(`_build/preloaded-store`), which a HyperBEAM VM started from the repository
+root opens on its own.
+
 `make smoke HB_URL=...` probes any node. Probes for hardware or a model
 runtime that the node does not have report `FAIL` with the node's response;
 `scripts/smoke-test.sh meta gpu_inventory` runs a subset.
@@ -151,12 +164,15 @@ make publish-dry-run WALLET=/path/to/wallet.json   # sign and print the IDs
 make publish WALLET=/path/to/wallet.json           # upload and write PUBLISH.md
 ```
 
-`make publish` requires committed device sources. It writes
-[`PUBLISH.md`](PUBLISH.md) with the signer address, the source commit, the
-HyperBEAM commit and the specification and implementation IDs of every
-device, and keeps the raw output in `_build/publish.log`. Signatures are
-salted, so every signing produces new message IDs; the IDs in `PUBLISH.md`
-identify the published messages.
+`make publish` requires committed device sources and the HyperBEAM commit
+pinned in `rebar.config`. It writes [`PUBLISH.md`](PUBLISH.md) with the
+signer address, the source commit, the HyperBEAM commit and the
+specification and implementation IDs of every device, and keeps the raw
+output in `_build/publish.log`. Signatures are salted, so every signing
+produces new message IDs; the IDs in `PUBLISH.md` identify the published
+messages. If an upload fails, the run stops: the devices published before it
+remain on Arweave, and their IDs are written to
+`_build/publish.log.partial.md`.
 
 ## Recipes
 
@@ -165,16 +181,19 @@ runnable examples. Each file becomes a Device-Recipe message whose
 `recipe-for-device` tag is the specification ID of its device.
 
 ```bash
-make recipes WALLET=/path/to/wallet.json           # sign and print the IDs
-make publish-recipes WALLET=/path/to/wallet.json   # upload and update the ledger
+make recipes WALLET=/path/to/wallet.json           # sign against the local store and print the IDs
+make publish-recipes WALLET=/path/to/wallet.json   # sign against PUBLISH.md, upload, update the ledger
 ```
 
-The specification IDs come from `PRELOADED_STORE` (default
-`_build/preloaded-store`, built by `make preload` when it is missing). Point
-it at the store a node runs to bind recipes to that node's devices, or set
-`RECIPE_SPECS=PUBLISH.md` to bind them to the Device-Specification messages
-published on Arweave. Uploaded rounds are listed in
-[`docs/recipes/PUBLISHED.md`](docs/recipes/PUBLISHED.md).
+`make publish-recipes` binds every recipe to the Device-Specification ID in
+`PUBLISH.md` and requires `WALLET` to be the signer recorded there, so the
+recipes appear with the published devices. It fails while `PUBLISH.md` lists
+no published device. `make recipes` is a dry run against the preloaded store
+in `PRELOADED_STORE`, rebuilt by `make preload` when a device source is newer
+than the store. `RECIPE_SPECS` selects another source for either target: a
+preloaded store directory or a publication record. Each uploaded recipe is
+appended to [`docs/recipes/PUBLISHED.md`](docs/recipes/PUBLISHED.md) as soon
+as the bundler accepts it.
 
 ## Scripts
 
@@ -184,7 +203,7 @@ published on Arweave. Uploaded rounds are listed in
 | `scripts/local-node.sh` | Run a background node from a preloaded store |
 | `scripts/publish-record.sh` | Render `PUBLISH.md` from the output of `make publish` |
 | `scripts/publish-recipes.escript` | Sign and upload the Device-Recipe messages |
-| `scripts/update-store-device.escript` | Repackage one device into an existing preloaded store and keep the other devices unchanged |
+| `scripts/update-store-device.escript` | Repackage one device into an existing preloaded store, signed by the store's signer, and keep the other devices unchanged |
 | `scripts/setup-measurement.sh` | Build the SNP NIF of the vendored `snp@1.0` device |
 
 ## Repository layout
@@ -224,7 +243,7 @@ The devices are built and tested against:
 | rebar3 | 3.27 |
 | PermawebOS measurement devices | [`permaweb/os`](https://github.com/permaweb/os) at `63f88cc3a73af0e5af13b58887b2870d8b486c48` |
 | Host | Linux x86_64 AMD SEV-SNP guest with an NVIDIA H100 in confidential-computing mode |
-| GPU attestation | NVIDIA attestation SDK, built by `make setup-cc` |
+| GPU attestation | [`NVIDIA/attestation-sdk`](https://github.com/NVIDIA/attestation-sdk) at `73efa3ac1bec28ed7d7f0c0811a6c993e722dbd4`, built by `make setup-cc` |
 | Model runtime | SGLang with an OpenAI-compatible chat-completions API |
 
 The HyperBEAM pin is the upstream `permaweb/HyperBEAM` edge line at
