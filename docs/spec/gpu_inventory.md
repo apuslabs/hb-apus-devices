@@ -11,7 +11,10 @@ them. It reads PCI display controllers and processing accelerators from the
 node's sysfs tree, enriches NVIDIA GPUs with a predefined `nvidia-smi` query, and
 commits the stable facts (identity, driver, firmware, links, topology) to a
 canonical digest. Volatile values such as temperature and utilization are
-reported separately and never enter the digest.
+reported separately and never enter the digest. Requests share collections:
+an inventory report is reused for a short, configurable time (five seconds
+by default), and concurrent requests wait for the collection in progress
+instead of starting another `nvidia-smi` run.
 
 The device makes no attestation claim: every value is what the host kernel
 and NVIDIA's management tools report, and a compromised host can report
@@ -35,6 +38,11 @@ hardware-measured nonces.
 - **Provenance classes:** `host-observed` (read from the host's kernel and
   tools; spoofable by a compromised host) for `report` and `digest`, and
   `runtime-observed` (volatile values) for `snapshot`.
+- **Collection:** one reading of the host that produces a report (sysfs and
+  the `nvidia-smi` inventory query) or a snapshot (the `nvidia-smi` runtime
+  query). Its **configuration** is the values of `gpu-inventory-root`,
+  `gpu-inventory-nvidia-smi-path` and `gpu-inventory-nvidia-smi-timeout`
+  in effect.
 
 ## 3. Device interface
 
@@ -59,13 +67,18 @@ reported in `errors`.
 | `gpu-inventory-root` | `/sys` | Root of the sysfs tree to read. |
 | `gpu-inventory-nvidia-smi-path` | `nvidia-smi` | An absolute path, or a bare executable name looked up in the node's `PATH`. Any other relative path counts as absent. |
 | `gpu-inventory-nvidia-smi-timeout` | `10000` | How long, in milliseconds, the device waits for one `nvidia-smi` run: a positive integer or decimal string; other values select the default. |
+| `gpu-inventory-cache-ms` | `5000` | How long, in milliseconds, `report` and `digest` reuse a collected report: a non-negative integer or decimal string, where `0` disables reuse; other values select the default. |
 
 ## 4. Resolved keys (normative)
 
 ### `report` — the stable inventory
 
 - **Reads:** node options only.
-- **Behaviour:**
+- **Behaviour:** if a report collected with the same configuration finished
+  less than `gpu-inventory-cache-ms` ago, return it unchanged, including its
+  `collected-at-unix` and `errors`. If a report collection with the same
+  configuration is in progress, wait for it and return its report.
+  Otherwise collect a new report:
   1. List `<root>/bus/pci/devices` in sorted order. If the directory does not
      exist, there are no sysfs rows and no sysfs source. Any other listing
      error adds `sysfs: unavailable (<reason>)` to `errors`.
@@ -102,7 +115,8 @@ reported in `errors`.
 ### `digest` — the inventory digest
 
 - **Reads:** node options only.
-- **Behaviour:** collect a `report` as above.
+- **Behaviour:** obtain the report exactly as `report` does, reuse included,
+  and return its `inventory-digest`.
 - **Returns:** `{ok, #{type => apus-gpu-inventory-digest, version => 1.0,
   inventory-digest => <digest>, provenance-class => host-observed}}`.
 
@@ -111,7 +125,9 @@ reported in `errors`.
 - **Reads:** node options only.
 - **Behaviour:** run `nvidia-smi` once with the runtime fields (§5.2) and build
   one row per output line, without unknown values. Errors are handled as in
-  `report` step 3. sysfs is not read.
+  `report` step 3. sysfs is not read. A request that arrives while a
+  `snapshot` collection with the same configuration is in progress waits
+  for it and returns its result; a finished snapshot is never reused.
 - **Returns:** `{ok, Snapshot}` with `type` = `apus-gpu-runtime-snapshot`,
   `version`, `collected-at-unix`, `provenance` = `{class: "runtime-observed",
   sources}`, `supported` (at least one row), `devices` and `errors`.
@@ -206,26 +222,47 @@ rendered as the strings `"true"` and `"false"`, typed through `ao-types`.
 
 ## 6. Ordering, freshness & caching
 
-- Every call reads the host afresh; the device keeps no state.
+- A `report` or `digest` describes the host as of the report's
+  `collected-at-unix`: the report is reused for at most
+  `gpu-inventory-cache-ms` after its collection finishes. Every `snapshot`
+  that does not join a collection in progress reads the host afresh.
+- Collections are shared through one coordinator process per node, started
+  on first use and registered under the device module's name; each
+  collection runs in a process of its own. The coordinator holds the
+  requests waiting for each collection in progress and the most recent
+  report of each configuration, which it discards on the first request
+  after `gpu-inventory-cache-ms` has passed; with `gpu-inventory-cache-ms`
+  `0` it keeps no report. If the coordinator or a collection process stops
+  without a result, the waiting requests collect for themselves.
 - Rows and topology lists are sorted, so equal hardware gives byte-identical
   canonical JSON and an equal digest, whatever order sysfs or `nvidia-smi`
   list devices in. `collected-at-unix` is outside the digest.
 - The digest changes when a stable fact changes: a device is added or
   removed, a driver or VBIOS is updated, or a link width or generation
   changes.
-- Results are not stored under the node's default cache settings.
+- Results are not stored in the node's cache under its default cache
+  settings.
 
 ## 7. Security & authority
 
 - Every value is host-observed. The digest identifies what the host
   reported; it does not prove what hardware is present.
-- Requests cannot choose the sysfs root, the executable or the timeout; these
-  are node options. No key reads the request or base message.
+- Requests cannot choose the sysfs root, the executable, the timeout or the
+  reuse time; these are node options. No key reads the request or base
+  message.
 - `nvidia-smi` runs through an argument vector with predefined field lists,
   never through a shell. The device reads at most 1 MiB of its output and
   waits at most the configured timeout. On timeout it closes the port, which
   closes the process's standard input and output; the process ends when it
   next writes output or exits on its own.
+- While the coordinator runs (§6), for each configuration it runs at most
+  one report collection and one snapshot collection at a time, and it
+  starts a new report collection no earlier than `gpu-inventory-cache-ms`
+  after the previous one returned its report. Concurrent requests therefore
+  share `nvidia-smi` runs. When a collection process or the coordinator
+  stops without a result, each request that was waiting for it collects for
+  itself in its own process, so those requests run `nvidia-smi`
+  concurrently.
 - The report contains PCI identities, driver and firmware versions and GPU
   UUIDs. It contains no credentials and no file paths.
 
@@ -266,9 +303,17 @@ no `nvidia-smi` error.
    unchanged; volatile values never change it.
 7. A missing `nvidia-smi` is not an error; a failing, slow or malformed run is
    reported in `errors`.
-8. The sysfs root and the executable come only from node options.
+8. The sysfs root, the executable, the timeout and the reuse time come only
+   from node options.
 9. `nvidia-smi` is run without a shell; the device waits at most the
    configured timeout and reads at most 1 MiB of output.
+10. `report` and `digest` reuse a report whose collection with the same
+    configuration finished less than `gpu-inventory-cache-ms` ago, and the
+    digest that `digest` returns always equals the `inventory-digest` of the
+    report it was taken from.
+11. Concurrent `report` and `digest` requests with the same configuration
+    share one report collection; concurrent `snapshot` requests share one
+    snapshot collection.
 
 ## 11. Out of scope
 

@@ -58,6 +58,11 @@ readelf -d src/dev_sev_gpu/priv/dev_sev_gpu_nif.so | grep -E 'RUNPATH|RPATH'
 
 Expected: `[$ORIGIN/lib:$ORIGIN/../lib]`.
 
+A node that loads `sev_gpu@1.0` from its implementation archive loads the
+native backend only from the archive's extracted resources. The
+`src/dev_sev_gpu/priv/` directory below the node's working directory is
+used only by a device compiled from a source checkout under its source name.
+
 The `dev_sev_gpu_nif` module always carries the name the library declares,
 so the NIF loads whatever generated name Device Forge gives the device
 module. When the module is present but the library does not load (for
@@ -72,6 +77,12 @@ The module and its library stay loaded until the node stops. After an
 upgrade of the `sev_gpu@1.0` implementation archive the node keeps the
 loaded copy and prints one line naming the loaded and the new module file;
 restart the node to load the new native backend.
+
+Each NIF call runs in a process of its own. The device waits for it at most
+`sev-gpu-nif-timeout` milliseconds (by default the `sev-gpu-nvattest-timeout`
+value) and then fails with `nif_timeout`; the NVAT work already under way
+finishes on its dirty I/O scheduler. `verify` accepts at most 16 evidence
+entries and 1 MiB of evidence per request.
 
 ## Command-line backend
 
@@ -101,11 +112,13 @@ NVIDIA's OCSP responder. The node needs outbound HTTPS access to
 |---|---|---|
 | `sev-gpu-backend` | `auto` | `sev_gpu@1.0`: `auto`, `nif` or `nvattest` |
 | `sev-gpu-nvattest-path` | `/usr/bin/nvattest` | `sev_gpu@1.0` |
-| `sev-gpu-nvattest-timeout` | `60000` (ms) | `sev_gpu@1.0` |
+| `sev-gpu-nvattest-timeout` | `60000` (ms) | `sev_gpu@1.0`: one `nvattest` run |
+| `sev-gpu-nif-timeout` | `sev-gpu-nvattest-timeout` (ms) | `sev_gpu@1.0`: one NIF call |
 | `sev-gpu-scratch-dir` | `/tmp` | `sev_gpu@1.0`: evidence files for `verify` |
 | `gpu-inventory-root` | `/sys` | `gpu_inventory@1.0` |
 | `gpu-inventory-nvidia-smi-path` | `nvidia-smi` | `gpu_inventory@1.0`: absolute path or name in `PATH` |
 | `gpu-inventory-nvidia-smi-timeout` | `10000` (ms) | `gpu_inventory@1.0` |
+| `gpu-inventory-cache-ms` | `5000` (ms) | `gpu_inventory@1.0`: reuse of the inventory report; `0` disables reuse |
 | `measurement-mode` | `auto` | `inference_measurement@1.0`: `auto`, `hook-body` or `observation-only` |
 | `inference-measurement-inventory-device` | `gpu_inventory@1.0` | `inference_measurement@1.0` |
 | `inference-measurement-gpu-tee-device` | `sev_gpu@1.0` | `inference_measurement@1.0` |
@@ -113,6 +126,13 @@ NVIDIA's OCSP responder. The node needs outbound HTTPS access to
 | `inference-measurement-sev-guest-path` | `/dev/sev-guest` | `inference_measurement@1.0` |
 
 Section 3 of each specification defines these options in full.
+
+`gpu_inventory@1.0` shares its collections on the node: `report` and
+`digest` reuse a report for `gpu-inventory-cache-ms`, and concurrent
+requests wait for the collection in progress. Requests that arrive during a
+collection or within `gpu-inventory-cache-ms` after it, such as the
+measurements and receipts of a burst of completions, share one `nvidia-smi`
+inventory query.
 
 Set `sev-gpu-backend` to `nif` on a node that must never fall back to
 `nvattest`; `generate` then fails with `nif_unavailable` when the NIF is not
@@ -143,7 +163,11 @@ rebar3 device test --device-src=src,vendor/permaweb-os/src \
 ```
 
 The tests cover nonce validation, the claims rule, both backends (with
-stand-in executables), inventory parsing, the measurement binding and its
-anchoring in the host report. Two tests attest the real GPU end to end on a
-confidential-computing host; elsewhere they check that `generate` reports
-the missing attestation backend as an error.
+stand-in executables), the evidence limits and the NIF call timeout,
+inventory parsing and the shared inventory collection, the measurement
+binding and its anchoring in the host report, and the verification of
+observation envelopes as a node serves them over HTTP (including a round
+trip through a node's HTTP server), with replaced content that keeps only
+the node's signature over `hashpath` rejected. Two tests attest the real
+GPU end to end on a confidential-computing host; elsewhere they check that
+`generate` reports the missing attestation backend as an error.

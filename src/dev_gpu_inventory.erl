@@ -5,7 +5,10 @@
 %%% predefined `nvidia-smi' query, and commits the stable facts to a canonical
 %%% digest. It makes no attestation claim: every value is what the host
 %%% reports. The sysfs root and the `nvidia-smi' executable are node options;
-%%% a request cannot select either.
+%%% a request cannot select either. Collections are shared on the node: an
+%%% inventory report is reused for a short, configurable time, and requests
+%%% that arrive while a collection runs wait for its result instead of
+%%% starting another `nvidia-smi' run.
 -module(dev_gpu_inventory).
 -implements(<<"gpu_inventory@1.0">>).
 -specification("docs/spec/gpu_inventory.md").
@@ -16,6 +19,10 @@
 -define(DEFAULT_ROOT, <<"/sys">>).
 -define(DEFAULT_NVIDIA_SMI, <<"nvidia-smi">>).
 -define(DEFAULT_NVIDIA_SMI_TIMEOUT_MS, 10000).
+%% How long a collected inventory report is reused, in milliseconds.
+-define(DEFAULT_CACHE_MS, 5000).
+%% How long an unused coordinator waits for its start signal.
+-define(COORDINATOR_START_MS, 5000).
 %% Upper bound on the bytes read from one `nvidia-smi' run.
 -define(MAX_NVIDIA_SMI_OUTPUT, 1048576).
 
@@ -50,12 +57,12 @@ info(_Opts) ->
 %% @doc Return the stable GPU inventory and its digest.
 -spec report(#{ _ => _ }, #{ _ => _ }, map()) -> {ok, map()}.
 report(_Base, _Req, Opts) ->
-    {ok, collect_report(Opts)}.
+    {ok, inventory_report(Opts)}.
 
 %% @doc Return the inventory digest without the inventory itself.
 -spec digest(#{ _ => _ }, #{ _ => _ }, map()) -> {ok, map()}.
 digest(_Base, _Req, Opts) ->
-    Report = collect_report(Opts),
+    Report = inventory_report(Opts),
     {ok, #{
         <<"type">> => <<"apus-gpu-inventory-digest">>,
         <<"version">> => ?VERSION,
@@ -67,6 +74,10 @@ digest(_Base, _Req, Opts) ->
 %% any digest.
 -spec snapshot(#{ _ => _ }, #{ _ => _ }, map()) -> {ok, map()}.
 snapshot(_Base, _Req, Opts) ->
+    {ok, shared(snapshot, 0, fun() -> collect_snapshot(Opts) end, Opts)}.
+
+%% @doc Read the runtime fields from `nvidia-smi'.
+collect_snapshot(Opts) ->
     {Rows, Sources, Errors} =
         case nvidia_query(?RUNTIME_FIELDS, Opts) of
             {ok, CSV} ->
@@ -76,7 +87,7 @@ snapshot(_Base, _Req, Opts) ->
             {error, Reason} ->
                 {[], [<<"nvidia-smi">>], [error_text(<<"nvidia-smi">>, Reason)]}
         end,
-    {ok, #{
+    #{
         <<"type">> => <<"apus-gpu-runtime-snapshot">>,
         <<"version">> => ?VERSION,
         <<"collected-at-unix">> => erlang:system_time(second),
@@ -87,11 +98,16 @@ snapshot(_Base, _Req, Opts) ->
         <<"supported">> => Rows =/= [],
         <<"devices">> => Rows,
         <<"errors">> => Errors
-    }}.
+    }.
 
 %%% ------------------------------------------------------------------
 %%% Inventory
 %%% ------------------------------------------------------------------
+
+%% @doc The inventory report: a report collected within the last
+%% `gpu-inventory-cache-ms' milliseconds, or a new collection.
+inventory_report(Opts) ->
+    shared(report, cache_ms(Opts), fun() -> collect_report(Opts) end, Opts).
 
 %% @doc Collect sysfs and `nvidia-smi' facts into the inventory report.
 collect_report(Opts) ->
@@ -330,11 +346,7 @@ nvidia_query(Fields, Opts) ->
 %% a bare name is looked up in the node's `PATH'. A missing executable
 %% means the host has no NVIDIA tooling, which is not an error.
 nvidia_smi(Opts) ->
-    Configured =
-        case hb_opts:get(<<"gpu-inventory-nvidia-smi-path">>, ?DEFAULT_NVIDIA_SMI, Opts) of
-            Value when is_binary(Value); is_list(Value) -> hb_util:list(Value);
-            _ -> hb_util:list(?DEFAULT_NVIDIA_SMI)
-        end,
+    Configured = nvidia_smi_option(Opts),
     case filename:pathtype(Configured) of
         absolute ->
             case filelib:is_regular(Configured) of
@@ -352,16 +364,34 @@ nvidia_smi(Opts) ->
             end
     end.
 
+%% @doc The configured `nvidia-smi' path or name, as a string.
+nvidia_smi_option(Opts) ->
+    case hb_opts:get(<<"gpu-inventory-nvidia-smi-path">>, ?DEFAULT_NVIDIA_SMI, Opts) of
+        Value when is_binary(Value); is_list(Value) -> hb_util:list(Value);
+        _ -> hb_util:list(?DEFAULT_NVIDIA_SMI)
+    end.
+
+%% @doc The limit, in milliseconds, for one `nvidia-smi' run.
 timeout(Opts) ->
-    case hb_opts:get(<<"gpu-inventory-nvidia-smi-timeout">>, ?DEFAULT_NVIDIA_SMI_TIMEOUT_MS, Opts) of
-        Timeout when is_integer(Timeout), Timeout > 0 -> Timeout;
+    integer_option(<<"gpu-inventory-nvidia-smi-timeout">>,
+        ?DEFAULT_NVIDIA_SMI_TIMEOUT_MS, 1, Opts).
+
+%% @doc How long, in milliseconds, a collected inventory report is reused.
+cache_ms(Opts) ->
+    integer_option(<<"gpu-inventory-cache-ms">>, ?DEFAULT_CACHE_MS, 0, Opts).
+
+%% @doc An integer node option of at least `Min', given as an integer or a
+%% decimal string; other values select `Default'.
+integer_option(Key, Default, Min, Opts) ->
+    case hb_opts:get(Key, Default, Opts) of
+        Value when is_integer(Value), Value >= Min -> Value;
         Bin when is_binary(Bin) ->
             try binary_to_integer(Bin) of
-                Timeout when Timeout > 0 -> Timeout;
-                _ -> ?DEFAULT_NVIDIA_SMI_TIMEOUT_MS
-            catch _:_ -> ?DEFAULT_NVIDIA_SMI_TIMEOUT_MS
+                Value when Value >= Min -> Value;
+                _ -> Default
+            catch _:_ -> Default
             end;
-        _ -> ?DEFAULT_NVIDIA_SMI_TIMEOUT_MS
+        _ -> Default
     end.
 
 %% @doc Run an executable without a shell and collect its standard output
@@ -418,6 +448,117 @@ parse_csv_rows(Output, Width) ->
     case lists:all(fun(Row) -> length(Row) =:= Width end, Rows) of
         true -> {ok, Rows};
         false -> {error, malformed_output}
+    end.
+
+%%% ------------------------------------------------------------------
+%%% Shared collection
+%%% ------------------------------------------------------------------
+
+%% @doc The result of `Collect', shared between requests of the same kind
+%% and configuration. A finished result younger than `MaxAge' milliseconds
+%% is returned as it is; a request that arrives while a collection runs
+%% receives that collection's result; otherwise a new collection starts.
+%% A coordinator process, started on first use and registered under this
+%% module's name, tracks the collections, and each collection runs in a
+%% process of its own. When the coordinator or a collection is unavailable,
+%% the request collects for itself.
+shared(Kind, MaxAge, Collect, Opts) ->
+    Key = {Kind, inventory_root(Opts), nvidia_smi_option(Opts), timeout(Opts)},
+    case coordinator() of
+        {ok, Coordinator} ->
+            Monitor = erlang:monitor(process, Coordinator),
+            Coordinator ! {collect, self(), Monitor, Key, MaxAge, Collect},
+            receive
+                {Monitor, {ok, Result}} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    Result;
+                {Monitor, failed} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    Collect();
+                {'DOWN', Monitor, process, Coordinator, _} ->
+                    Collect()
+            end;
+        error ->
+            Collect()
+    end.
+
+%% @doc The running coordinator, or a new one.
+coordinator() ->
+    case whereis(?MODULE) of
+        Pid when is_pid(Pid) -> {ok, Pid};
+        undefined -> start_coordinator()
+    end.
+
+%% A new coordinator starts serving only once it holds the registered name;
+%% when another request registered one first, that one is used.
+start_coordinator() ->
+    Pid = spawn(fun() ->
+        receive start -> coordinate(#{})
+        after ?COORDINATOR_START_MS -> ok
+        end
+    end),
+    try register(?MODULE, Pid) of
+        true ->
+            Pid ! start,
+            {ok, Pid}
+    catch
+        error:badarg ->
+            exit(Pid, kill),
+            case whereis(?MODULE) of
+                Running when is_pid(Running) -> {ok, Running};
+                undefined -> error
+            end
+    end.
+
+%% @doc The coordinator loop. `Collections' maps a key to
+%% `{running, Worker, Waiters, MaxAge}' while its collection runs, where
+%% `Worker' is the monitor of the collection process, and to
+%% `{done, At, MaxAge, Result}' while the result may be reused. Expired
+%% results are dropped when the next request arrives.
+coordinate(Collections) ->
+    receive
+        {collect, From, Tag, Key, MaxAge, Collect} ->
+            Now = erlang:monotonic_time(millisecond),
+            Current = maps:filter(
+                fun(_, {done, At, Age, _}) -> Now - At < Age;
+                   (_, _) -> true
+                end,
+                Collections
+            ),
+            case maps:get(Key, Current, undefined) of
+                {done, At, _, Result} when Now - At < MaxAge ->
+                    From ! {Tag, {ok, Result}},
+                    coordinate(Current);
+                {running, Worker, Waiters, Age} ->
+                    coordinate(Current#{ Key => {running, Worker, [{From, Tag} | Waiters], Age} });
+                _ ->
+                    {_, Worker} = spawn_monitor(fun() -> exit({collected, Collect()}) end),
+                    coordinate(Current#{ Key => {running, Worker, [{From, Tag}], MaxAge} })
+            end;
+        {'DOWN', Worker, process, _, Exit} ->
+            case [Key || Key := {running, Running, _, _} <- Collections, Running =:= Worker] of
+                [Key] ->
+                    {running, _, Waiters, MaxAge} = maps:get(Key, Collections),
+                    Reply =
+                        case Exit of
+                            {collected, Result} -> {ok, Result};
+                            _ -> failed
+                        end,
+                    lists:foreach(fun({From, Tag}) -> From ! {Tag, Reply} end, Waiters),
+                    coordinate(
+                        case Reply of
+                            {ok, Collected} when MaxAge > 0 ->
+                                Now = erlang:monotonic_time(millisecond),
+                                Collections#{ Key => {done, Now, MaxAge, Collected} };
+                            _ ->
+                                maps:remove(Key, Collections)
+                        end
+                    );
+                [] ->
+                    coordinate(Collections)
+            end;
+        _ ->
+            coordinate(Collections)
     end.
 
 %%% ------------------------------------------------------------------
@@ -575,12 +716,39 @@ write_script(Dir, Name, Body) ->
 %% A stand-in `nvidia-smi' answering the inventory and runtime queries for
 %% one H100, in `nvidia-smi''s own bus-id format.
 fake_nvidia_smi(Dir) ->
-    write_script(Dir, "nvidia-smi", [
+    write_script(Dir, "nvidia-smi", nvidia_smi_answers()).
+
+nvidia_smi_answers() ->
+    [
         "case \"$1\" in\n",
         "  *temperature.gpu*) echo '0, NVIDIA H100 PCIe, 00000000:01:00.0, 41, 72, 350, 3, 1, 1024, 81559, 345, 345, 1593, P0, [N/A]' ;;\n",
         "  *) echo '0, NVIDIA H100 PCIe, 00000000:01:00.0, 595.71.05, GPU-4f46656c-2135-0fc6-40a0-41b700763229, 81559, 9.0, 96.00.AF.00.01, 5, 16, 350.00, Disabled, Enabled, [N/A]' ;;\n",
         "esac\n"
+    ].
+
+%% The stand-in `nvidia-smi' that also records each run in `runs' and
+%% answers after `Delay' seconds.
+counting_nvidia_smi(Dir, Delay) ->
+    write_script(Dir, "counting-nvidia-smi", [
+        "echo run >> '", filename:join(Dir, "runs"), "'\n",
+        "sleep ", Delay, "\n"
+        | nvidia_smi_answers()
     ]).
+
+%% How many times the counting stand-in ran.
+runs(Dir) ->
+    case file:read_file(filename:join(Dir, "runs")) of
+        {ok, Log} -> length(binary:matches(Log, <<"run">>));
+        {error, enoent} -> 0
+    end.
+
+counting_opts(Dir, Delay, Extra) ->
+    maps:merge(
+        (fixture_opts(Dir))#{
+            <<"gpu-inventory-nvidia-smi-path">> => hb_util:bin(counting_nvidia_smi(Dir, Delay))
+        },
+        Extra
+    ).
 
 fixture_opts(Dir) ->
     #{
@@ -743,6 +911,57 @@ failing_nvidia_smi_is_reported_test() ->
         }),
         ?assertEqual([<<"nvidia-smi: unavailable (timeout)">>],
             maps:get(<<"errors">>, TimedOut))
+    end).
+
+inventory_report_is_reused_test() ->
+    with_test_dir(fun(Dir) ->
+        Opts = counting_opts(Dir, "0", #{}),
+        {ok, First} = report(#{}, #{}, Opts),
+        {ok, Second} = report(#{}, #{}, Opts),
+        {ok, Digest} = digest(#{}, #{}, Opts),
+        ?assertEqual(1, runs(Dir)),
+        ?assertEqual(First, Second),
+        ?assertEqual(maps:get(<<"inventory-digest">>, First),
+            maps:get(<<"inventory-digest">>, Digest)),
+        %% Snapshots are never reused.
+        {ok, _} = snapshot(#{}, #{}, Opts),
+        {ok, _} = snapshot(#{}, #{}, Opts),
+        ?assertEqual(3, runs(Dir))
+    end).
+
+inventory_reuse_follows_the_cache_option_test() ->
+    with_test_dir(fun(Dir) ->
+        Uncached = counting_opts(Dir, "0", #{ <<"gpu-inventory-cache-ms">> => 0 }),
+        {ok, _} = report(#{}, #{}, Uncached),
+        {ok, _} = report(#{}, #{}, Uncached),
+        ?assertEqual(2, runs(Dir)),
+        Short = Uncached#{ <<"gpu-inventory-cache-ms">> => <<"200">> },
+        {ok, _} = report(#{}, #{}, Short),
+        {ok, _} = report(#{}, #{}, Short),
+        ?assertEqual(3, runs(Dir)),
+        timer:sleep(300),
+        {ok, _} = report(#{}, #{}, Short),
+        ?assertEqual(4, runs(Dir)),
+        ?assertEqual(5000, cache_ms(#{ <<"gpu-inventory-cache-ms">> => -1 })),
+        ?assertEqual(5000, cache_ms(#{ <<"gpu-inventory-cache-ms">> => <<"soon">> }))
+    end).
+
+concurrent_requests_share_one_run_test() ->
+    with_test_dir(fun(Dir) ->
+        Opts = counting_opts(Dir, "0.5", #{ <<"gpu-inventory-cache-ms">> => 0 }),
+        %% Five requests at once; each returns `{ok, Result}'.
+        Concurrently = fun(Call) ->
+            Self = self(),
+            Pids = [spawn(fun() -> Self ! {self(), Call()} end) || _ <- lists:seq(1, 5)],
+            [receive {Pid, {ok, Result}} -> Result after 10000 -> timeout end || Pid <- Pids]
+        end,
+        Reports = Concurrently(fun() -> report(#{}, #{}, Opts) end),
+        ?assertEqual(1, runs(Dir)),
+        ?assertMatch([#{ <<"type">> := <<"apus-gpu-inventory">> }], lists:usort(Reports)),
+        Snapshots = Concurrently(fun() -> snapshot(#{}, #{}, Opts) end),
+        ?assertEqual(2, runs(Dir)),
+        ?assertMatch([#{ <<"type">> := <<"apus-gpu-runtime-snapshot">> }],
+            lists:usort(Snapshots))
     end).
 
 snapshot_reads_runtime_fields_test() ->

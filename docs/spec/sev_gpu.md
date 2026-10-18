@@ -74,6 +74,7 @@ directories and limits; no request or base message can.
 | `sev-gpu-backend` | `auto` | `auto`, `nif` or `nvattest`. Any other value fails with `invalid_backend`. |
 | `sev-gpu-nvattest-path` | `/usr/bin/nvattest` | Absolute path of the `nvattest` executable. `PATH` is never searched. |
 | `sev-gpu-nvattest-timeout` | `60000` | How long, in milliseconds, the device waits for one `nvattest` run: a positive integer or decimal string; other values select the default. |
+| `sev-gpu-nif-timeout` | the `sev-gpu-nvattest-timeout` value | How long, in milliseconds, the device waits for one NIF call: a positive integer or decimal string; other values select the default. |
 | `sev-gpu-scratch-dir` | `/tmp` | Directory for the evidence file that `verify` hands to NVAT. |
 
 **Native assets.** The NIF backend uses these resources of the
@@ -85,16 +86,18 @@ dev_sev_gpu_nif.so      the NIF, linked against libnvat
 lib/libnvat.so*         optional: the NVAT shared library, when not installed on the host
 ```
 
-The device looks for `dev_sev_gpu_nif.beam` in these directories, in order:
-`dev_sev_gpu/` below its implementation directory, the implementation
-directory itself, and `src/dev_sev_gpu/priv/` below the node's working
-directory. Without these resources the `auto` backend uses `nvattest`.
-On first use it loads the module from the first match and then the library
-next to it. The library's run-time search path is `$ORIGIN/lib` and
-`$ORIGIN/../lib`, so `libnvat` is found without changing the node's
-environment. The `dev_sev_gpu_nif` module always carries the name the library
-declares, so the NIF loads whatever generated name Device Forge gives the
-device module.
+A device loaded from its implementation archive (its module carries the
+name Device Forge generates) looks for `dev_sev_gpu_nif.beam` only in the
+archive's extracted resources: `dev_sev_gpu/` below its implementation
+directory, then the implementation directory itself. A device compiled from
+a source checkout under its source name, `dev_sev_gpu`, looks only in
+`src/dev_sev_gpu/priv/` below the node's working directory. Without these
+resources the `auto` backend uses `nvattest`. On first use the device loads
+the module from the first match and then the library next to it. The
+library's run-time search path is `$ORIGIN/lib` and `$ORIGIN/../lib`, so
+`libnvat` is found without changing the node's environment. The
+`dev_sev_gpu_nif` module always carries the name the library declares, so
+the NIF loads whatever generated name Device Forge gives the device module.
 
 The module and its library stay loaded for the life of the node. When a
 `dev_sev_gpu_nif` module loaded from another directory is already present
@@ -112,16 +115,19 @@ the node loads the module and library of the current archive.
      not exactly 64 hexadecimal characters, fail with `invalid_nonce`. The
      device MUST NOT substitute a default nonce.
   2. Select the backend from `sev-gpu-backend` (§3).
-  3. **NIF backend.** Collect evidence from all GPUs through NVML for the
-     nonce and serialize it; then attest the GPUs for the same nonce with
-     NVAT's default evidence policy and local verifier. The NVAT verdict is
-     the attestation call's return code. Any other NVAT failure (SDK
-     initialization, nonce parsing, evidence collection, serialization or
-     context setup) fails with `{nvat_error, Reason}`. The NIF is not
-     available when the `dev_sev_gpu_nif` module cannot be found or loaded,
-     or when its library cannot be loaded; then `nif` fails with
-     `nif_unavailable` and `auto` continues with the `nvattest` backend. A
-     loaded NIF's result is final in `auto` mode.
+  3. **NIF backend.** In one NIF call, collect evidence from all GPUs
+     through NVML for the nonce and serialize it; then attest the GPUs for
+     the same nonce with NVAT's default evidence policy and local verifier.
+     The NVAT verdict is the attestation call's return code. Any other NVAT
+     failure (SDK initialization, nonce parsing, evidence collection,
+     serialization or context setup) fails with `{nvat_error, Reason}`. The
+     call runs in a process of its own, and the device waits for it at most
+     `sev-gpu-nif-timeout`; a call that takes longer fails with
+     `nif_timeout` (§7). The NIF is not available when the `dev_sev_gpu_nif`
+     module cannot be found or loaded, or when its library cannot be loaded;
+     then `nif` fails with `nif_unavailable` and `auto` continues with the
+     `nvattest` backend. A loaded NIF's result, `nif_timeout` included, is
+     final in `auto` mode.
   4. **`nvattest` backend.** Require `sev-gpu-nvattest-path` to be an
      absolute path to an existing regular file, else fail with
      `nvattest_not_found`. Run, without a shell and with the environment
@@ -154,11 +160,15 @@ attests the submitted evidence itself.
   the node options of §3.
 - **Behaviour:**
   1. If neither `body` nor `evidences` is present, fail with
-     `evidence_required`. A binary is decoded as JSON. The value MUST be a
-     non-empty array of evidence entries (§2), or an object whose
-     `evidences` member is one (a whole `generate` result qualifies). Each
+     `evidence_required`. A binary larger than 1 MiB (1048576 bytes) fails
+     with `evidence_too_large` before it is decoded; another binary is
+     decoded as JSON. The value MUST be a non-empty array of evidence
+     entries (§2), or an object whose `evidences` member is one (a whole
+     `generate` result qualifies); else fail with `invalid_evidence`. An
+     array of more than 16 entries fails with `too_many_evidences`. Each
      entry's four fields MUST be UTF-8 strings, and the array MUST encode as
-     JSON; else fail with `invalid_evidence`.
+     JSON; else fail with `invalid_evidence`. An array whose compact JSON
+     encoding is larger than 1 MiB fails with `evidence_too_large`.
   2. Every entry MUST carry the same nonce (letter case ignored), and that
      nonce MUST be 64 hexadecimal characters; else fail with
      `invalid_evidence`. This is the evidence nonce.
@@ -166,10 +176,11 @@ attests the submitted evidence itself.
      (else `invalid_nonce`). If it differs from the evidence nonce, return
      `false` without running a backend.
   4. **NIF backend.** Pass the nonce, the evidence array and the scratch
-     directory to the NIF. The NIF writes the evidence array to a fresh file
-     in the scratch directory, attests it with NVAT's default evidence policy
-     and local verifier for the evidence nonce, and removes the file.
-     Failures are reported as in `generate`.
+     directory to the NIF in one call. The NIF writes the evidence array to
+     a fresh file in the scratch directory, attests it with NVAT's default
+     evidence policy and local verifier for the evidence nonce, and removes
+     the file. As in `generate`, the call is bounded by
+     `sev-gpu-nif-timeout` and failures are reported the same way.
   5. **`nvattest` backend.** Write the evidence array as JSON to a new file
      `sev-gpu-evidence-<32 hex characters>.json` in the scratch directory
      (creation fails if the name exists; a write failure fails with
@@ -274,7 +285,8 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   not cache results, and under the node's default cache settings results
   are not stored. A caller that wants a fresh report MUST use a fresh nonce.
 - `nvattest` runs `attest` before `collect-evidence`; each run has its own
-  timeout. The NIF collects first and attests second.
+  timeout. The NIF collects first and attests second, within one call and
+  one timeout.
 - EAT tokens carry NVAT's own issue and expiry times.
 - NVAT's default policy fetches reference integrity manifests (RIMs) from
   NVIDIA's RIM service (`rim.attestation.nvidia.com`) and checks certificate
@@ -288,9 +300,10 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   to a third party. A remote verifier MUST verify the returned `evidences`
   itself (with NVAT, NVIDIA's remote attestation service, or `verify` on a node
   it trusts) and MUST check that the evidence nonce is the nonce it chose.
-- Requests cannot select the backend, the `nvattest` path, the timeout or the
-  scratch directory; these are node options. Request values reach NVAT only
-  as a validated hexadecimal nonce and as evidence JSON.
+- Requests cannot select the backend, the `nvattest` path, the timeouts or
+  the scratch directory; these are node options. Request values reach NVAT
+  only as a validated hexadecimal nonce and as evidence JSON of at most 16
+  entries and 1 MiB.
 - `nvattest` runs from an absolute path through an argument vector, never
   through a shell. The device reads at most 16 MiB of its output and waits
   at most the configured timeout. On timeout it closes the port, which closes
@@ -302,14 +315,23 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   client, outside HyperBEAM's HTTP machinery. Their endpoints are NVAT's
   defaults and no request can change them; the RIM identifiers requested
   are derived from the evidence under appraisal.
+- Each NIF call runs in a process of its own, and the device waits for it
+  at most `sev-gpu-nif-timeout`. When the limit passes the device kills
+  that process, discards its result and fails with `nif_timeout`; the NVAT
+  work already under way finishes on its dirty I/O scheduler before the
+  process exits.
 - `verify` lets any caller start an NVAT appraisal, including the RIM and
-  OCSP requests. Operators that expose the device publicly MAY rate-limit
+  OCSP requests, for at most 16 evidence entries and 1 MiB of evidence per
+  request. Operators that expose the device publicly MAY rate-limit
   requests to it, for example at a reverse proxy.
 - Evidence files are created under unpredictable names, are never reused, and
   are deleted after each verification. They contain only the submitted
-  evidence.
-- The NIF runs on dirty I/O schedulers. Loading it does not change the node's
-  environment variables.
+  evidence, at most 1 MiB.
+- The NIF runs on dirty I/O schedulers, which the node shares with file
+  I/O; each call in progress occupies one until NVAT returns. Loading the
+  NIF does not change the node's environment variables.
+- A device loaded from its implementation archive loads native code only
+  from the archive's extracted resources (§3).
 - The result is not signed by this device. Binding GPU evidence to a host
   measurement is the job of `inference_measurement@1.0`.
 
@@ -323,13 +345,16 @@ Errors are returned as `{error, Reason}`:
 | `invalid_nonce` | both | `nonce` is not 64 hexadecimal characters. |
 | `invalid_backend` | both | `sev-gpu-backend` is not `auto`, `nif` or `nvattest`. |
 | `nif_unavailable` | both | Backend `nif` and the NIF is not available. |
-| `{nvat_error, Reason}` | both | The NIF reported a failure; `Reason` is NVAT's return-code text or the NIF's description (for example an unwritable scratch directory). |
+| `nif_timeout` | both | A NIF call exceeded `sev-gpu-nif-timeout`. |
+| `{nvat_error, Reason}` | both | The NIF reported a failure; `Reason` is NVAT's return-code text or the NIF's description (for example an unwritable scratch directory), or `NIF call failed` when the call ended without a result. |
 | `nvattest_not_found` | both | `nvattest` is needed and the configured path is not an absolute path to a regular file. |
 | `{nvattest_spawn_failed, Reason}` | both | The executable could not be started. |
 | `nvattest_timeout` | both | A run exceeded `sev-gpu-nvattest-timeout`. |
 | `nvattest_invalid_response` | both | Output was not a JSON object, or exceeded 16 MiB. |
 | `evidence_required` | `verify` | Neither `body` nor `evidences` is present. |
 | `invalid_evidence` | `verify` | The evidence is not a non-empty, JSON-encodable array of well-formed entries (four UTF-8 string fields) with one valid nonce. |
+| `too_many_evidences` | `verify` | The evidence array has more than 16 entries. |
+| `evidence_too_large` | `verify` | A binary larger than 1 MiB, or an evidence array whose compact JSON encoding is larger than 1 MiB. |
 | `{scratch_unavailable, Reason}` | `verify` | The `nvattest` backend could not write the evidence file. |
 
 A failed attestation is not an error: `generate` returns `verified` false and
@@ -380,8 +405,15 @@ hb_ao:resolve(
 9. `nvattest` is run from an absolute path without a shell, with
    `NVAT_LOG_LEVEL=off`; the device waits at most the configured timeout
    for each run.
-10. With backend `auto`, `nvattest` runs only when the NIF is not available.
-11. Evidence files written by `verify` are removed after use.
+10. The device waits at most `sev-gpu-nif-timeout` for each NIF call, and a
+    call that takes longer fails with `nif_timeout`.
+11. With backend `auto`, `nvattest` runs only when the NIF is not available.
+12. `verify` rejects more than 16 evidence entries with
+    `too_many_evidences`, and a body or evidence array larger than 1 MiB
+    with `evidence_too_large`, without running a backend.
+13. Evidence files written by `verify` are removed after use.
+14. A device loaded from its implementation archive loads the NIF only from
+    the archive's extracted resources.
 
 ## 11. Out of scope
 
