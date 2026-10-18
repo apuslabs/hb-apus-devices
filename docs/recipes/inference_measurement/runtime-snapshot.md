@@ -4,15 +4,21 @@ slug: runtime-snapshot
 ---
 # Read the GPU runtime snapshot
 
-Read volatile GPU facts from `nvidia-smi`. These values are not part of any
-digest.
+Read volatile GPU values such as temperature, power and utilization. They are
+not part of any digest or binding.
 
 ```bash
 HB=${HB:-https://hb.apus.network}
 curl -s -H 'accept: application/json' -H 'accept-bundle: true' \
-  "$HB/~inference_measurement@1.0/snapshot"
+  "$HB/~inference_measurement@1.0/snapshot" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print(s["type"], "supported:", s["supported"], "errors:", s["errors"])
+for d in s["devices"]:
+    print(d["pci-bdf"], d.get("temperature-c"), d.get("power-watts"), d.get("utilization-gpu-percent"))'
 ```
 
-Expected: `body.type` is `apus-gpu-runtime-snapshot` with `supported`,
-`devices` and `errors`. When `nvidia-smi` cannot be queried the body reports
-`supported: "false"` and an `errors` entry instead of failing.
+Expected: `apus-gpu-runtime-snapshot supported: true errors: []`, then one line
+per GPU with its temperature (C), power draw (W) and utilization (%). When
+`nvidia-smi` cannot be queried the snapshot reports `supported: false` and an
+`errors` entry instead of failing.
