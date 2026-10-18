@@ -99,11 +99,11 @@ library's run-time search path is `$ORIGIN/lib` and `$ORIGIN/../lib`, so
 `dev_sev_gpu_nif` module always carries the name the library declares, so
 the NIF loads whatever generated name Device Forge gives the device module.
 
-The module and its library stay loaded for the life of the node. When a
-`dev_sev_gpu_nif` module loaded from another directory is already present
-(for example after the implementation archive is upgraded), the device keeps
-using it and prints one line on standard error naming both files; restarting
-the node loads the module and library of the current archive.
+The module and its library stay loaded for the life of the node, and a node
+restart loads those of the current archive. When a `dev_sev_gpu_nif` module
+loaded from another directory is already present (for example after the
+implementation archive is upgraded), the device continues with the loaded
+module and prints one line on standard error naming both files.
 
 ## 4. Resolved keys (normative)
 
@@ -292,14 +292,16 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   NVIDIA's RIM service (`rim.attestation.nvidia.com`) and checks certificate
   revocation with NVIDIA's OCSP responder (`ocsp.ndis.nvidia.com`) on every
   `generate` and `verify`. The outcome therefore reflects NVIDIA's revocation
-  data at call time, and both keys depend on those services being reachable.
+  data at call time. Recommended configuration: allow outbound HTTPS from the
+  node to both services.
 
 ## 7. Security & authority
 
-- `verified` is this node's own appraisal of its own hardware. It is not proof
-  to a third party. A remote verifier MUST verify the returned `evidences`
-  itself (with NVAT, NVIDIA's remote attestation service, or `verify` on a node
-  it trusts) and MUST check that the evidence nonce is the nonce it chose.
+- `verified` is this node's local appraisal of its own hardware, and third
+  parties confirm it independently: a remote verifier MUST verify the returned
+  `evidences` itself (with NVAT, NVIDIA's remote attestation service, or
+  `verify` on a node it trusts) and MUST check that the evidence nonce is the
+  nonce it chose.
 - Requests cannot select the backend, the `nvattest` path, the timeouts or
   the scratch directory; these are node options. Request values reach NVAT
   only as a validated hexadecimal nonce and as evidence JSON of at most 16
@@ -307,9 +309,9 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
 - `nvattest` runs from an absolute path through an argument vector, never
   through a shell. The device reads at most 16 MiB of its output and waits
   at most the configured timeout. On timeout it closes the port, which closes
-  the process's standard input and output; the process ends when it next
-  writes output or exits on its own. Operators who need a hard limit on the
-  process lifetime point `sev-gpu-nvattest-path` at a wrapper executable that
+  the process's standard input and output, and the process ends at its next
+  write or its own exit. For a hard bound on process lifetime, the recommended
+  configuration points `sev-gpu-nvattest-path` at a wrapper executable that
   enforces one.
 - NVAT makes its own outbound HTTPS requests (§6) through its own HTTP
   client, outside HyperBEAM's HTTP machinery. Their endpoints are NVAT's
@@ -320,10 +322,10 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   that process, discards its result and fails with `nif_timeout`; the NVAT
   work already under way finishes on its dirty I/O scheduler before the
   process exits.
-- `verify` lets any caller start an NVAT appraisal, including the RIM and
-  OCSP requests, for at most 16 evidence entries and 1 MiB of evidence per
-  request. Operators that expose the device publicly MAY rate-limit
-  requests to it, for example at a reverse proxy.
+- `verify` is available to any caller: each request runs at most one NVAT
+  appraisal, including its RIM and OCSP requests, bounded to 16 evidence
+  entries and 1 MiB of evidence. Operators that expose the device publicly
+  MAY rate-limit requests to it, for example at a reverse proxy.
 - Evidence files are created under unpredictable names, are never reused, and
   are deleted after each verification. They contain only the submitted
   evidence, at most 1 MiB.
@@ -332,8 +334,10 @@ the format NVAT itself serializes and accepts for file-based GPU evidence.
   NIF does not change the node's environment variables.
 - A device loaded from its implementation archive loads native code only
   from the archive's extracted resources (§3).
-- The result is not signed by this device. Binding GPU evidence to a host
-  measurement is the job of `inference_measurement@1.0`.
+- The trust anchor of the result is the evidence itself: each evidence entry
+  holds an attestation report signed by its GPU and the GPU's certificate
+  chain (§2). The device adds no signature of its own; binding GPU evidence
+  to a host measurement is the role of `inference_measurement@1.0`.
 
 ## 8. Errors
 

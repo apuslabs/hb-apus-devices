@@ -352,8 +352,9 @@ observation(Purpose, Inventory, Binding, Opts, Failure) ->
         end,
     {ok, Signed}.
 
-%% @doc Whether the SEV-SNP guest device exists. A present device is not a
-%% verified report, so `verified' and `report-generated' stay false.
+%% @doc Whether the SEV-SNP guest device exists. A present device is
+%% reported as `available'; `verified' and `report-generated' describe a
+%% hardware report, which an observation does not carry, so they are false.
 cpu_tee_observation(Opts) ->
     Path = path_option(<<"inference-measurement-sev-guest-path">>, ?DEFAULT_SEV_GUEST_PATH, Opts),
     case file:read_file_info(Path) of
@@ -458,8 +459,9 @@ request_envelope(Req, Opts) ->
 %% composition the binding digest is recomputed from the recorded binding:
 %% the base device must verify its report against that digest and the
 %% report's evidence must carry it, so the binding is anchored in the
-%% hardware report. A `boot-measurement' composition binds nothing into
-%% the report; its `verified' covers the base measurement alone.
+%% hardware report. A `boot-measurement' composition carries the node's
+%% cached boot measurement, which predates the binding; its `verified'
+%% covers that base measurement.
 verify_composed(Envelope, Opts) ->
     Base = maps:without(?COMPOSITION_KEYS, Envelope),
     Composition = as_map(hb_maps:get(<<"apus-gpu-composition">>, Envelope, #{}, Opts), Opts),

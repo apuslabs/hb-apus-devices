@@ -712,13 +712,13 @@ truthy(_) -> false.
 -include_lib("eunit/include/eunit.hrl").
 
 %% TEST-NET addresses standing in for the caller and an intermediate proxy.
--define(LEAK_NEEDLES, [
+-define(CLIENT_METADATA_MARKERS, [
     <<"cf-connecting-ip">>, <<"cf-ipcountry">>, <<"cf-ray">>, <<"cf-visitor">>,
     <<"cdn-loop">>, <<"x-forwarded-for">>, <<"x-forwarded-proto">>,
     <<"x-real-ip">>, <<"true-client-ip">>, <<"forwarded">>, <<"user-agent">>,
     <<"cookie">>, <<"authorization">>,
-    <<"203.0.113.77">>, <<"198.51.100.20">>, <<"leak-test-agent">>,
-    <<"leak-test-cookie">>, <<"leak-test-token">>, <<"leak-test-user">>,
+    <<"203.0.113.77">>, <<"198.51.100.20">>, <<"client-test-agent">>,
+    <<"client-test-cookie">>, <<"client-test-token">>, <<"client-test-user">>,
     <<"a494f31a6eb0fd20">>
 ]).
 
@@ -727,8 +727,8 @@ truthy(_) -> false.
     "\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
     "\"content\":\"pong\"}}]}">>).
 
-%% An HTTP request as HyperBEAM receives it behind Cloudflare and Nginx.
-leaky_request() ->
+%% An HTTP request as HyperBEAM receives it behind a CDN and a reverse proxy.
+request_with_client_metadata() ->
     #{
         <<"accept">> => <<"*/*">>,
         <<"cdn-loop">> => <<"cloudflare; loops=1">>,
@@ -741,10 +741,10 @@ leaky_request() ->
         <<"x-real-ip">> => <<"203.0.113.77">>,
         <<"true-client-ip">> => <<"203.0.113.77">>,
         <<"forwarded">> => <<"for=203.0.113.77">>,
-        <<"user-agent">> => <<"leak-test-agent">>,
-        <<"cookie">> => <<"session=leak-test-cookie">>,
-        <<"authorization">> => <<"Bearer leak-test-token">>,
-        <<"user">> => <<"leak-test-user">>,
+        <<"user-agent">> => <<"client-test-agent">>,
+        <<"cookie">> => <<"session=client-test-cookie">>,
+        <<"authorization">> => <<"Bearer client-test-token">>,
+        <<"user">> => <<"client-test-user">>,
         <<"host">> => <<"hb.apus.network">>,
         <<"method">> => <<"POST">>,
         <<"model">> => <<"test-model">>,
@@ -754,9 +754,9 @@ leaky_request() ->
         <<"priv">> => #{<<"ip">> => <<"203.0.113.77">>}
     }.
 
-assert_no_transport_leak(Term) ->
+assert_no_client_metadata(Term) ->
     Bin = term_to_binary(Term),
-    ?assertEqual([], [Needle || Needle <- ?LEAK_NEEDLES,
+    ?assertEqual([], [Needle || Needle <- ?CLIENT_METADATA_MARKERS,
         binary:match(Bin, Needle) =/= nomatch]).
 
 chat_request() ->
@@ -827,22 +827,22 @@ info_lists_exactly_the_resolvable_keys_test() ->
     ?assertNot(erlang:function_exported(?MODULE, stop, 0)).
 
 public_request_keeps_only_generation_inputs_test() ->
-    Req = leaky_request(),
+    Req = request_with_client_metadata(),
     Public = public_request(Req, backend_payload(Req, #{}), #{}),
     ?assertEqual(
         lists:sort([<<"model">>, <<"messages">>, <<"max_tokens">>, <<"tee">>]),
         lists:sort(maps:keys(Public))),
-    assert_no_transport_leak(Public).
+    assert_no_client_metadata(Public).
 
 attestation_raw_excludes_transport_fields_test() ->
-    Req = leaky_request(),
+    Req = request_with_client_metadata(),
     Body = backend_payload(Req, #{}),
     Res = #{<<"status">> => 200, <<"content-type">> => ?JSON,
         <<"body">> => <<"{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}">>},
     Opts = #{<<"inference-attestation-device">> =>
         stub_attestation_device(self())},
     {ok, Result} = attested_response(Res, Req, Body, Opts),
-    assert_no_transport_leak(Result),
+    assert_no_client_metadata(Result),
     #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce}} =
         decode_body(Result),
     %% The report is requested for this nonce; it must be the digest of the
@@ -874,7 +874,7 @@ attestation_is_bound_to_the_digest_of_raw_test() ->
 %% `user-agent', `host', the private peer address) yield the same `ao-core'.
 ao_core_evidence_excludes_client_metadata_test() ->
     Res = #{<<"status">> => 200, <<"body">> => ?CHAT_RESPONSE},
-    Other = (leaky_request())#{
+    Other = (request_with_client_metadata())#{
         <<"x-real-ip">> => <<"203.0.113.78">>,
         <<"x-forwarded-for">> => <<"203.0.113.78">>,
         <<"cf-connecting-ip">> => <<"203.0.113.78">>,
@@ -882,18 +882,18 @@ ao_core_evidence_excludes_client_metadata_test() ->
         <<"host">> => <<"node.example">>,
         <<"priv">> => #{<<"ip">> => <<"203.0.113.78">>}
     },
-    Evidence = ao_core_evidence(leaky_request(), Res, #{}),
+    Evidence = ao_core_evidence(request_with_client_metadata(), Res, #{}),
     ?assertEqual(Evidence, ao_core_evidence(Other, Res, #{})),
-    assert_no_transport_leak(Evidence),
+    assert_no_client_metadata(Evidence),
     ?assertMatch(#{<<"status">> := <<"captured">>, <<"hashpath">> := _,
         <<"request-id">> := _, <<"response-id">> := _}, Evidence),
     ?assertEqual(?HASHPATH_SOURCE, maps:get(<<"source">>, Evidence)),
     ?assertEqual(
         lists:sort([<<"max_tokens">>, <<"messages">>, <<"model">>, <<"tee">>]),
-        lists:sort(maps:keys(public_step_request(leaky_request(), #{})))),
+        lists:sort(maps:keys(public_step_request(request_with_client_metadata(), #{})))),
     %% The same request sent as a JSON body gives the same public step.
     ?assertEqual(Evidence, ao_core_evidence(
-        #{<<"body">> => hb_json:encode(maps:remove(<<"priv">>, leaky_request()))},
+        #{<<"body">> => hb_json:encode(maps:remove(<<"priv">>, request_with_client_metadata()))},
         Res, #{})),
     %% The `raw' an attested response publishes carries the same evidence
     %% whatever the caller's address.
@@ -905,7 +905,7 @@ ao_core_evidence_excludes_client_metadata_test() ->
         #{<<"attestation">> := #{<<"raw">> := Raw}} = decode_body(Result),
         maps:get(<<"ao-core">>, hb_json:decode(Raw))
     end,
-    ?assertEqual(RawEvidence(leaky_request()), RawEvidence(Other)).
+    ?assertEqual(RawEvidence(request_with_client_metadata()), RawEvidence(Other)).
 
 %% Values that cannot be computed are omitted, never published as text.
 ao_core_evidence_omits_unknown_values_test() ->

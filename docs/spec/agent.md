@@ -284,8 +284,8 @@ and `priv` keys at every level (Erlang term text when not encodable as JSON).
 
 - Model calls are sequential and each sees the full conversation so far. Tool calls run in
   order; their tool messages follow the assistant frame in the same order.
-- `run` is not a pure function: it depends on the model, remote HTTP endpoints and cache
-  contents. Nested calls are made with `hashpath => ignore` and
+- `run` is computed live: its result depends on the model, remote HTTP endpoints and
+  cache contents. Nested calls are made with `hashpath => ignore` and
   `cache-control => [no-store, no-cache]`. The `run` result carries no cache directive; a
   node that stores results SHOULD exclude `/~agent@1.0/run`.
 - No state survives a run. Callers that need memory keep the transcript and send it in
@@ -306,22 +306,22 @@ and `priv` keys at every level (Erlang term text when not encodable as JSON).
   that are not absolute `http`/`https`, hosts named `localhost` or ending in `.localhost`,
   and IP-address literals (short, integer, IPv6 and IPv4-mapped forms included) that are
   not public unicast addresses under HyperBEAM's hostname policy (loopback, private,
-  link-local, unspecified and other special-use ranges, and the node's own subnets). Other
-  names are not resolved by this device; `relay@1.0` applies DNS-based checks under its
-  `relay-block-internal` (default true) and `relay-allowed-hosts` options, so protection
-  against names that resolve to private addresses depends on that relay policy.
+  link-local, unspecified and other special-use ranges, and the node's own subnets). Host
+  names are checked by `relay@1.0`, which applies DNS-based checks under its
+  `relay-block-internal` (default true) and `relay-allowed-hosts` options; under the
+  default relay policy, names that resolve to private addresses are refused as well.
   `agent-http-allow-private` disables only this device's check; to reach private hosts the
   relay policy MUST also allow them.
 - **`bundle_item` writes with the node's identity.** When enabled, data chosen by the
   model is signed with the node's wallet and uploaded permanently, at the node's cost. It
-  is disabled by default and cannot be enabled by a request. Tool results are untrusted
-  input: fetched content can steer the model, which operators SHOULD weigh before enabling
-  writes.
+  is disabled by default and cannot be enabled by a request. Tool results are external
+  input that enters the model's context; operators SHOULD treat them as untrusted and weigh
+  this before enabling writes.
 - **Bounded work.** A run makes at most `agent-max-iterations-limit` model calls and
   processes at most `agent-max-tool-calls-per-completion` tool calls per completion and
   `agent-max-tool-calls-per-run` per run. The device bounds the result text handed to the
-  model, not the transfer: `relay@1.0` receives the full response body before it is cut,
-  so the transfer size depends on the node's relay and network policy.
+  model (§5.5); transfer size is governed by the node's relay and network policy, since
+  `relay@1.0` receives the full response body before the device cuts it.
 - **No internal terms in results.** Exceptions and error terms from the inference and tool
   devices are logged on the node and replaced by the generic messages of §8; only error
   envelopes, status codes, error bodies and atom or text reasons are passed on. The result

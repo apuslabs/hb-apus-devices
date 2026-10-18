@@ -24,9 +24,10 @@ runtime's response and the AO-Core execution link in a JSON document called
 exactly those bytes. A verifier can therefore tie a hardware report to one
 request and one response.
 
-Results are complete messages. The device does not stream: `stream=true` is
-rejected (§8), because an AO-Core result is one message and both the
-attestation and `inference_receipt@1.0` cover a complete response body.
+Results are complete messages: each result is one AO-Core message carrying
+the full response body, which both the attestation and
+`inference_receipt@1.0` cover. A request with `stream=true` receives the 400
+error `streaming_unsupported` (§8).
 
 **Reference deployment (informative).** Apus Network operates this device at
 `https://hb.apus.network`. There, the runtime is SGLang serving
@@ -269,8 +270,8 @@ specification defines (such as `evidences`, `claims`, `eat` and
   hyphen spelling accepted, reported with underscores). Other keys of
   `inference-opts` are never reported.
 
-Declared facts are operator statements; the device does not check them
-against the runtime.
+Declared facts are operator statements, reported as configured; a verifier
+confirms them against the deployed model and runtime.
 
 **Error body.** HTTP-shaped error results carry
 `content-type: application/json`. Errors produced by the device have the body
@@ -300,30 +301,33 @@ error whose body is a JSON object is returned with that body unchanged.
   host, nor obtain an attestation for a response from another server.
 - **Credential handling.** `inference-api-key` is sent only to the runtime
   origin, as `authorization: Bearer <key>`. It is never recorded in `raw`
-  and never returned. Over `http` it travels in clear text, so a runtime
-  outside the node's host SHOULD be reached over `https`.
+  and never returned. A runtime outside the node's host SHOULD be reached
+  over `https`, so that TLS protects the credential in transit.
 - **Published data.** `raw` records only the public request and the
   identifiers of the public step. HTTP headers (including `cf-*`,
   `x-forwarded-*`, `x-real-ip`, `user-agent`, `host`, cookies and
   credentials), the `user` identifier and the caller's private address are
   never recorded, and never enter the HashPath or the IDs in `raw.ao-core`,
   so two requests that differ only in them yield the same `raw.ao-core`.
-  Prompts and completions in `raw` become public when a client publishes the
-  attestation.
+  An attestation is designed as public evidence: `raw` carries the prompt
+  and the completion, so anyone who holds a published attestation can verify
+  exactly which request and response the hardware report covers.
 - **What the attestation proves.** A report for the attestation nonce shows
-  that the attesting hardware produced it after `raw` existed. It does not by
-  itself prove where the runtime ran: that is a property of the deployment
-  (in the reference deployment, HyperBEAM, the runtime and the GPU share one
-  confidential guest). `verified` in the attestation is the node's own
-  check. A verifier SHOULD recompute the attestation nonce from `raw`, check
-  that the report carries that nonce, and verify the report with the
-  hardware vendor's verifier.
-- **Error detail.** Transport failures are reported without detail, because
-  the underlying reason can name internal addresses; the node records the
-  reason as an `inference` event.
-- **Access.** The device does not authenticate callers. Anyone who can reach
-  the node can use the configured runtime; capacity limits are the
-  operator's responsibility.
+  that the attesting hardware produced it after `raw` existed, which binds
+  the hardware evidence to exactly the request and response that `raw`
+  records. Where the runtime runs is a property of the deployment: in the
+  reference deployment, HyperBEAM, the runtime and the GPU share one
+  confidential guest. `verified` in the attestation records the node's own
+  check; for independent confirmation, a verifier SHOULD recompute the
+  attestation nonce from `raw`, check that the report carries that nonce,
+  and verify the report with the hardware vendor's verifier.
+- **Error detail.** Transport failures are reported as the generic
+  `runtime_unavailable` error, so responses never disclose the operator's
+  network addresses; the node records the underlying reason as an
+  `inference` event.
+- **Access.** The device serves every caller that reaches the node; operators
+  apply caller authentication and capacity limits in front of the node, for
+  example at a gateway (§11).
 
 ## 8. Errors
 

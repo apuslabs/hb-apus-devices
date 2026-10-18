@@ -16,12 +16,12 @@ an inventory report is reused for a short, configurable time (five seconds
 by default), and concurrent requests wait for the collection in progress
 instead of starting another `nvidia-smi` run.
 
-The device makes no attestation claim: every value is what the host kernel
-and NVIDIA's management tools report, and a compromised host can report
-anything. Its role in the Apus Network attestation chain is to give each
-measurement and inference receipt a stable fingerprint of the GPU hardware
-it refers to; `inference_measurement@1.0` binds that fingerprint into
-hardware-measured nonces.
+Its role in the Apus Network attestation chain is to give each measurement
+and inference receipt a stable fingerprint of the GPU hardware it refers to.
+Every value is exactly what the host kernel and NVIDIA's management tools
+report, and every result states its provenance class (§2). Hardware-rooted
+assurance builds on this fingerprint: `inference_measurement@1.0` binds it
+into hardware-measured nonces, and `sev_gpu@1.0` attests the GPU itself.
 
 ## 2. Concepts & terminology
 
@@ -35,8 +35,9 @@ hardware-measured nonces.
 - **Stable row:** a row without volatile fields and without unknown values.
 - **Inventory digest:** base64url (unpadded) SHA-256 of the canonical JSON
   encoding of the stable rows and the topology (§5.3).
-- **Provenance classes:** `host-observed` (read from the host's kernel and
-  tools; spoofable by a compromised host) for `report` and `digest`, and
+- **Provenance classes:** `host-observed` (as reported by the host's kernel
+  and tools; the attestation devices bind the digest into hardware-signed
+  evidence of the host that reported it, §7) for `report` and `digest`, and
   `runtime-observed` (volatile values) for `snapshot`.
 - **Collection:** one reading of the host that produces a report (sysfs and
   the `nvidia-smi` inventory query) or a snapshot (the `nvidia-smi` runtime
@@ -245,24 +246,28 @@ rendered as the strings `"true"` and `"false"`, typed through `ao-types`.
 
 ## 7. Security & authority
 
-- Every value is host-observed. The digest identifies what the host
-  reported; it does not prove what hardware is present.
+- Every value is host-observed, and each result says so in its provenance
+  class. The digest is a stable fingerprint of the hardware the host
+  reports. `inference_measurement@1.0` binds the digest into the nonces of
+  the host measurement and of the `sev_gpu@1.0` GPU attestation, so
+  hardware-signed evidence attests that the measured host reported this
+  inventory.
 - Requests cannot choose the sysfs root, the executable, the timeout or the
   reuse time; these are node options. No key reads the request or base
   message.
 - `nvidia-smi` runs through an argument vector with predefined field lists,
   never through a shell. The device reads at most 1 MiB of its output and
-  waits at most the configured timeout. On timeout it closes the port, which
-  closes the process's standard input and output; the process ends when it
-  next writes output or exits on its own.
+  waits at most the configured timeout. On timeout it closes the port,
+  closing the process's standard input and output, and reports `timeout`
+  at once; the process then ends at its next write or when it exits.
 - While the coordinator runs (§6), for each configuration it runs at most
   one report collection and one snapshot collection at a time, and it
   starts a new report collection no earlier than `gpu-inventory-cache-ms`
   after the previous one returned its report. Concurrent requests therefore
-  share `nvidia-smi` runs. When a collection process or the coordinator
-  stops without a result, each request that was waiting for it collects for
-  itself in its own process, so those requests run `nvidia-smi`
-  concurrently.
+  share `nvidia-smi` runs. If a collection process or the coordinator stops
+  without a result, every request that was waiting for it still completes:
+  each collects for itself in its own process, running `nvidia-smi` in
+  parallel with the others.
 - The report contains PCI identities, driver and firmware versions and GPU
   UUIDs. It contains no credentials and no file paths.
 

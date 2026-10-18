@@ -59,8 +59,9 @@ Together they form an attestation chain for a single completion:
 - `inference_measurement@1.0` reads the inventory from `gpu_inventory@1.0`
   and binds its digest and the caller's nonce into the nonce of a fresh AMD
   SEV-SNP measurement produced by `measurement@1.0`, and requests fresh GPU
-  evidence from `sev_gpu@1.0` for the measurement envelope. Without
-  `measurement@1.0` it returns an explicitly lower-trust observation.
+  evidence from `sev_gpu@1.0` for the measurement envelope. On a node
+  without `measurement@1.0` it returns an observation envelope with the same
+  inventory, GPU evidence and binding, explicitly labelled `host-observed`.
 - `inference_receipt@1.0` runs the completion through `inference@1.0`,
   collects the inventory and a fresh measurement, and signs a receipt that a
   third party can check against the AO-Core HashPath of the execution.
@@ -81,8 +82,10 @@ requests without `tee=true` from the model runtime directly; attested
 completions (`tee=true`) and every other path are resolved by the HyperBEAM
 node. For each attested completion, the gateway publishes the request's chat
 messages and generation parameters, the model response and the GPU
-attestation to Arweave as a permanent, public data item. Do not send content
-that must stay private as an attested completion to the public endpoint.
+attestation to Arweave as a permanent, public data item. Attested
+completions on the public endpoint are public by design, so anyone can verify
+them; for content that must stay private, use a completion without
+`tee=true` or a node you operate.
 
 ## Vendored PermawebOS devices
 

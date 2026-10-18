@@ -62,8 +62,8 @@ An example JSON node configuration (load it with `HB_CONFIG=config.json`):
 
 `inference-opts` accepts `model_name`, `model_revision`, `model_sha256`,
 `runtime_name`, `runtime_version`, `runtime_build_hash`, `precision` and
-`deterministic`. They are operator statements: the device reports them but
-does not check them against the runtime. Other keys are never reported.
+`deterministic`. They are operator declarations, which the device reports
+in `resolved_model` as declared. Other keys are never reported.
 
 Start the runtime on the configured address, for example SGLang:
 
@@ -107,8 +107,8 @@ Send `tee=true` (a query parameter or a JSON field). The response gains:
 and the AO-Core execution link: the HashPath and request ID of the public
 step, which holds the generation parameters and never the HTTP message. HTTP
 headers, the `user` identifier and the caller's address are never recorded or
-bound into that HashPath. Prompts and completions in `raw` become public when
-an attestation is published.
+bound into that HashPath. Publishing an attestation makes `raw`, with its
+prompts and completions, publicly verifiable.
 
 To check the binding, recompute the nonce from `raw`:
 
@@ -132,8 +132,8 @@ treat as unattested.
 with a `receipt`. Execution-profile declarations (`model-sha256`,
 `runtime-build-hash`, `inference-profile`, `model-source`, `model-tx`,
 `workload-manifest-id`, `model-revision`, `runtime-name`,
-`runtime-version`) may be sent with the request; they are recorded, not
-checked. The receipt's bindings `model-sha256`, `runtime-build-hash`,
+`runtime-version`) may be sent with the request; they are recorded as
+declared. The receipt's bindings `model-sha256`, `runtime-build-hash`,
 `inference-profile`, `model-source` and `model-tx` take the node option of
 the same name when it is set, and the request's declaration otherwise.
 
@@ -161,8 +161,9 @@ curl -s -X POST "$HB/~inference_receipt@1.0/v1/chat/completions" \
 
 The answer's `body.verified` is `true` (the string `"true"` in the typed
 HTTP encoding) when the recorded response is linked to the recorded base and
-request. Hardware provenance and model identity need the measurement and
-attestation checks. A `verification-input-term` whose text exceeds
+request. Hardware provenance is established by the receipt's measurement
+and attestation evidence, and model identity by comparing the receipt's model
+bindings with the deployed model. A `verification-input-term` whose text exceeds
 1,398,102 bytes (the base64url length of 1 MiB), or that holds a compressed
 term, is refused with 400 before it is decoded.
 
@@ -171,10 +172,12 @@ node's bundler; it spends the publication wallet's funds. It accepts a
 receipt, or a JSON object that carries one under `report.receipt`, of at most
 8 MiB, whose `node-address` is this node, or a publication record whose
 `attestation` is bound to its `raw` document (its `nonce` is the SHA-256 of
-`raw`). These are structural checks, not a
-signature check, so restrict `publish` to your gateway: set
-`receipt-publishers` to the gateway's signing address, or refuse
-`/~inference_receipt@1.0/publish` to every other caller in front of the node.
+`raw`). The checks are structural, so a receipt stays publishable after a
+client's JSON round trip; the receipt's origin is confirmed through its
+`signed-receipt`, as described below. The recommended configuration
+restricts `publish` to your gateway: set `receipt-publishers` to the
+gateway's signing address, or refuse `/~inference_receipt@1.0/publish` to
+every other caller in front of the node.
 A gateway that calls `publish` on behalf of its own callers should pass it
 only receipts the node returned to that gateway.
 With `receipt-publishers` set, the publisher signs a message holding only

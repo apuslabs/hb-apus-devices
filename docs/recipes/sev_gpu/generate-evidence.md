@@ -21,5 +21,6 @@ print("verified:      ", r["verified"])' "$NONCE"
 
 Expected: `True`, `True`, `['success']` (one entry per GPU) and `True`. The
 full response also carries `claims` with NVIDIA's appraisal of each GPU and
-`eat`, the detached Entity Attestation Token. A plain-text body such as
-`nvattest_not_found` instead of JSON means the node cannot attest its GPU.
+`eat`, the detached Entity Attestation Token. A node without an available
+attestation backend answers with status 503 and a JSON body such as
+`{"error": "nvattest_not_found"}`.

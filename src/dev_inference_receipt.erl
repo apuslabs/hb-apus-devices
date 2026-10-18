@@ -233,11 +233,13 @@ publishable_document(Value, Opts) ->
 %% `node-address' must be this node's address. A publication record whose
 %% receipt does not name the node is accepted when its `attestation' is the
 %% one `inference@1.0' attaches with `tee=true': `nonce' is the SHA-256 of
-%% `raw' and GPU evidence is present (bound_attestation/1). `signed-receipt' is not
-%% verified here: a JSON round trip in another language can change committed
-%% values (an integral float such as `1.0' becomes an integer, and integers
-%% beyond 2^53 are rounded), so a signature check would refuse genuine
-%% receipts.
+%% `raw' and GPU evidence is present (bound_attestation/1). These checks
+%% cover structure and `node-address', so receipts are accepted in the form
+%% clients re-serialize them: a JSON round trip in another language can
+%% change the form of committed values (an integral float such as `1.0'
+%% becomes an integer, and integers beyond 2^53 are rounded).
+%% `signed-receipt' is verified by the verification workflow, on the receipt
+%% as the node returned it.
 publishable_receipt(Data, Opts) ->
     Document = try hb_json:decode(Data) catch _:_ -> undefined end,
     case Document of
@@ -940,7 +942,8 @@ result_body(Result, Opts) when is_map(Result) ->
 result_body(_Result, _Opts) ->
     #{}.
 
-%% @doc Extract measurement metadata without asserting a trust class.
+%% @doc Extract measurement metadata, with the provenance class the
+%% measurement envelope records (`host-observed' when it records none).
 measurement_fields(Body, Opts) when is_map(Body) ->
     Composition = hb_ao:get(<<"apus-gpu-composition">>, Body, #{}, Opts),
     Integrated = maps:get(<<"measurement-integration">>, Composition, false),
@@ -1037,18 +1040,18 @@ first_defined([Value | _]) -> Value.
 -include_lib("eunit/include/eunit.hrl").
 
 %% TEST-NET addresses standing in for the caller and an intermediate proxy.
--define(LEAK_NEEDLES, [
+-define(CLIENT_METADATA_MARKERS, [
     <<"cf-connecting-ip">>, <<"cf-ipcountry">>, <<"cf-ray">>, <<"cf-visitor">>,
     <<"cdn-loop">>, <<"x-forwarded-for">>, <<"x-forwarded-proto">>,
     <<"x-real-ip">>, <<"true-client-ip">>, <<"forwarded">>, <<"user-agent">>,
     <<"cookie">>, <<"authorization">>,
-    <<"203.0.113.77">>, <<"198.51.100.20">>, <<"leak-test-agent">>,
-    <<"leak-test-cookie">>, <<"leak-test-token">>, <<"leak-test-user">>,
+    <<"203.0.113.77">>, <<"198.51.100.20">>, <<"client-test-agent">>,
+    <<"client-test-cookie">>, <<"client-test-token">>, <<"client-test-user">>,
     <<"a494f31a6eb0fd20">>
 ]).
 
-%% An HTTP request as HyperBEAM receives it behind Cloudflare and Nginx.
-leaky_request() ->
+%% An HTTP request as HyperBEAM receives it behind a CDN and a reverse proxy.
+request_with_client_metadata() ->
     #{
         <<"accept">> => <<"*/*">>,
         <<"cdn-loop">> => <<"cloudflare; loops=1">>,
@@ -1061,10 +1064,10 @@ leaky_request() ->
         <<"x-real-ip">> => <<"203.0.113.77">>,
         <<"true-client-ip">> => <<"203.0.113.77">>,
         <<"forwarded">> => <<"for=203.0.113.77">>,
-        <<"user-agent">> => <<"leak-test-agent">>,
-        <<"cookie">> => <<"session=leak-test-cookie">>,
-        <<"authorization">> => <<"Bearer leak-test-token">>,
-        <<"user">> => <<"leak-test-user">>,
+        <<"user-agent">> => <<"client-test-agent">>,
+        <<"cookie">> => <<"session=client-test-cookie">>,
+        <<"authorization">> => <<"Bearer client-test-token">>,
+        <<"user">> => <<"client-test-user">>,
         <<"host">> => <<"hb.apus.network">>,
         <<"method">> => <<"POST">>,
         <<"model">> => <<"test-model">>,
@@ -1074,15 +1077,15 @@ leaky_request() ->
         <<"priv">> => #{<<"ip">> => <<"203.0.113.77">>}
     }.
 
-assert_no_transport_leak(Term) ->
+assert_no_client_metadata(Term) ->
     Bin = term_to_binary(Term),
-    ?assertEqual([], [Needle || Needle <- ?LEAK_NEEDLES,
+    ?assertEqual([], [Needle || Needle <- ?CLIENT_METADATA_MARKERS,
         binary:match(Bin, Needle) =/= nomatch]).
 
 execution_request_is_allowlisted_and_fresh_test() ->
-    A = execution_request(<<"completions">>, leaky_request(), #{}),
-    B = execution_request(<<"completions">>, leaky_request(), #{}),
-    assert_no_transport_leak(A),
+    A = execution_request(<<"completions">>, request_with_client_metadata(), #{}),
+    B = execution_request(<<"completions">>, request_with_client_metadata(), #{}),
+    assert_no_client_metadata(A),
     ?assertEqual(<<"completions">>, maps:get(<<"path">>, A)),
     ?assertNotEqual(maps:get(<<"request-nonce">>, A),
         maps:get(<<"request-nonce">>, B)),
@@ -1100,8 +1103,8 @@ runtime_endpoints() ->
         {"/health", health, {200, <<>>}}
     ].
 
-%% Node options for a runtime at `URL'. `hashpath: ignore' mirrors the
-%% reference deployment, which disables HashPaths globally.
+%% Node options for a runtime at `URL'. With `hashpath: ignore' the node
+%% skips HashPaths globally, and the receipt still records its step's HashPath.
 node_opts(URL) ->
     #{
         <<"inference-peer">> => URL,
@@ -1148,8 +1151,8 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
                 <<"inference-attestation-device">> =>
                     stub_attestation_device(self(), Ref)
             },
-            {ok, Result} = completions(#{}, leaky_request(), Opts),
-            assert_no_transport_leak(Result),
+            {ok, Result} = completions(#{}, request_with_client_metadata(), Opts),
+            assert_no_client_metadata(Result),
             #{<<"ao-core">> := AOCore, <<"request-digest">> := RequestDigest,
                 <<"device-chain">> := DeviceChain,
                 <<"node-address">> := NodeAddress} =
@@ -1168,7 +1171,7 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
             ?assertMatch(<<131, Tag, _/binary>> when Tag =/= 80,
                 hb_util:decode(Term)),
             Transcript = binary_to_term(hb_util:decode(Term), [safe]),
-            assert_no_transport_leak(Transcript),
+            assert_no_client_metadata(Transcript),
             %% Verifiers can recompute the request digest from the transcript.
             ?assertEqual(RequestDigest, digest(maps:get(request, Transcript))),
             ?assertEqual(<<"verified">>,
@@ -1402,7 +1405,7 @@ receipt_relays_every_generation_key_test_() ->
             Request = maps:from_list([{Key, generation_value(Key)}
                 || Key <- ?GENERATION_KEYS]),
             {ok, _} = completions(#{},
-                Request#{<<"user">> => <<"leak-test-user">>}, node_opts(URL)),
+                Request#{<<"user">> => <<"client-test-user">>}, node_opts(URL)),
             [Sent] = hb_mock_server:get_requests(chat, 1, Handle),
             Relayed = hb_json:decode(maps:get(<<"body">>, Sent)),
             ?assertEqual(lists:sort(?GENERATION_KEYS),
@@ -1602,7 +1605,7 @@ unavailable_probes_contribute_empty_objects_test() ->
 
 publish_requires_a_receipt_test() ->
     ?assertEqual({400, #{<<"error">> => <<"receipt-required">>}},
-        error_json(publish(#{}, leaky_request(), #{}))).
+        error_json(publish(#{}, request_with_client_metadata(), #{}))).
 
 %% A receipt document with the keys `publish' requires, naming `Address'.
 receipt_document(Address) ->

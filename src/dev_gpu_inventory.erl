@@ -3,9 +3,10 @@
 %%% `gpu_inventory@1.0' reads PCI display controllers and 3D/processing
 %%% accelerators from the node's sysfs tree, enriches NVIDIA GPUs with a
 %%% predefined `nvidia-smi' query, and commits the stable facts to a canonical
-%%% digest. It makes no attestation claim: every value is what the host
-%%% reports. The sysfs root and the `nvidia-smi' executable are node options;
-%%% a request cannot select either. Collections are shared on the node: an
+%%% digest. Every value is exactly what the host reports, and every result
+%%% states its provenance class; `sev_gpu@1.0' attests the GPU itself. The
+%%% sysfs root and the `nvidia-smi' executable are node options; a request
+%%% cannot select either. Collections are shared on the node: an
 %%% inventory report is reused for a short, configurable time, and requests
 %%% that arrive while a collection runs wait for its result instead of
 %%% starting another `nvidia-smi' run.

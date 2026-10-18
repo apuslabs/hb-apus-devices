@@ -33,5 +33,6 @@ report in `evidence` carries base64url(D) and the GPU evidence carries hex(D),
 where D is the SHA-256 of the binding; `cpu-tee.verified` is the base
 device's check that the report commits to that nonce. A node without a host
 measurement device answers with `apus-gpu-system-measurement
-observation-only`, a node-signed observation that makes no hardware claim;
-its `SNP nonce` line prints `False`.
+observation-only`, a node-signed envelope with the same GPU evidence and
+binding, labelled `host-observed` and never presented as a hardware
+measurement; its `SNP nonce` line prints `False`.

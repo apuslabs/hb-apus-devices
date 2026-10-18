@@ -41,7 +41,8 @@ in confidential-computing mode.
 - **Declarations:** optional caller statements about the deployed artifacts:
   `model-sha256`, `runtime-build-hash`, `inference-profile`, `model-source`,
   `model-tx`, `workload-manifest-id`, `model-revision`, `runtime-name`,
-  `runtime-version`. They are recorded, not checked.
+  `runtime-version`. They are recorded exactly as given, for a verifier to
+  compare with the deployed artifacts.
 - **Execution bindings:** the receipt keys `model-sha256`,
   `runtime-build-hash`, `inference-profile`, `model-source` and `model-tx`.
   Each is the operator's node option of the same name when it is set,
@@ -259,13 +260,13 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      a string, `nonce` is the lowercase hex SHA-256 of `raw`, and `evidences`
      is a non-empty list. Such a record documents an attested completion
      served by `inference@1.0` without a receipt.
-  6. The device checks the structure and `node-address` only; it does not
-     verify `signed-receipt`. A receipt that reaches it through a client's
-     JSON round trip, such as the reference gateway's JavaScript parse and
-     serialization, can carry committed values in another form: an
-     integral floating-point value such as `1.0` arrives as the integer `1`,
-     and an integer beyond 2^53 arrives rounded. A signature check would
-     therefore refuse genuine receipts.
+  6. `publish` validates the receipt's structure and `node-address`, so that
+     it accepts receipts in the form clients re-serialize them: a JSON round
+     trip, such as a JavaScript parse and serialization, can change the form
+     of committed values (an integral floating-point value such as `1.0`
+     becomes the integer `1`, and an integer beyond 2^53 is rounded).
+     Verification of `signed-receipt` belongs to the verification workflow
+     (§9), on the receipt as the node returned it.
   7. The device commits `{data: <document>, content-type:
      application/json}` with `ans104@1.0`, signed by the publication wallet,
      resolves `bundler@1.0` with `path: item`, `await: true` and a bundle
@@ -300,7 +301,7 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 | `issued-at-unix` | Unix time in seconds. |
 | `sequence` | Unix time in milliseconds. |
 | `ao-core` | Execution evidence (below). |
-| `device-chain` | `status` (`captured`), `receipt-device` (`inference_receipt@1.0`), `measurement-device` (`inference_measurement@1.0`), `inventory-device` (`gpu_inventory@1.0`) and `loader`, the constant `HyperBEAM Device Forge`: the toolchain that packages these devices. `loader` does not record how the node loaded the module. |
+| `device-chain` | `status` (`captured`), `receipt-device` (`inference_receipt@1.0`), `measurement-device` (`inference_measurement@1.0`), `inventory-device` (`gpu_inventory@1.0`) and `loader`, a constant label (`HyperBEAM Device Forge`) naming the toolchain that packages these devices. |
 | `receipt-id` | Signed ID of `signed-receipt`. |
 | `signed-receipt` | The receipt above (without `receipt-id`, `signed-receipt` and `node-address`), committed with the node's identity through the node's `commitment-device` (HyperBEAM default `httpsig@1.0`). |
 | `node-address` | The address that signed `signed-receipt`; present when the commitment succeeded. |
@@ -399,40 +400,42 @@ of §8. In these bodies `verified` is the JSON literal `false`.
   operator's value is the one signed at the top level of the receipt. A
   declaration still enters the executed request as given, and therefore the
   transcript and `request-digest`. Declarations without a node option are
-  caller claims. A verifier MUST compare bindings and declarations with the
-  deployed artifacts; the device does not download or hash the model.
+  recorded as the caller's statements. A verifier MUST compare bindings and
+  declarations with the deployed artifacts, as a verification step outside
+  the device (§11).
 - **Signatures.** `signed-receipt` is committed with the node's identity
   wallet; `node-address` names it. Published data items are signed by the
   publication wallet: the wallet at `receipt-wallet-location` when set, which
   keeps upload funds separate from the node's identity, otherwise the node
   wallet.
-- **Publishing spends funds.** Each accepted `publish` call signs a data item
-  and pays for its upload. Without `receipt-publishers`, any caller that
-  reaches the key can publish a document that passes the checks of §4.
-  Operators SHOULD restrict `publish` to their gateway: set
-  `receipt-publishers` to the gateway's signing address, or refuse
-  `/~inference_receipt@1.0/publish` to every other caller in front of the
-  node. A gateway that calls `publish` on behalf of its own callers extends
-  this reach to them, so it SHOULD pass `publish` only receipts that the
+- **Publishing configuration.** Each accepted `publish` call signs a data
+  item and pays for its upload from the publication wallet. The recommended
+  configuration restricts `publish` to the operator's gateway: operators
+  SHOULD set `receipt-publishers` to the gateway's signing address, or
+  refuse `/~inference_receipt@1.0/publish` to every other caller in front of
+  the node. With `receipt-publishers` unset, the key accepts from any caller
+  a document that passes the checks of §4. A gateway that publishes on
+  behalf of its own callers SHOULD pass `publish` only receipts that the
   node returned to that gateway.
-- **What `publish` checks.** The checks of §4 establish that a document has
-  the shape of a receipt and names this node in `node-address`, or that a
-  publication record carries an attestation bound to its `raw` document,
-  within 8 MiB.
-  They are not a signature check: `node-address` is a public value, so a
-  caller can build a document that passes them, and a publication record can
-  carry fields beside its receipt. Proof that the node produced a receipt is
-  `signed-receipt`, which verifies on the receipt as the node returned it
-  (§5); a copy that went through a JSON round trip that changed the form of
-  committed values (§4, `publish`) does not verify.
+- **Receipt authenticity.** The checks of §4 admit a document of at most
+  8 MiB that has the shape of a receipt naming this node in `node-address`,
+  or a publication record that carries an attestation bound to its `raw`
+  document. Since `node-address` is a public value, authenticity rests on
+  `signed-receipt`, which verifies with `hb_message:verify` on the receipt
+  as the node returned it (§5) and has `node-address` as its only signer; a
+  verifier checks it in that form, because a JSON round trip can change the
+  form of committed values (§4, `publish`). The signature authenticates the
+  receipt itself; fields of a publication record beside it are
+  authenticated by the evidence that covers them, such as an attestation
+  bound to `raw`.
 - **Publisher authority.** With `receipt-publishers` set, authority comes
   from a verified commitment by a listed address over the published key.
   HyperBEAM routes `/~inference_receipt@1.0/publish` to this key with `path:
   publish`, so a commitment that also covers `path` does not verify and is
   refused; publishers commit to the published key alone and send the signed
-  message to that path. The device does not detect replays: a captured
-  signed request publishes its data again, so publishers SHOULD send signed
-  requests only over private or encrypted channels.
+  message to that path. A signed request authorizes the publication of its
+  data each time it is presented, so publishers SHOULD send signed requests
+  only over private or encrypted channels.
 - **Posted evidence is data.** `verify-hashpath` reads posted values without
   device dispatch. The text of `verification-input-term` is bounded to
   1,398,102 bytes, the base64url length of 1 MiB, before it is decoded,
@@ -545,7 +548,9 @@ of §8. In these bodies `verified` is the JSON literal `false`.
     `receipt-publishers` set, it first refuses with 403 any request without
     a verified commitment by a listed address over the published key; it
     publishes only documents of at most 8 MiB that carry a receipt with the
-    keys of §4 whose `node-address` is this node.
+    keys of §4 whose `node-address` is this node, or a publication record
+    whose attestation `nonce` is the SHA-256 of its `raw` and whose
+    `evidences` list is non-empty.
 13. Error results carry `content-type: application/json` and the JSON bodies
     of §8.
 14. `models` and `health` return the `inference@1.0` result unchanged and

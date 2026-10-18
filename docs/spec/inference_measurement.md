@@ -21,10 +21,9 @@ recomputes the digest from the recorded binding, has the base measurement
 device verify the host report against it, and compares it with the GPU
 evidence nonce; `verify` performs exactly these checks.
 
-On a node without a working host measurement device the device returns a
-node-signed **observation** envelope: the same inventory, GPU evidence and
-binding, labelled `host-observed` and never presented as a hardware
-measurement.
+When no host measurement is available, the device returns a node-signed
+**observation** envelope: the same inventory, GPU evidence and binding,
+labelled `host-observed` and never presented as a hardware measurement.
 
 ## 2. Concepts & terminology
 
@@ -42,9 +41,10 @@ measurement.
   `apus-gpu-composition` added by this device.
 - **Hardware-bound binding:** a composed envelope whose host report commits
   to `D`: the base measurement was taken with nonce base64url(`D`) and its
-  evidence carries that nonce. `fresh` compositions are hardware-bound;
-  `boot` compositions are not, because the cached boot report was taken
-  before the request existed.
+  evidence carries that nonce. `fresh` compositions are hardware-bound.
+  `boot` compositions pair the cached boot report, taken before the
+  request, with fresh GPU evidence bound to `D`, and record
+  `nonce-binding-hardware-bound` false.
 - **Observation envelope:** an envelope of type
   `apus-gpu-system-measurement` built and signed by this node.
 - **Observation commitment:** a commitment of an observation envelope that
@@ -58,7 +58,7 @@ measurement.
 
 | Class | Meaning |
 |---|---|
-| `host-observed` | Read from the host and signed by the node; a compromised host can forge it. |
+| `host-observed` | Read from the host and signed by the node; its trust rests on the node's signature rather than on a hardware-rooted report. |
 | `host-measured-subject` | The measured subject (the base envelope's `body`) is covered by a hardware-rooted host report that the base device signs and verifies. Whether that report also commits to `D` is stated separately by `nonce-binding-hardware-bound`. |
 | `runtime-observed` | Volatile values read at request time (`snapshot`); never part of a digest or binding. |
 
@@ -139,7 +139,7 @@ nonce: the base device returns its cached boot measurement, which does not
 commit to `D`. `cpu-tee.verified` comes from the base device's `verify`
 without a nonce. The GPU evidence is fresh and bound to `D`;
 `integration-mode` is `boot-measurement` and `nonce-binding-hardware-bound`
-is false, because nothing in the host report links it to `D`. Observation
+is false, because the cached host report predates `D`. Observation
 envelopes have `purpose` `boot`.
 
 ### `verify` — check an envelope
@@ -276,9 +276,10 @@ Given an object `H` (the observation envelope, or `apus-gpu-composition`) and
 `H.gpu-inventory-digest`, and, if `gpu-tee.available` is true,
 `gpu-tee.nonce` (lower-cased) equals `hex(D)` recomputed from the binding.
 
-This check alone shows only that the recorded values agree with each other.
+This check establishes that the recorded values are mutually consistent.
 In a composed envelope the keys it reads are outside the base device's
-commitments; they gain hardware weight only through §5.6.
+commitments; their hardware weight comes from the host report anchor
+(§5.6).
 
 ### 5.6 Host report anchor
 
@@ -337,36 +338,39 @@ itself, so with that content type send `{"body": "<the JSON text>"}`.
   report to commit to it (§5.6). A composition record or GPU evidence for
   any other binding digest, attached to a genuine base envelope, therefore
   fails `verify`.
-- A `boot-measurement` composition is not hardware-bound: its GPU evidence
-  and binding are reported, but nothing ties them to the host report.
-  `verify` reports `nonce-binding-hardware-bound` false, and its `verified`
-  covers the base measurement only. A verifier that needs the GPU evidence
-  tied to the host measurement MUST require `nonce-binding-hardware-bound`
-  true, which only `fresh` envelopes provide.
-- `D` shows that the host report and the GPU report were produced for the
-  same request and inventory, after the request nonce was chosen. The GPU
-  report identifies the GPU, not the host it is attached to, and `D` is
-  computable from public values, so GPU evidence for the same `D` from
-  another GPU also satisfies the binding. The inventory digest inside `D`
-  records which GPUs the measured host reported.
-- `verified` does not require GPU evidence: an envelope whose `gpu-tee` is
-  unavailable still verifies its host measurement and binding. A verifier
-  that requires GPU attestation MUST also require `gpu-tee-verified` true or
-  verify the `gpu-tee` evidence itself.
-- An observation envelope is host-observed only. It is signed by the node,
-  never claims `host-measured-subject`, and reports a present SEV-SNP guest
-  device as `available` with `verified` and `report-generated` false.
-- A failed base measurement downgrades to an observation envelope with
-  `failure`; it never upgrades a trust label.
-- `verify` checks signatures and bindings; it does not decide whether a
-  measured subject or a GPU claim set is acceptable. That policy belongs to
-  the verifier.
+- A `boot-measurement` composition serves the cached boot measurement
+  together with fresh GPU evidence and its binding. The host report
+  predates `D`, so `verify` reports `nonce-binding-hardware-bound` false
+  and its `verified` covers the base measurement. A verifier that needs the
+  GPU evidence tied to the host measurement MUST require
+  `nonce-binding-hardware-bound` true, which only `fresh` envelopes provide.
+- For a hardware-bound composition, `D` establishes that the host report
+  and the GPU report were produced for the same request and inventory,
+  after the request nonce was chosen. The GPU report attests the GPU that
+  produced it, and the inventory digest inside `D` records which GPUs the
+  measured host reported. `D` is derived from public values, so any GPU
+  report produced for the same `D` satisfies the binding; matching a GPU
+  report to a specific GPU of the host is acceptance policy for the
+  verifier.
+- `verified` covers the host measurement and the binding independently of
+  GPU evidence: an envelope whose `gpu-tee` is unavailable still verifies
+  them. A verifier that requires GPU attestation MUST also require
+  `gpu-tee-verified` true or verify the `gpu-tee` evidence itself.
+- An observation envelope carries the `host-observed` class. It is signed
+  by the node, never claims `host-measured-subject`, and reports a present
+  SEV-SNP guest device as `available` with `verified` and
+  `report-generated` false.
+- When an attempted composition does not complete, the device returns an
+  observation envelope recording `failure`; a trust label is never
+  upgraded.
+- `verify` checks signatures and bindings; whether a measured subject or a
+  GPU claim set is acceptable is policy that belongs to the verifier.
 - For an observation envelope only observation commitments count:
   `signature-verified` is true when all of them verify, whoever signed
   them, and `signers` lists their committers. The node's commitment over
-  `hashpath` alone does not vouch for the observation, so content replaced
-  under it has no signer. A verifier MUST check that `signers` contains the
-  address of the node it expects.
+  `hashpath` alone is not an observation commitment, so on its own it never
+  makes its committer a signer. A verifier MUST check that `signers`
+  contains the address of the node it expects.
 - Requests cannot select dependency devices or file paths. A request or base
   message may select `measurement-mode`, which only chooses between composing
   and observing.
