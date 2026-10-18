@@ -6,14 +6,15 @@
 # Usage: scripts/local-node.sh start|stop|restart|status|logs
 #
 # Environment:
-#   PRELOADED_STORE  store to load devices from (default: _build/preloaded-store,
-#                    built by `make preload`)
+#   PRELOADED_STORE  store to load devices from (default:
+#                    _build/apus-device-store, built by `make preload`)
 #   HB_PORT          HTTP port (default: 8734)
 #   HB_CONFIG        node configuration file (default: config.flat in the
 #                    repository root, when present)
 #   NODE_DIR         working directory of the node: pid file, log, node
 #                    wallet and cache (default: _build/local-node)
 #   START_TIMEOUT    seconds to wait for the node to answer (default: 60)
+#   LOG_LINES        lines printed by `logs` (default: 100)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,7 +27,7 @@ absolute() {
     esac
 }
 
-store=$(absolute "${PRELOADED_STORE:-_build/preloaded-store}")
+store=$(absolute "${PRELOADED_STORE:-_build/apus-device-store}")
 port=${HB_PORT:-8734}
 node_dir=$(absolute "${NODE_DIR:-_build/local-node}")
 start_timeout=${START_TIMEOUT:-60}
@@ -47,8 +48,9 @@ start() {
         echo "node already running (pid $(cat "$pid_file")) at $url"
         return 0
     fi
-    if [ ! -f "$store/data.mdb" ]; then
-        echo "error: no preloaded store at $store; run make preload first" >&2
+    # `make preload` writes the marker only after the store is complete.
+    if [ ! -f "$store/.preloaded" ] || [ ! -f "$store/data.mdb" ]; then
+        echo "error: no complete preloaded store at $store; run make preload first" >&2
         exit 1
     fi
     if [ ! -d "$root/_build/default/lib/hb/ebin" ]; then
@@ -127,7 +129,7 @@ case "${1:-}" in
     stop) stop ;;
     restart) stop; start ;;
     status) status ;;
-    logs) tail -n "${LINES:-100}" "$log_file" ;;
+    logs) tail -n "${LOG_LINES:-100}" "$log_file" ;;
     *)
         echo "usage: scripts/local-node.sh start|stop|restart|status|logs" >&2
         exit 2

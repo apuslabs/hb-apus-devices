@@ -9,16 +9,20 @@
 %%
 %% Each recipe's `recipe-for-device' tag is the specification ID of its
 %% device, read from SPECS, which is either:
-%%   - a preloaded store directory (`make preload'): the specification IDs
-%%     of the devices that a node running this store loads; or
 %%   - a publication record written by `make publish' (PUBLISH.md): the IDs
-%%     of the Device-Specification messages published on Arweave.
+%%     of the Device-Specification messages published on Arweave. WALLET
+%%     must have the signer address of the record, so that recipes and
+%%     specifications share one signer; or
+%%   - a preloaded store directory (`make preload'): the specification IDs
+%%     of the devices that a node running this store loads. These IDs exist
+%%     only in that store.
 %%
 %% Without --upload the recipes are signed and their IDs printed; nothing is
 %% sent. With --upload each signed recipe is posted to the bundler (default
-%% https://up.arweave.net:443) and listed in the ledger (default
-%% docs/recipes/PUBLISHED.md). --expect aborts unless WALLET has the given
-%% address. --only selects the recipes whose path contains the substring.
+%% https://up.arweave.net:443) and appended to the ledger (default
+%% docs/recipes/PUBLISHED.md) as soon as the bundler accepts it. --expect
+%% aborts unless WALLET has the given address. --only selects the recipes
+%% whose path contains the substring.
 -mode(compile).
 
 -define(INDEX_KEY, <<"~meta@1.0/preloaded-devices-index">>).
@@ -66,7 +70,7 @@ main([SpecSource, KeyPath | Flags]) ->
                 true -> start_http_client(Opts);
                 false -> ok
             end,
-            Specs = spec_ids(SpecSource, SeedOpts),
+            Specs = spec_ids(SpecSource, Address, SeedOpts),
             Recipes =
                 [
                     Path
@@ -76,12 +80,27 @@ main([SpecSource, KeyPath | Flags]) ->
                 ],
             io:format("Signer: ~s~nSpecifications: ~s~nBundler: ~s~nMode: ~s~n~n",
                 [Address, SpecSource, Bundler, mode(Upload)]),
-            Results = [publish(Path, Specs, Upload, Opts) || Path <- Recipes],
-            case Upload andalso Results =/= [] of
-                true -> write_ledger(Ledger, Results, Address);
+            % Each uploaded recipe is recorded before the next one is sent,
+            % so the ledger lists every upload even if a later one fails.
+            {_Round, Count} =
+                lists:foldl(
+                    fun(Path, {Round, N}) ->
+                        Result = publish(Path, Specs, Upload, Opts),
+                        NextRound =
+                            case Upload of
+                                true -> record(Ledger, Round, Address, Result);
+                                false -> Round
+                            end,
+                        {NextRound, N + 1}
+                    end,
+                    {not_started, 0},
+                    Recipes
+                ),
+            io:format("~n~p recipes ~s.~n", [Count, outcome(Upload)]),
+            case Upload andalso Count > 0 of
+                true -> io:format("Ledger: ~s~n", [Ledger]);
                 false -> ok
-            end,
-            io:format("~n~p recipes ~s.~n", [length(Results), outcome(Upload)])
+            end
         end
     );
 main(_) ->
@@ -130,7 +149,9 @@ publish(Path, Specs, Upload, Opts) ->
         true ->
             case upload(Signed, Opts) of
                 {ok, _} -> ok;
-                Error -> fail("~s: upload failed: ~0p", [Path, Error])
+                Error ->
+                    fail("~s: upload failed: ~0p; the recipes uploaded "
+                        "before it in this run are in the ledger", [Path, Error])
             end
     end,
     io:format("~s ~s ~s~n", [ID, Device, Slug]),
@@ -174,10 +195,10 @@ upload(Msg, Opts) ->
 
 %% @doc Device name to specification ID, from a preloaded store directory or
 %% from a publication record.
-spec_ids(Source, SeedOpts) ->
+spec_ids(Source, Address, SeedOpts) ->
     case {filelib:is_dir(Source), filelib:is_regular(Source)} of
         {true, _} -> store_spec_ids(Source, SeedOpts);
-        {false, true} -> record_spec_ids(Source);
+        {false, true} -> record_spec_ids(Source, Address);
         _ -> fail("specification source not found: ~s", [Source])
     end.
 
@@ -196,34 +217,55 @@ store_spec_ids(StoreDir, SeedOpts) ->
         <<"capacity">> => 1073741824
     },
     Opts = SeedOpts#{ <<"store">> => [Store] },
-    try
-        ok = hb_store:start(Store, #{}, Opts),
-        {ok, Index} = hb_cache:read(?INDEX_KEY, Opts),
-        Specs =
-            maps:from_list(
-                [
-                    {Name, hb_util:bin(hb_cache:ensure_loaded(Ref, Opts))}
-                ||
-                    {Name, Ref} <- maps:to_list(Index),
-                    is_binary(Name),
-                    binary:match(Name, <<"@">>) =/= nomatch
-                ]
-            ),
-        hb_store:stop(Store, #{}, Opts),
-        Specs
-    after
-        file:del_dir_r(Tmp)
+    Result =
+        try
+            ok = hb_store:start(Store, #{}, Opts),
+            case hb_cache:read(?INDEX_KEY, Opts) of
+                {ok, Index} ->
+                    {ok,
+                        maps:from_list(
+                            [
+                                {Name,
+                                    hb_util:bin(hb_cache:ensure_loaded(Ref, Opts))}
+                            ||
+                                {Name, Ref} <- maps:to_list(Index),
+                                is_binary(Name),
+                                binary:match(Name, <<"@">>) =/= nomatch
+                            ]
+                        )};
+                _ ->
+                    no_index
+            end
+        after
+            catch hb_store:stop(Store, #{}, Opts),
+            file:del_dir_r(Tmp)
+        end,
+    case Result of
+        {ok, Specs} -> Specs;
+        no_index ->
+            fail("~s is not a preloaded store (no device index); run make preload",
+                [StoreDir])
     end.
 
 %% @doc Read the device table of a publication record written by
-%% `make publish': | `name@1.0` | `SpecID` | `ImplID` |
-record_spec_ids(Path) ->
+%% `make publish': | `name@1.0` | `SpecID` | `ImplID` |. The record's signer
+%% must be the address of the recipe wallet.
+record_spec_ids(Path, Address) ->
     {ok, Bin} = file:read_file(Path),
     Pattern =
         "^\\| `([^`]+@[^`]+)` \\| `(" ?ID_PATTERN ")` \\| `" ?ID_PATTERN "` \\|",
-    case re:run(Bin, Pattern, [multiline, global, {capture, all_but_first, binary}]) of
-        {match, Rows} -> maps:from_list([{Name, Spec} || [Name, Spec] <- Rows]);
-        nomatch -> fail("~s lists no published device", [Path])
+    Specs =
+        case re:run(Bin, Pattern, [multiline, global, {capture, all_but_first, binary}]) of
+            {match, Rows} -> maps:from_list([{Name, Spec} || [Name, Spec] <- Rows]);
+            nomatch -> fail("~s lists no published device; run make publish first", [Path])
+        end,
+    SignerPattern = "^\\| Signer \\| `(" ?ID_PATTERN ")` \\|",
+    case re:run(Bin, SignerPattern, [multiline, {capture, all_but_first, binary}]) of
+        {match, [Address]} -> Specs;
+        {match, [Signer]} ->
+            fail("~s was signed by ~s; sign the recipes with that wallet, not ~s",
+                [Path, Signer, Address]);
+        nomatch -> fail("~s records no signer", [Path])
     end.
 
 %% @doc Split `---' front matter (`key: value' lines) from the markdown body.
@@ -251,9 +293,10 @@ load_wallet(KeyPath) ->
         false -> fail("wallet keyfile not found: ~s", [KeyPath])
     end.
 
-%% @doc Append one publishing round to the ledger. Block heights are filled
-%% in from Arweave GraphQL once the bundles are confirmed.
-write_ledger(Ledger, Results, Address) ->
+%% @doc Append one uploaded recipe to the ledger. The first upload of a run
+%% opens a new round section. Block heights are filled in from Arweave
+%% GraphQL once the bundles are confirmed.
+record(Ledger, not_started, Address, Result) ->
     Header =
         case filelib:is_regular(Ledger) of
             true -> [];
@@ -264,18 +307,21 @@ write_ledger(Ledger, Results, Address) ->
             erlang:system_time(second),
             [{offset, "Z"}]
         ),
-    Lines = [
+    append(Ledger, [
         Header,
         "\n## Published at ", Timestamp, "\n\n",
         "Signer: `", Address, "`.\n\n",
         "| Recipe ID | Device | Slug | Spec ID | Block |\n",
-        "|---|---|---|---|---|\n",
-        [
-            ["| ", ID, " | ", Device, " | ", Slug, " | ", Spec, " | pending |\n"]
-        ||
-            #{ id := ID, device := Device, slug := Slug, spec := Spec } <- Results
-        ]
-    ],
+        "|---|---|---|---|---|\n"
+    ]),
+    record(Ledger, started, Address, Result);
+record(Ledger, started, _Address, Result) ->
+    #{ id := ID, device := Device, slug := Slug, spec := Spec } = Result,
+    append(Ledger,
+        ["| ", ID, " | ", Device, " | ", Slug, " | ", Spec, " | pending |\n"]),
+    started.
+
+append(Ledger, Lines) ->
     ok = file:write_file(Ledger, Lines, [append]).
 
 flag(Name, [Name, Value | _], _Default) -> Value;
