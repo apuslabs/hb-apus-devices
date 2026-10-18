@@ -1,12 +1,19 @@
-%%% @doc Receipt decorator for the existing OpenAI-compatible inference device.
+%%% @doc `inference_receipt@1.0': a receipt decorator for `inference@1.0'.
 %%%
-%%% The decorator commits the original request/response transcript to the node
-%%% observation and includes the receipt in the public response JSON. Publishing
-%%% waits for the signed Arweave bundle to be posted and its chunks seeded.
+%%% `completions' executes one allowlisted, non-streaming request on
+%%% `inference@1.0' as an AO-Core step whose HashPath is always generated,
+%%% then returns the runtime's JSON with a `receipt' added. The receipt binds
+%%% digests of the executed request and the response, the step's AO-Core
+%%% transcript and HashPath, the node's GPU inventory and a fresh
+%%% measurement, and is signed with the node's identity.
+%%%
+%%% `verify-hashpath' recomputes a recorded transcript's HashPath, and
+%%% `publish' signs a receipt as an ANS-104 data item and submits it to the
+%%% node's bundler.
 -module(dev_inference_receipt).
 -implements(<<"inference_receipt@1.0">>).
 -specification("docs/spec/inference_receipt.md").
--export([info/1, completions/3, chat/3, models/3, health/3, v1/3,
+-export([info/1, completions/3, chat/3, v1/3, models/3, health/3,
     verify_hashpath/3, publish/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -14,33 +21,41 @@
 -define(VERSION, <<"1.0">>).
 -define(INFERENCE_BASE, #{<<"device">> => <<"inference@1.0">>}).
 
-%% Request keys that may enter the executed and published AO-Core request:
-%% the generation parameters `inference@1.0' relays (minus the `user'
-%% identifier, see its `PUBLIC_PARAM_KEYS'), the attestation flag and the
-%% caller's execution-profile declarations.
--define(EXECUTION_KEYS, [
+%% Generation parameters `inference@1.0' relays to the runtime, without its
+%% `user' caller identifier. Both specifications state this list.
+-define(GENERATION_KEYS, [
     <<"model">>, <<"prompt">>, <<"messages">>, <<"max_tokens">>,
-    <<"temperature">>, <<"top_p">>, <<"n">>, <<"stream">>,
-    <<"stop">>, <<"presence_penalty">>, <<"frequency_penalty">>,
-    <<"logit_bias">>, <<"seed">>, <<"top_k">>,
+    <<"max_completion_tokens">>, <<"temperature">>, <<"top_p">>, <<"n">>,
+    <<"stream">>, <<"stop">>, <<"presence_penalty">>,
+    <<"frequency_penalty">>, <<"logit_bias">>, <<"seed">>, <<"top_k">>,
     <<"repetition_penalty">>, <<"length_penalty">>, <<"early_stopping">>,
-    <<"tools">>, <<"tool_choice">>,
-    <<"tee">>, <<"type">>,
+    <<"tools">>, <<"tool_choice">>, <<"response_format">>,
+    <<"chat_template_kwargs">>, <<"reasoning_effort">>
+]).
+
+%% Execution-profile declarations a caller may record in the receipt.
+-define(DECLARATION_KEYS, [
     <<"model-sha256">>, <<"runtime-build-hash">>, <<"inference-profile">>,
     <<"model-source">>, <<"model-tx">>, <<"workload-manifest-id">>,
     <<"model-revision">>, <<"runtime-name">>, <<"runtime-version">>
 ]).
 
+%% Request keys that may enter the executed and published AO-Core request:
+%% the generation parameters, the attestation flag, the response shape
+%% selector and the caller's declarations.
+-define(EXECUTION_KEYS,
+    ?GENERATION_KEYS ++ [<<"tee">>, <<"type">>] ++ ?DECLARATION_KEYS).
+
 %% @doc Return the public device description.
 info(_Opts) ->
     #{
-        exports => [<<"completions">>, <<"chat">>, <<"models">>,
-            <<"health">>, <<"v1">>, <<"verify-hashpath">>, <<"publish">>],
-        description => <<"Inference transcript receipt decorator">>,
+        exports => [<<"completions">>, <<"chat">>, <<"v1">>, <<"models">>,
+            <<"health">>, <<"verify-hashpath">>, <<"publish">>],
+        description => <<"Signed receipts for inference@1.0 completions">>,
         version => ?VERSION
     }.
 
-%% @doc Decorate a non-streaming completion response with a receipt.
+%% @doc Run a non-streaming completion and attach a receipt.
 -spec completions(
     #{ _ => _ },
     #{
@@ -48,24 +63,22 @@ info(_Opts) ->
         model => _,
         messages => _,
         stream => _,
+        tee => _,
         'model-sha256' => _,
         'model-source' => _,
         'model-tx' => _,
         'runtime-build-hash' => _,
         'inference-profile' => _,
         'workload-manifest-id' => _,
-        'measurement-mode' => _,
-        'gpu-inventory-root' => _,
         _ => _
     },
     map()
-) -> {ok, _} | {error, _}.
-completions(Base, Req, Opts) ->
-    %% The inference completion handler targets `/v1/chat/completions`.
-    %% Resolve one AO-Core step so its exact input can accompany the receipt.
-    decorate(<<"completions">>, Base, Req, Opts).
+) -> {ok, #{ receipt := map(), _ => _ }} | {error, _}.
+completions(_Base, Req, Opts) ->
+    decorate(<<"completions">>, Req, Opts).
 
-%% @doc Preserve the chat route so `/chat/completions` reaches completions/3.
+%% @doc Route `/chat/completions' to `completions': the request is merged into
+%% the base message, which keeps this device and gains `chat-mode: true'.
 -spec chat(
     #{ _ => _ },
     #{ _ => _ },
@@ -81,25 +94,25 @@ chat(Base, Req, Opts) ->
         Opts
     )}.
 
-%% @doc Delegate model discovery without creating a workload receipt.
+%% @doc Return `inference@1.0/models' without creating a receipt.
 -spec models(
     #{ _ => _ },
     #{ _ => _ },
     map()
 ) -> {ok, _} | {error, _}.
-models(Base, Req, Opts) -> delegate(<<"models">>, Base, Req, Opts).
+models(_Base, _Req, Opts) -> delegate(<<"models">>, Opts).
 
-%% @doc Delegate health checks without creating a workload receipt.
+%% @doc Return `inference@1.0/health' without creating a receipt.
 -spec health(
     #{ _ => _ },
     #{ _ => _ },
     map()
 ) -> {ok, _} | {error, _}.
-health(Base, Req, Opts) -> delegate(<<"health">>, Base, Req, Opts).
+health(_Base, _Req, Opts) -> delegate(<<"health">>, Opts).
 
-%% @doc Preserve the OpenAI v1 route so nested `/chat/completions` dispatch
-%% reaches this decorator's chat export instead of attaching a receipt to the
-%% intermediate route envelope.
+%% @doc Route the OpenAI `/v1/...' prefix. The merged base message keeps this
+%% device and `chat-mode: true', so `/v1/chat/completions' reaches
+%% `completions' here rather than attaching a receipt to the route envelope.
 -spec v1(
     #{ _ => _ },
     #{ _ => _ },
@@ -109,40 +122,41 @@ v1(Base, Req, Opts) ->
     {ok, hb_util:deep_merge(
         Base,
         Req#{<<"device">> => <<"inference_receipt@1.0">>,
-            %% The public v1 receipt route is the chat-completions route
-            %% used by the Explorer. Preserve that semantic when delegating
-            %% through AO-Core's nested v1 path.
             <<"chat-mode">> => true},
         Opts
     )}.
 
-%% @doc Publish a completed receipt through HyperBEAM's internal bundler.
-%% The receipt device owns the upload boundary; callers only receive the
-%% bundler result and never handle a wallet or Arweave signature.
+%% @doc Publish a completed receipt through HyperBEAM's bundler. The device
+%% signs the ANS-104 item; callers never handle a wallet or a signature.
 -spec publish(
     #{ _ => _ },
     #{ receipt => _, body => _, _ => _ },
     map()
-) -> {ok, #{ status := 200, id := binary(), _ => _ }} | {error, _}.
+) -> {ok, #{ id := binary(), 'bundle-id' := binary(), _ => _ }}
+    | {error, #{ status := integer(), body := _ }}.
 publish(_Base, Req, Opts) ->
-    Receipt = first_defined([
+    case first_defined([
         hb_ao:get(<<"receipt">>, Req, undefined, Opts),
-        hb_ao:get(<<"body">>, Req, undefined, Opts),
-        Req
-    ]),
+        hb_ao:get(<<"body">>, Req, undefined, Opts)
+    ]) of
+        undefined ->
+            {error, #{<<"status">> => 400, <<"body">> => #{
+                <<"error">> => <<"receipt-required">>
+            }}};
+        Receipt ->
+            publish_receipt(Receipt, Opts)
+    end.
+
+publish_receipt(Receipt, Opts) ->
     Data = case Receipt of
         Bin when is_binary(Bin) -> Bin;
         Value -> hb_json:encode(Value)
     end,
-    %% `bundler@1.0' accepts signed ANS-104 items. Sign and normalize the
-    %% receipt inside this Device Forge device, then hand the structured item
-    %% directly to the preloaded bundler implementation. This keeps wallet
-    %% handling and Arweave transport inside HyperBEAM.
+    %% `bundler@1.0' accepts signed ANS-104 items: the ANS-104 commitment
+    %% device returns the signed structured message it expects.
     Unsigned = #{<<"data">> => Data,
         <<"content-type">> => <<"application/json">>},
     PublishOpts = publish_opts(Opts),
-    %% The ANS-104 commitment device returns the signed structured message
-    %% expected by `bundler@1.0`; no second conversion is necessary.
     Signed = hb_message:commit(Unsigned, PublishOpts, <<"ans104@1.0">>),
     case hb_ao:resolve(
         #{<<"device">> => <<"bundler@1.0">>},
@@ -151,11 +165,10 @@ publish(_Base, Req, Opts) ->
     ) of
         {ok, #{<<"id">> := ID, <<"bundle-id">> := BundleID,
                 <<"bundle-status">> := <<"complete">>} = Response} ->
-            %% Keep the item ID at the response top level. AO-Core may expose
-            %% the nested body through a cache link during HTTP encoding, so
-            %% callers must not need to dereference that link just to index
-            %% the Arweave data item.
-            {ok, #{<<"status">> => 200, <<"id">> => ID,
+            %% The item ID stays at the top level: HTTP encoding may expose
+            %% the nested body as a cache link, and callers index the data
+            %% item without dereferencing it.
+            {ok, #{<<"id">> => ID,
                 <<"bundle-id">> => BundleID,
                 <<"bundle-status">> => <<"complete">>,
                 <<"body">> => Response}};
@@ -170,11 +183,11 @@ publish(_Base, Req, Opts) ->
             }}}
     end.
 
-%% Only node configuration selects the publication wallet. Keep the node's
-%% identity key separate from its funded upload wallet, and key this bundler
-%% worker by the latter so an existing unfunded worker cannot be reused.
+%% Only node configuration selects the publication wallet. The node's
+%% identity key stays separate from its funded upload wallet, and the bundler
+%% worker is keyed by the latter so an unfunded worker is never reused.
 publish_opts(Opts) ->
-    Base = Opts#{hashpath => ignore, <<"bundler-max-items">> => 1},
+    Base = Opts#{<<"hashpath">> => ignore, <<"bundler-max-items">> => 1},
     case hb_opts:get(<<"receipt-wallet-location">>, undefined, Opts) of
         undefined -> Base;
         Path ->
@@ -329,28 +342,10 @@ restore_json_links(List) when is_list(List) ->
     [restore_json_links(Value) || Value <- List];
 restore_json_links(Value) -> Value.
 
-%% @doc Resolve the base inference device using ordinary AO-Core dispatch.
-delegate(Path, Base, Req, Opts) ->
-    hb_ao:resolve(
-        #{<<"device">> => <<"inference@1.0">>},
-        %% Preserve `tee` so the delegated inference device can attach its
-        %% hardware evidence to the same response that carries the receipt.
-        maps:put(<<"path">>, Path, Req),
-        delegate_opts(Base, Req, Opts)
-    ).
-
-delegate_opts(Base, Req, Opts) ->
-    lists:foldl(
-        fun(Key, Acc) ->
-            case first_defined([maps:get(Key, Req, undefined),
-                    maps:get(Key, Base, undefined)]) of
-                undefined -> Acc;
-                Value -> Acc#{Key => Value}
-            end
-        end,
-        Opts,
-        [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>]
-    ).
+%% @doc Resolve a key of `inference@1.0' with the node's options. The caller's
+%% request is not forwarded: these keys read nothing from it.
+delegate(Key, Opts) ->
+    hb_ao:resolve(?INFERENCE_BASE, #{<<"path">> => Key}, Opts).
 
 %% @doc Build the single AO-Core request that is executed and recorded.
 %%
@@ -390,14 +385,15 @@ execution_request(Path, Req, Opts) ->
 %% The receipt is the record of this step's HashPath, so generate it even
 %% when the node skips HashPaths globally (`hashpath: ignore'), and never
 %% answer the attested step from the result cache.
-execution_opts(Base, Req, Opts) ->
-    (delegate_opts(Base, Req, Opts))#{
+execution_opts(Opts) ->
+    Opts#{
         <<"hashpath">> => update,
         <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
     }.
 
-%% @doc Reject streaming and decorate the complete response transcript.
-decorate(Path, Base, Req, Opts) ->
+%% @doc Reject streaming, execute the allowlisted request and decorate the
+%% complete response.
+decorate(Path, Req, Opts) ->
     case truthy(hb_ao:get(<<"stream">>, Req, false, Opts)) of
         true ->
             {error, #{
@@ -411,31 +407,29 @@ decorate(Path, Base, Req, Opts) ->
         false ->
             ExecutionReq = execution_request(Path, Req, Opts),
             case hb_ao:resolve(?INFERENCE_BASE, ExecutionReq,
-                    execution_opts(Base, Req, Opts)) of
-                {ok, Response} ->
-                    add_receipt(Response, Req, ExecutionReq, Opts);
-                {error, _} = Error -> Error;
-                Other -> {ok, Other}
+                    execution_opts(Opts)) of
+                {ok, Response} -> add_receipt(Response, ExecutionReq, Opts);
+                Error -> Error
             end
     end.
 
 %% @doc Attach the receipt after committing the original response body/data.
-add_receipt(Response, Req, ExecutionReq, Opts) when is_map(Response) ->
+add_receipt(Response, ExecutionReq, Opts) when is_map(Response) ->
     Body = first_defined([
         hb_ao:get(<<"body">>, Response, undefined, Opts),
         hb_ao:get(<<"data">>, Response, <<>>, Opts)
     ]),
-    Receipt = make_receipt(Req, ExecutionReq, Body, Response, Opts),
-    %% HTTP response encoding serializes the `body` field and can omit
-    %% sibling AO-Core keys. Put the receipt in the JSON body as well so the
-    %% public API and the Arweave uploader carry the exact same evidence.
+    Receipt = make_receipt(ExecutionReq, Body, Response, Opts),
+    %% HTTP response encoding serializes the `body' field and can omit
+    %% sibling AO-Core keys. The receipt is placed in the JSON body as well, so
+    %% the public API and a publishing client carry the same evidence.
     BodyWithReceipt = body_with_receipt(Body, Receipt, Opts),
     {ok, maps:without([<<"body+link">>, <<"data+link">>], Response#{
         <<"body">> => BodyWithReceipt,
         <<"data">> => BodyWithReceipt,
         <<"receipt">> => Receipt
     })};
-add_receipt(Response, _Req, _ExecutionReq, _Opts) ->
+add_receipt(Response, _ExecutionReq, _Opts) ->
     {ok, Response}.
 
 body_with_receipt(Body, Receipt, _Opts) when is_binary(Body) ->
@@ -466,12 +460,12 @@ json_safe(Tuple) when is_tuple(Tuple) ->
 json_safe(Value) -> Value.
 
 %% @doc Build and commit a request/response observation. Request-derived
-%% fields come from the executed public request; `Req' only selects how the
-%% node probes its own inventory and measurement.
-make_receipt(Req, ExecutionReq, Body, Response, Opts) ->
+%% fields come from the executed public request; the inventory and the
+%% measurement are probed with the node's own configuration.
+make_receipt(ExecutionReq, Body, Response, Opts) ->
     RequestDigest = digest(ExecutionReq),
-    Inventory = resolve_inventory(Req, Opts),
-    Measurement = resolve_measurement(Req, RequestDigest, Opts),
+    Inventory = resolve_inventory(Opts),
+    Measurement = resolve_measurement(RequestDigest, Opts),
     ResponseDigest = digest(Body),
     InventoryDigest = maps:get(<<"inventory-digest">>, Inventory, undefined),
     MeasurementID = maps:get(<<"measurement-id">>, Measurement, undefined),
@@ -494,25 +488,28 @@ make_receipt(Req, ExecutionReq, Body, Response, Opts) ->
         <<"provenance-class">> => Provenance
     },
     Receipt0 = add_execution_bindings(ReceiptBase, ExecutionReq, Opts, Inventory),
-    ReceiptMeasurement = Receipt0#{
-        <<"system-measurement">> => Measurement
-    },
-    Receipt1 = ReceiptMeasurement#{
+    Receipt1 = Receipt0#{
+        <<"system-measurement">> => Measurement,
         <<"ao-core">> =>
             ao_core_evidence(?INFERENCE_BASE, ExecutionReq, Response, Opts),
-        <<"device-chain">> => device_chain_evidence(Opts)
+        <<"device-chain">> => device_chain_evidence()
     },
     Committed = try hb_message:commit(Receipt1, Opts)
     catch _:_ -> Receipt1
     end,
-    Receipt1#{
+    Signed = Receipt1#{
         <<"receipt-id">> => hb_message:id(Committed, signed, Opts),
         <<"signed-receipt">> => Committed
-    }.
+    },
+    %% The address that signed `signed-receipt': the node's identity.
+    case safe_signers(Committed, Opts) of
+        [NodeAddress | _] -> Signed#{<<"node-address">> => NodeAddress};
+        [] -> Signed
+    end.
 
 %% @doc Expose AO-Core's execution link in terms a verifier can explain.
 %% The hashpath is read from the resolved response private message; it is not
-%% re-hashed by this device or by the Explorer uploader.
+%% re-hashed by this device or by a publishing client.
 ao_core_evidence(Base, Req, Response, Opts) ->
     Priv = hb_private:from_message(Response),
     PublicEvidence = public_ao_core_evidence(Response, Opts),
@@ -540,9 +537,9 @@ ao_core_evidence(Base, Req, Response, Opts) ->
             <<"request">> => Req,
             <<"response">> => Response
         },
-        %% JSON is the public transport representation. Keep an opaque
-        %% Erlang-term snapshot as well so Verify can restore AO-Core private
-        %% metadata and run the exact HyperBEAM verifier after upload.
+        %% JSON is the public transport representation. An opaque Erlang-term
+        %% snapshot restores AO-Core private metadata, so the exact HyperBEAM
+        %% verifier can run on a published receipt.
         <<"verification-input-term">> => hb_util:encode(term_to_binary(
             #{base => Base, request => Req, response => Response},
             [compressed])),
@@ -561,28 +558,25 @@ hashpath_verification(Base, Req, Hashpath, Opts) ->
         _ -> <<"unavailable">>
     end.
 
-%% The inference device exposes the AO-Core link in its JSON response because
-%% the outer receipt decorator runs before AO-Core attaches private metadata.
-%% Prefer that device-produced field over deriving a local digest here.
+%% The inference device can expose the AO-Core link in its JSON response
+%% (inside `attestation.raw' for `tee=true'). It is used when the response
+%% carries no private HashPath.
 public_ao_core_evidence(Response, Opts) ->
-    Body = hb_ao:get(<<"body">>, Response, undefined, Opts),
-    Json = case Body of
+    Json = case hb_ao:get(<<"body">>, Response, undefined, Opts) of
         Bin when is_binary(Bin) ->
             try hb_json:decode(Bin) catch _:_ -> #{} end;
         Map when is_map(Map) -> Map;
         _ -> #{}
     end,
-    case maps:get(<<"ao-core">>, Json, undefined) of
-        Evidence when is_map(Evidence) -> Evidence;
-        _ ->
-            case maps:get(<<"attestation">>, Json, undefined) of
-                #{<<"raw">> := Raw} when is_binary(Raw) ->
-                    try
-                        RawMap = hb_json:decode(Raw),
-                        maps:get(<<"ao-core">>, RawMap, #{})
-                    catch _:_ -> #{} end;
+    case Json of
+        #{<<"ao-core">> := Evidence} when is_map(Evidence) -> Evidence;
+        #{<<"attestation">> := #{<<"raw">> := Raw}} when is_binary(Raw) ->
+            try hb_json:decode(Raw) of
+                #{<<"ao-core">> := Evidence} when is_map(Evidence) -> Evidence;
                 _ -> #{}
-            end
+            catch _:_ -> #{}
+            end;
+        _ -> #{}
     end.
 
 hashpath_algorithm(Req, Response, _Opts) ->
@@ -600,8 +594,8 @@ commitment_device(Response, Opts) ->
         _ -> undefined
     end.
 
-safe_signers(Response, Opts) ->
-    case catch hb_message:signers(Response, Opts) of
+safe_signers(Message, Opts) ->
+    case catch hb_message:signers(Message, Opts) of
         Signers when is_list(Signers) -> Signers;
         _ -> []
     end.
@@ -612,35 +606,34 @@ safe_message_id(Message, Committers, Opts) ->
         _ -> undefined
     end.
 
-%% @doc Record which Forge devices produced the receipt and measurement.
-device_chain_evidence(Opts) ->
+%% @doc Record which devices produced the receipt and its measurement.
+device_chain_evidence() ->
     #{
         <<"status">> => <<"captured">>,
         <<"receipt-device">> => <<"inference_receipt@1.0">>,
         <<"measurement-device">> => <<"inference_measurement@1.0">>,
         <<"inventory-device">> => <<"gpu_inventory@1.0">>,
-        <<"loader">> => <<"HyperBEAM Device Forge preloaded-store">>,
-        <<"implementation-id">> => maps:get(<<"device-implementation-id">>, Opts, undefined)
+        <<"loader">> => <<"HyperBEAM Device Forge preloaded-store">>
     }.
 
-%% Include the execution profile facts in the signed receipt when configured.
-%% These fields are bindings for independent verification; their absence keeps
-%% older deployments readable and is reported as measurement-only by clients.
+%% Add execution-profile bindings to the signed receipt: a value the executed
+%% request declares, else the node option of the same name, else the
+%% inventory's field. Absent bindings are omitted.
 add_execution_bindings(Receipt, Req, Opts, Inventory) ->
     Candidates = [
         {<<"model-sha256">>, [maps:get(<<"model-sha256">>, Req, undefined),
-            maps:get(<<"model-sha256">>, Opts, undefined),
+            hb_opts:get(<<"model-sha256">>, undefined, Opts),
             maps:get(<<"model_sha256">>, Inventory, undefined)]},
         {<<"runtime-build-hash">>, [maps:get(<<"runtime-build-hash">>, Req, undefined),
-            maps:get(<<"runtime-build-hash">>, Opts, undefined),
+            hb_opts:get(<<"runtime-build-hash">>, undefined, Opts),
             maps:get(<<"runtime_build_hash">>, Inventory, undefined)]},
         {<<"inference-profile">>, [maps:get(<<"inference-profile">>, Req, undefined),
-            maps:get(<<"inference-profile">>, Opts, undefined),
+            hb_opts:get(<<"inference-profile">>, undefined, Opts),
             maps:get(<<"profile">>, Inventory, undefined)]},
         {<<"model-source">>, [maps:get(<<"model-source">>, Req, undefined),
-            maps:get(<<"model-source">>, Opts, undefined)]},
+            hb_opts:get(<<"model-source">>, undefined, Opts)]},
         {<<"model-tx">>, [maps:get(<<"model-tx">>, Req, undefined),
-            maps:get(<<"model-tx">>, Opts, undefined)]}
+            hb_opts:get(<<"model-tx">>, undefined, Opts)]}
     ],
     lists:foldl(
         fun({Key, Values}, Acc) ->
@@ -653,34 +646,51 @@ add_execution_bindings(Receipt, Req, Opts, Inventory) ->
         Candidates
     ).
 
-%% @doc Resolve the stable inventory needed by the receipt.
-resolve_inventory(Req, Opts) ->
+%% @doc Resolve the node's GPU inventory report. The inventory device reads
+%% its own node options; nothing from the caller's request is forwarded.
+resolve_inventory(Opts) ->
     case hb_ao:resolve(
         #{<<"device">> => <<"gpu_inventory@1.0">>},
-        #{<<"path">> => <<"report">>,
-          <<"gpu-inventory-root">> =>
-              hb_ao:get(<<"gpu-inventory-root">>, Req, <<"/sys">>, Opts)},
+        #{<<"path">> => <<"report">>},
         Opts
     ) of
-        {ok, Response} -> hb_ao:get(<<"body">>, Response, #{}, Opts);
+        {ok, Response} -> result_body(Response, Opts);
         _ -> #{}
     end.
 
-%% @doc Resolve the composed measurement bound to this request digest.
-resolve_measurement(Req, RequestDigest, Opts) ->
+%% @doc Resolve a fresh measurement bound to this request digest.
+resolve_measurement(RequestDigest, Opts) ->
     case hb_ao:resolve(
         #{<<"device">> => <<"inference_measurement@1.0">>},
-        #{<<"path">> => <<"fresh">>,
-          <<"nonce">> => RequestDigest,
-          <<"measurement-mode">> =>
-              hb_ao:get(<<"measurement-mode">>, Req, <<"auto">>, Opts),
-          <<"gpu-inventory-root">> =>
-              hb_ao:get(<<"gpu-inventory-root">>, Req, <<"/sys">>, Opts)},
+        #{<<"path">> => <<"fresh">>, <<"nonce">> => RequestDigest},
         Opts
     ) of
-        {ok, Response} -> measurement_fields(hb_ao:get(<<"body">>, Response, #{}, Opts), Opts);
+        {ok, Response} -> measurement_fields(result_body(Response, Opts), Opts);
         _ -> #{}
     end.
+
+%% @doc The result message of a device that answers either bare or inside a
+%% `{status, body}' envelope. Bare inventory and measurement results carry a
+%% `type'; a measurement envelope's own `body' is its measured subject, so a
+%% typed result is never unwrapped.
+result_body(Result, Opts) when is_map(Result) ->
+    case hb_maps:find(<<"type">>, Result, Opts) of
+        {ok, _} -> Result;
+        error ->
+            case hb_maps:find(<<"body">>, Result, Opts) of
+                {ok, Body} when is_map(Body) -> Body;
+                {ok, Body} when is_binary(Body) ->
+                    try hb_json:decode(Body) of
+                        Decoded when is_map(Decoded) -> Decoded;
+                        _ -> #{}
+                    catch _:_ -> #{}
+                    end;
+                {ok, _} -> #{};
+                error -> Result
+            end
+    end;
+result_body(_Result, _Opts) ->
+    #{}.
 
 %% @doc Extract measurement metadata without asserting a trust class.
 measurement_fields(Body, Opts) when is_map(Body) ->
@@ -809,24 +819,76 @@ execution_request_is_allowlisted_and_fresh_test() ->
     ?assertEqual(maps:remove(<<"request-nonce">>, A),
         maps:remove(<<"request-nonce">>, B)).
 
+-define(CHAT_RESPONSE, <<"{\"object\":\"chat.completion\",\"model\":\"runtime-model\","
+    "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":"
+    "{\"role\":\"assistant\",\"content\":\"ok\"}}]}">>).
+
+runtime_endpoints() ->
+    [
+        {"/v1/chat/completions", chat, {200, ?CHAT_RESPONSE}},
+        {"/v1/models", models, {200, <<"{\"object\":\"list\",\"data\":[]}">>}},
+        {"/health", health, {200, <<>>}}
+    ].
+
+%% Node options for a runtime at `URL'. `hashpath: ignore' mirrors the
+%% reference deployment, which disables HashPaths globally.
+node_opts(URL) ->
+    #{
+        <<"inference-peer">> => URL,
+        <<"hashpath">> => ignore,
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => hb_test_utils:test_store()
+    }.
+
+with_runtime(Fun) ->
+    {ok, URL, Handle} = hb_mock_server:start(runtime_endpoints()),
+    try Fun(URL, Handle)
+    after hb_mock_server:stop(Handle)
+    end.
+
+%% An attestation device that reports the nonce it was asked to bind.
+stub_attestation_device(Parent, Ref) ->
+    #{
+        <<"generate">> =>
+            fun(_Base, Req, _Opts) ->
+                Nonce = hb_maps:get(<<"nonce">>, Req, undefined, #{}),
+                Parent ! {attested_nonce, Ref, Nonce},
+                {ok, hb_json:encode(#{
+                    <<"verified">> => true,
+                    <<"claims">> => [#{<<"eat_nonce">> => Nonce}]
+                })}
+            end
+    }.
+
+info_lists_exactly_the_resolvable_keys_test() ->
+    #{exports := Exports} = info(#{}),
+    ?assertEqual(
+        lists:sort([<<"completions">>, <<"chat">>, <<"v1">>, <<"models">>,
+            <<"health">>, <<"verify-hashpath">>, <<"publish">>]),
+        lists:sort(Exports)),
+    [?assert(erlang:function_exported(?MODULE,
+            binary_to_atom(binary:replace(Key, <<"-">>, <<"_">>)), 3))
+        || Key <- Exports].
+
 receipt_excludes_transport_fields_and_verifies_test_() ->
     {timeout, 60, fun() ->
-        Chat = hb_json:encode(#{<<"object">> => <<"chat.completion">>,
-            <<"choices">> => [#{<<"index">> => 0, <<"finish_reason">> => <<"stop">>,
-                <<"message">> => #{<<"role">> => <<"assistant">>,
-                    <<"content">> => <<"ok">>}}]}),
-        {ok, URL, Handle} = hb_mock_server:start(
-            [{"/v1/chat/completions", chat, {200, Chat}}]),
-        try
-            Opts = #{<<"agent-api-peer">> => URL,
-                %% Mirrors the production node, which disables HashPaths.
-                <<"hashpath">> => ignore,
-                <<"priv-wallet">> => ar_wallet:new(),
-                <<"store">> => hb_test_utils:test_store()},
+        with_runtime(fun(URL, _Handle) ->
+            Ref = make_ref(),
+            Opts = (node_opts(URL))#{
+                <<"inference-attestation-device">> =>
+                    stub_attestation_device(self(), Ref)
+            },
             {ok, Result} = completions(#{}, leaky_request(), Opts),
             assert_no_transport_leak(Result),
-            #{<<"ao-core">> := AOCore, <<"request-digest">> := RequestDigest} =
-                maps:get(<<"receipt">>, Result),
+            #{<<"ao-core">> := AOCore, <<"request-digest">> := RequestDigest,
+                <<"device-chain">> := DeviceChain,
+                <<"node-address">> := NodeAddress} =
+                    maps:get(<<"receipt">>, Result),
+            ?assertEqual(
+                hb_util:human_id(ar_wallet:to_address(
+                    maps:get(<<"priv-wallet">>, Opts))),
+                NodeAddress),
+            ?assertNot(maps:is_key(<<"implementation-id">>, DeviceChain)),
             Term = maps:get(<<"verification-input-term">>, AOCore),
             Transcript = binary_to_term(hb_util:decode(Term), [safe]),
             assert_no_transport_leak(Transcript),
@@ -836,11 +898,107 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
                 maps:get(<<"verification-status">>, AOCore)),
             {ok, #{<<"body">> := Verification}} = verify_hashpath(#{},
                 #{<<"verification-input-term">> => Term}, Opts),
-            ?assertEqual(true, maps:get(<<"verified">>, Verification))
+            ?assertEqual(true, maps:get(<<"verified">>, Verification)),
+            %% `tee=true' attests the same response: the report is bound to
+            %% the SHA-256 of the published `raw'.
+            #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce,
+                <<"verified">> := true}, <<"receipt">> := _} =
+                    hb_json:decode(maps:get(<<"body">>, Result)),
+            ?assertEqual(hb_util:to_hex(hb_crypto:sha256(Raw)), Nonce),
+            ?assertEqual(Nonce,
+                receive {attested_nonce, Ref, Asked} -> Asked
+                after 5000 -> no_attestation_request
+                end)
+        end)
+    end}.
+
+request_and_base_cannot_select_the_runtime_test_() ->
+    {timeout, 60, fun() ->
+        {ok, Diverted, DivertedHandle} =
+            hb_mock_server:start([{"/[...]", diverted}]),
+        try
+            with_runtime(fun(URL, Handle) ->
+                Override = #{
+                    <<"agent-api-peer">> => Diverted,
+                    <<"agent-api-path">> => <<"/diverted">>,
+                    <<"agent-api-key">> => <<"caller-key">>,
+                    <<"inference-peer">> => Diverted,
+                    <<"inference-path">> => <<"/diverted">>,
+                    <<"inference-api-key">> => <<"caller-key">>,
+                    <<"gpu-inventory-root">> => <<"/diverted">>
+                },
+                Opts = (node_opts(URL))#{
+                    <<"inference-api-key">> => <<"operator-key">>},
+                Base = Override#{<<"device">> => <<"inference_receipt@1.0">>},
+                Chat = #{
+                    <<"model">> => <<"test-model">>,
+                    <<"messages">> =>
+                        [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}]
+                },
+                {ok, _} = hb_ao:resolve(Base, maps:merge(Chat,
+                    Override#{<<"path">> => <<"completions">>}), Opts),
+                {ok, _} = hb_ao:resolve(Base,
+                    Override#{<<"path">> => <<"models">>}, Opts),
+                {ok, _} = hb_ao:resolve(Base,
+                    Override#{<<"path">> => <<"health">>}, Opts),
+                [Sent] = hb_mock_server:get_requests(chat, 1, Handle),
+                ?assertMatch(#{<<"authorization">> := <<"Bearer operator-key">>},
+                    maps:get(<<"headers">>, Sent)),
+                ?assertMatch([_], hb_mock_server:get_requests(models, 1, Handle)),
+                ?assertMatch([_], hb_mock_server:get_requests(health, 1, Handle)),
+                ?assertEqual([],
+                    hb_mock_server:get_requests(DivertedHandle, diverted))
+            end)
         after
-            hb_mock_server:stop(Handle)
+            hb_mock_server:stop(DivertedHandle)
         end
     end}.
+
+%% Every key the receipt admits as a generation parameter reaches the runtime
+%% through `inference@1.0', and the `user' identifier does not.
+receipt_relays_every_generation_key_test_() ->
+    {timeout, 60, fun() ->
+        with_runtime(fun(URL, Handle) ->
+            Request = maps:from_list([{Key, generation_value(Key)}
+                || Key <- ?GENERATION_KEYS]),
+            {ok, _} = completions(#{},
+                Request#{<<"user">> => <<"leak-test-user">>}, node_opts(URL)),
+            [Sent] = hb_mock_server:get_requests(chat, 1, Handle),
+            Relayed = hb_json:decode(maps:get(<<"body">>, Sent)),
+            ?assertEqual(lists:sort(?GENERATION_KEYS),
+                lists:sort(maps:keys(Relayed)))
+        end)
+    end}.
+
+generation_value(<<"stream">>) -> false;
+generation_value(<<"messages">>) ->
+    [#{<<"role">> => <<"user">>, <<"content">> => <<"hi">>}];
+generation_value(_Key) -> <<"value">>.
+
+streaming_request_is_rejected_test() ->
+    ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
+            #{<<"error">> := <<"receipt-streaming-unsupported">>}}},
+        completions(#{}, #{<<"stream">> => true}, #{})).
+
+result_body_accepts_bare_and_enveloped_results_test() ->
+    Inventory = #{<<"type">> => <<"apus-gpu-inventory">>,
+        <<"inventory-digest">> => <<"digest">>},
+    ?assertEqual(Inventory, result_body(Inventory, #{})),
+    ?assertEqual(Inventory,
+        result_body(#{<<"status">> => 200, <<"body">> => Inventory}, #{})),
+    %% A bare measurement envelope's `body' is its subject, not a wrapper.
+    Envelope = #{<<"type">> => <<"lapee-measurement">>,
+        <<"body">> => #{<<"system">> => #{}}},
+    ?assertEqual(Envelope, result_body(Envelope, #{})),
+    ?assertEqual(Envelope,
+        result_body(#{<<"status">> => 200, <<"body">> => Envelope}, #{})),
+    ?assertEqual(#{}, result_body(not_a_message, #{})).
+
+publish_requires_a_receipt_test() ->
+    ?assertMatch({error, #{<<"status">> := 400, <<"body">> :=
+            #{<<"error">> := <<"receipt-required">>}}},
+        publish(#{}, leaky_request(), #{})).
+
 publish_posts_signed_bundle_before_returning_test_() ->
     {timeout, 20, fun() ->
         Parent = self(),
@@ -908,8 +1066,9 @@ verify_hashpath_rejects_invalid_transcript_test() ->
     ?assertEqual(422, Status),
     ?assertEqual(false, maps:get(<<"verified">>, Result)).
 
-%% Transcript recorded on the H100 guest on 2026-10-12 by HyperBEAM
-%% feat/self-docs-v011 @ 28baa3d2 (`ao-core.status=captured').
+%% Transcript recorded on the reference deployment on 2026-10-12 by
+%% HyperBEAM 28baa3d2 (`ao-core.status=captured'). The HashPath is specific to
+%% the pinned HyperBEAM version.
 -define(CAPTURED_HASHPATH, <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
     "hDjPRer0jfXtHMDhJIRBozzWusYX6-sed0_5HEH2NFk">>).
 
@@ -978,7 +1137,7 @@ verify_hashpath_accepts_captured_receipt_test() ->
     %% The whole receipt can be posted as well.
     ?assertEqual(true, maps:get(<<"verified">>,
         verify_http(#{<<"receipt">> => #{<<"ao-core">> => AOCore}}))),
-    %% A changed request no longer reproduces the recorded HashPath.
+    %% A changed request does not reproduce the recorded HashPath.
     #{<<"request">> := Request} = Transcript = captured_transcript(),
     Tampered = verify_http(#{<<"ao-core">> => AOCore#{
         <<"verification-input">> => Transcript#{
@@ -1013,7 +1172,7 @@ verify_hashpath_checks_every_recorded_copy_test() ->
     ?assertEqual(false, maps:get(<<"verified">>, Conflicting)),
     ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, Conflicting)).
 
-%% Receipts from HyperBEAM 2c03978a recorded no HashPath.
+%% A receipt with `ao-core.status=not-captured' records no HashPath.
 verify_hashpath_reports_not_captured_receipt_test() ->
     #{<<"response">> := Response} = Transcript = captured_transcript(),
     Result = verify_http(#{<<"ao-core">> => #{
