@@ -1,923 +1,2392 @@
-%%% @doc A ReAct agent device that implements an iterative Reason-Act-Observe
-%%% loop. The agent calls an LLM (via relay to an OpenAI-compatible endpoint),
-%%% parses tool_calls from the response, executes tools, and loops until the
-%%% LLM returns a final text answer or max iterations are reached.
+%%% @doc `agent@1.0': a stateless tool-using agent (a ReAct loop) over an
+%%% OpenAI-compatible chat model.
 %%%
-%%% Architecture:
-%%%   dev_agent (standalone device)
-%%%     ├── Calls LLM via inference@1.0 (OpenAI-compatible, local or remote)
-%%%     │     └── inference@1.0 relays via relay@1.0 to the configured peer
-%%%     ├── Parses OpenAI tool_calls format
-%%%     ├── Executes built-in tools (http_request, lookup_data, …)
-%%%     └── Manages conversation history internally (Erlang recursion)
+%%% `run' builds a conversation from the request, asks the node's inference
+%%% device for a chat completion, executes the built-in tools that the model
+%%% calls, appends the observations and repeats until the model answers or the
+%%% iteration limit is reached. The `finish_reason' of each completion decides
+%%% the next step: `stop' answers, `tool_calls' executes tools, `length'
+%%% continues a truncated answer, and every other value ends the run with an
+%%% error code.
 %%%
-%%% Usage:
-%%%   {ok, Result} = hb_ao:resolve(
-%%%     #{<<"device">> => <<"agent@1.0">>},
-%%%     #{<<"path">> => <<"run">>,
-%%%       <<"agent-user-prompt">> => <<"What is the weather?">>},
-%%%     #{}).
+%%% Authority boundaries:
+%%% <ul>
+%%%   <li>The inference device, the tool executor devices and every policy
+%%%       switch are node options. Request and base messages never select a
+%%%       backend, peer, credential, device or path.</li>
+%%%   <li>The request may narrow the built-in tool set (`agent-tools') but
+%%%       never widen it. `bundle_item' exists only when the operator sets
+%%%       `agent-allow-bundle'.</li>
+%%%   <li>A tool runs only when its arguments are a JSON object, and only the
+%%%       argument keys declared in its schema reach its executor.</li>
+%%% </ul>
+%%%
+%%% The normative description is `docs/spec/agent.md'.
 -module(dev_agent).
 -implements(<<"agent@1.0">>).
 -specification("docs/spec/agent.md").
 -export([info/1, run/3]).
 -include_lib("hb/include/hb.hrl").
+-ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-endif.
 
+%% Node option defaults.
+-define(DEFAULT_INFERENCE_DEVICE, <<"inference@1.0">>).
+-define(DEFAULT_MAX_ITERATIONS_LIMIT, 25).
+-define(DEFAULT_MAX_TOOL_RESULT_BYTES, 4000).
+
+%% Request defaults.
+-define(DEFAULT_USER_PROMPT, <<"Hello">>).
 -define(DEFAULT_MAX_ITERATIONS, 10).
--define(DEFAULT_MODEL, <<"gpt-4o-mini">>).
--define(MAX_TOOL_RESULT_SIZE, 4000).
+
+%% Constant bounds.
+-define(MAX_TOOL_CALLS_PER_TURN, 16).
+-define(PREVIEW_BYTES, 160).
+-define(MAX_DETAIL_BYTES, 512).
+
+%% Keys this device writes into its result. Values with these names in the
+%% base message are replaced, never echoed.
+-define(OUTPUT_KEYS, [
+    <<"agent-answer">>,
+    <<"agent-iterations">>,
+    <<"agent-error">>,
+    <<"agent-error-detail">>
+]).
+
+-define(MESSAGE_ROLES, [<<"system">>, <<"user">>, <<"assistant">>, <<"tool">>]).
+-define(TOOL_CHOICE_MODES, [<<"auto">>, <<"none">>, <<"required">>]).
+-define(HTTP_METHODS, [<<"GET">>, <<"POST">>, <<"PUT">>, <<"DELETE">>]).
+-define(SEARCH_RETURNS, [<<"paths">>, <<"messages">>, <<"count">>]).
+
+-define(PROMPT_PREAMBLE,
+    <<"You are a helpful assistant running on a HyperBEAM node in the AO "
+      "network.">>).
+-define(CONTINUE_PROMPT,
+    <<"Continue exactly where your previous message stopped. Do not repeat "
+      "any text you have already written.">>).
 
 %%%===================================================================
 %%% Device API
 %%%===================================================================
 
-info(_Msg) ->
-    #{
-        exports => [<<"run">>]
-    }.
+%% @doc The device exposes a single key, `run'.
+-spec info(term()) -> #{ exports := [binary()] }.
+info(_) ->
+    #{ exports => [<<"run">>] }.
 
-%% @doc Entry point for the agent. Reads user prompt from the request,
-%% builds initial messages, and starts the ReAct loop.
+%% @doc Run one agent task and return the base message with the outcome.
+%% Inputs are read from the request message only; the base message is echoed
+%% in the result (without its commitments) and never consulted.
 -spec run(
     #{ _ => _ },
     #{
         'agent-user-prompt' => _,
+        'agent-messages' => _,
+        'agent-system-prompt' => _,
         'agent-model' => _,
         'agent-max-iterations' => _,
         'agent-disable-tools' => _,
-        'agent-api-peer' => _,
-        'agent-api-path' => _,
-        'agent-api-key' => _,
+        'agent-tools' => _,
+        'agent-tool-choice' => _,
         _ => _
     },
     map()
-) -> {ok, #{ 'agent-answer' := _, 'agent-iterations' := _, _ => _ }}.
+) -> {ok, #{
+        'agent-answer' := binary(),
+        'agent-iterations' := pos_integer(),
+        'agent-error' => binary(),
+        'agent-error-detail' => #{ _ => _ },
+        _ => _
+    }}.
 run(Base, Req, Opts) ->
-    UserPrompt = hb_ao:get(<<"agent-user-prompt">>, Req, <<"Hello">>, Opts),
-    SystemPrompt = default_system_prompt(),
-    DisableTools = truthy(hb_ao:get(<<"agent-disable-tools">>, Req, false, Opts)),
-    Tools =
-        case DisableTools of
-            true -> [];
-            false -> default_tools()
-        end,
-    Model = hb_ao:get(<<"agent-model">>, Req, ?DEFAULT_MODEL, Opts),
-    MaxIter = hb_ao:get(<<"agent-max-iterations">>, Req, ?DEFAULT_MAX_ITERATIONS, Opts),
-    %% Merge agent API config from Req/Base into Opts so that
-    %% Lua ao.resolve calls can pass config via message fields.
-    MergedOpts = merge_agent_config(Req, merge_agent_config(Base, Opts)),
-    LLMFun = maps:get(<<"agent-llm-fun">>, MergedOpts, fun default_call_llm/2),
-    ToolFun = maps:get(<<"agent-tool-fun">>, MergedOpts, fun default_execute_tool/2),
-    Messages = [
-        #{<<"role">> => <<"system">>, <<"content">> => SystemPrompt},
-        #{<<"role">> => <<"user">>, <<"content">> => UserPrompt}
-    ],
-    AgentOpts = #{
-        model => Model,
+    Tools = enabled_tools(Req, Opts),
+    State = #{
+        base => Base,
+        opts => Opts,
         tools => Tools,
-        max_iterations => MaxIter,
-        llm_fun => LLMFun,
-        tool_fun => ToolFun,
-        opts => MergedOpts
+        model => model(Req, Opts),
+        tool_choice => initial_tool_choice(Req, Tools, Opts),
+        max_iterations => max_iterations(Req, Opts),
+        max_result_bytes => max_tool_result_bytes(Opts),
+        messages =>
+            initial_messages(Req, system_prompt(Req, Tools, Opts), Opts),
+        iteration => 1,
+        partial => <<>>
     },
-    loop(Messages, 1, AgentOpts, Base).
+    loop(State).
 
 %%%===================================================================
-%%% ReAct Loop
+%%% Loop
 %%%===================================================================
 
-%% @doc The main ReAct loop. Calls LLM, checks for tool_calls or final answer.
-loop(Messages, Iteration, #{max_iterations := MaxIter} = AgentOpts, Base)
-  when Iteration > MaxIter ->
-    ?event(agent, {max_iterations_reached, Iteration}),
-    {ok, Base#{
-        <<"agent-answer">> =>
-            <<"Max iterations reached. Could not complete the task.">>,
-        <<"agent-error">> => <<"max_iterations_exceeded">>,
-        <<"agent-iterations">> => Iteration - 1
-    }};
-loop(Messages, Iteration, AgentOpts, Base) ->
-    #{model := Model, tools := Tools, llm_fun := LLMFun,
-      tool_fun := ToolFun, opts := Opts} = AgentOpts,
-    RequestBody = build_request_body(Messages, Tools, Model),
-    case LLMFun(RequestBody, Opts) of
-        {ok, ResponseBody} ->
-            case parse_response(ResponseBody) of
-                {tool_calls, AssistantMsg, ToolCalls} ->
-                    ?event(agent, {tool_calls, Iteration, length(ToolCalls)}),
-                    ToolResultMsgs = execute_tool_calls(ToolCalls, ToolFun, Opts),
-                    NewMessages = Messages ++ [AssistantMsg | ToolResultMsgs],
-                    loop(NewMessages, Iteration + 1, AgentOpts, Base);
-                {final_answer, Content} ->
-                    ?event(agent, {final_answer, Iteration}),
-                    {ok, Base#{
-                        <<"agent-answer">> => Content,
-                        <<"agent-iterations">> => Iteration
-                    }};
-                {error, ParseError} ->
-                    {ok, Base#{
-                        <<"agent-answer">> => <<"Error parsing LLM response.">>,
-                        <<"agent-error">> => ParseError,
-                        <<"agent-iterations">> => Iteration
-                    }}
-            end;
-        {error, LLMError} ->
-            {ok, Base#{
-                <<"agent-answer">> => <<"Error calling LLM.">>,
-                <<"agent-error">> => LLMError,
-                <<"agent-iterations">> => Iteration
-            }}
+%% @doc One model call per iteration. The iteration counter is the number of
+%% the next model call; the run stops before a call that would exceed the
+%% limit.
+loop(State = #{ iteration := Iteration, max_iterations := Max })
+        when Iteration > Max ->
+    ?event(agent, {max_iterations_reached, Max}),
+    finish_error(
+        <<"max_iterations_exceeded">>,
+        #{ <<"limit">> => Max },
+        Max,
+        State
+    );
+loop(State = #{ iteration := Iteration }) ->
+    ?event(agent, {model_call, Iteration}),
+    case call_model(State) of
+        {ok, Response} -> step(parse_response(Response), State);
+        {error, Code, Detail} -> finish_error(Code, Detail, Iteration, State)
     end.
 
-%%%===================================================================
-%%% LLM Interaction
-%%%===================================================================
-
-%% @doc Build the OpenAI-compatible request body.
-build_request_body(Messages, [], Model) ->
-    hb_json:encode(#{
-        <<"model">> => Model,
-        <<"messages">> => Messages
+%% @doc Apply the outcome of one completion.
+step({answer, Text}, State = #{ iteration := Iteration, partial := Partial }) ->
+    ?event(agent, {final_answer, Iteration}),
+    finish_answer(<<Partial/binary, Text/binary>>, Iteration, State);
+step({tool_calls, Frame, Calls}, State) ->
+    #{ iteration := Iteration, messages := Messages } = State,
+    ?event(agent, {tool_calls, Iteration, length(Calls)}),
+    Results = execute_tool_calls(Calls, State),
+    loop(State#{
+        messages := Messages ++ [Frame | Results],
+        iteration := Iteration + 1,
+        partial := <<>>,
+        tool_choice := tool_choice_after_tools(State)
     });
-build_request_body(Messages, Tools, Model) ->
-    hb_json:encode(#{
-        <<"model">> => Model,
-        <<"messages">> => Messages,
-        <<"tools">> => Tools,
-        <<"tool_choice">> => <<"auto">>
-    }).
+step({continue, Frame, Text}, State) ->
+    #{ iteration := Iteration, messages := Messages, partial := Partial } =
+        State,
+    ?event(agent, {continue_truncated_answer, Iteration}),
+    loop(State#{
+        messages :=
+            Messages ++
+                [Frame, #{ <<"role">> => <<"user">>,
+                           <<"content">> => ?CONTINUE_PROMPT }],
+        iteration := Iteration + 1,
+        partial := <<Partial/binary, Text/binary>>
+    });
+step({error, Code, Detail}, State = #{ iteration := Iteration }) ->
+    ?event(agent, {run_failed, Code, Iteration}),
+    finish_error(Code, Detail, Iteration, State).
 
-truthy(true) -> true;
-truthy(<<"true">>) -> true;
-truthy(<<"1">>) -> true;
-truthy(1) -> true;
-truthy(_) -> false.
+%% @doc A caller's tool choice applies until the first tool round. Repeating
+%% `required' or a named function would force a tool call on every turn, so
+%% later turns use `auto'.
+tool_choice_after_tools(#{ tool_choice := undefined }) -> undefined;
+tool_choice_after_tools(_) -> <<"auto">>.
 
-%% @doc Default LLM call via inference@1.0.
-%% inference@1.0 relays to any OpenAI-compatible provider via relay@1.0,
-%% making local and remote LLM backends interchangeable from the agent's
-%% perspective. Supported Opts keys (consumed by inference@1.0/relay@1.0):
-%%   agent-api-peer: Base URL           (default: "http://localhost:8080")
-%%   agent-api-path: Completions path   (default: "/v1/chat/completions")
-%%   agent-api-key:  Bearer token       (optional)
-default_call_llm(RequestBody, Opts) ->
-    InferenceDevice = maps:get(<<"agent-inference-device">>, Opts,
-        <<"inference@1.0">>),
-    case hb_ao:resolve(
-        #{<<"device">>    => InferenceDevice,
-          <<"chat-mode">> => true},
-        #{<<"path">> => <<"completions">>,
-          <<"body">> => RequestBody},
-        Opts#{hashpath => ignore,
-              cache_control => [<<"no-store">>, <<"no-cache">>]}
-    ) of
-        {ok, Res} ->
-            {ok, hb_ao:get(<<"body">>, Res, <<>>, Opts)};
-        {error, Reason} ->
-            {error, Reason}
-    end.
+finish_answer(Answer, Iterations, #{ base := Base, opts := Opts }) ->
+    {ok, (result_base(Base, Opts))#{
+        <<"agent-answer">> => Answer,
+        <<"agent-iterations">> => Iterations
+    }}.
 
-%% @doc Parse an OpenAI chat completion response.
-%% Returns {tool_calls, AssistantMsg, ToolCalls} | {final_answer, Content} | {error, Reason}.
-parse_response(ResponseBody) when is_binary(ResponseBody) ->
-    try
-        Decoded = hb_json:decode(ResponseBody),
-        parse_response(Decoded)
-    catch
-        _:_ -> {error, <<"Failed to decode JSON response">>}
-    end;
-parse_response(Response) when is_map(Response) ->
-    Choices = maps:get(<<"choices">>, Response, []),
-    case Choices of
-        [FirstChoice | _] ->
-            Message = maps:get(<<"message">>, FirstChoice, #{}),
-            parse_assistant_message(Message);
-        [] ->
-            {error, <<"No choices in response">>}
-    end.
+finish_error(Code, Detail, Iterations, #{ base := Base, opts := Opts }) ->
+    {ok, (result_base(Base, Opts))#{
+        <<"agent-answer">> => error_answer(Code),
+        <<"agent-iterations">> => Iterations,
+        <<"agent-error">> => Code,
+        <<"agent-error-detail">> => Detail
+    }}.
 
-%% @doc Parse the assistant message for tool_calls or final answer.
-parse_assistant_message(Message) ->
-    ToolCalls = maps:get(<<"tool_calls">>, Message, null),
-    Content = maps:get(<<"content">>, Message, null),
-    case ToolCalls of
-        null -> {final_answer, content_to_binary(Content)};
-        [] -> {final_answer, content_to_binary(Content)};
-        Calls when is_list(Calls) ->
-            %% Build assistant message to include in history
-            AssistantMsg = #{
-                <<"role">> => <<"assistant">>,
-                <<"content">> => Content,
-                <<"tool_calls">> => Calls
-            },
-            {tool_calls, AssistantMsg, Calls}
-    end.
+%% @doc The result echoes the base message. Its commitments do not cover the
+%% result and are removed, and output keys it carries are replaced.
+result_base(Base, Opts) ->
+    maps:without(?OUTPUT_KEYS, hb_message:uncommitted(Base, Opts)).
 
-content_to_binary(null) -> <<>>;
-content_to_binary(B) when is_binary(B) -> B;
-content_to_binary(Other) -> hb_util:bin(Other).
+error_answer(<<"max_iterations_exceeded">>) ->
+    <<"Max iterations reached. Could not complete the task.">>;
+error_answer(<<"content_filtered">>) ->
+    <<"The model response was blocked by a content filter.">>;
+error_answer(<<"incomplete_response">>) ->
+    <<"The model response was incomplete.">>;
+error_answer(<<"unsupported_finish_reason">>) ->
+    <<"The model stopped for an unsupported reason.">>;
+error_answer(<<"invalid_response">>) ->
+    <<"The model response could not be parsed.">>;
+error_answer(<<"model_error">>) ->
+    <<"The model call failed.">>.
 
 %%%===================================================================
-%%% Tool Execution
+%%% Request inputs
 %%%===================================================================
 
-%% @doc Execute a list of tool calls, returning tool result messages.
-execute_tool_calls(ToolCalls, ToolFun, Opts) ->
-    lists:map(
-        fun(ToolCall) ->
-            ToolCallId = maps:get(<<"id">>, ToolCall, <<>>),
-            Function = maps:get(<<"function">>, ToolCall, #{}),
-            FuncName = maps:get(<<"name">>, Function, <<>>),
-            ArgsJson = maps:get(<<"arguments">>, Function, <<"{}">>),
-            Args = try hb_json:decode(ArgsJson) catch _:_ -> #{} end,
-            Result = ToolFun(#{name => FuncName, args => Args}, Opts),
-            #{
-                <<"role">> => <<"tool">>,
-                <<"tool_call_id">> => ToolCallId,
-                <<"content">> => truncate_result(Result)
-            }
+%% @doc Read a key from the request message, loading it if it is a link.
+req(Key, Req, Opts) ->
+    hb_maps:get(Key, Req, not_found, Opts).
+
+%% @doc `agent-model', then node option `agent-default-model'. Without
+%% either, the payload has no `model' field and the runtime chooses.
+model(Req, Opts) ->
+    case nonempty_text(req(<<"agent-model">>, Req, Opts)) of
+        {ok, Model} -> Model;
+        error ->
+            case nonempty_text(
+                    hb_opts:get(<<"agent-default-model">>, not_found, Opts)) of
+                {ok, Model} -> Model;
+                error -> undefined
+            end
+    end.
+
+%% @doc The effective iteration limit: the requested value (or the default)
+%% capped by the operator ceiling.
+max_iterations(Req, Opts) ->
+    Limit =
+        case positive_int(
+                hb_opts:get(<<"agent-max-iterations-limit">>, not_found, Opts)) of
+            {ok, L} -> L;
+            error -> ?DEFAULT_MAX_ITERATIONS_LIMIT
         end,
-        ToolCalls
+    Requested =
+        case positive_int(req(<<"agent-max-iterations">>, Req, Opts)) of
+            {ok, N} -> N;
+            error -> ?DEFAULT_MAX_ITERATIONS
+        end,
+    min(Requested, Limit).
+
+max_tool_result_bytes(Opts) ->
+    case positive_int(
+            hb_opts:get(<<"agent-max-tool-result-bytes">>, not_found, Opts)) of
+        {ok, N} -> N;
+        error -> ?DEFAULT_MAX_TOOL_RESULT_BYTES
+    end.
+
+%% @doc The built-in tools offered in this run: the operator-enabled table,
+%% narrowed by `agent-tools', or nothing when `agent-disable-tools' is set.
+enabled_tools(Req, Opts) ->
+    case truthy(req(<<"agent-disable-tools">>, Req, Opts)) of
+        true -> [];
+        false ->
+            Available =
+                [
+                    Tool
+                ||
+                    Tool = #{ requires := Gate } <- tool_table(),
+                    gate_open(Gate, Opts)
+                ],
+            case requested_tool_names(req(<<"agent-tools">>, Req, Opts)) of
+                all -> Available;
+                Names ->
+                    [
+                        Tool
+                    ||
+                        Tool = #{ name := Name } <- Available,
+                        lists:member(Name, Names)
+                    ]
+            end
+    end.
+
+gate_open(none, _Opts) -> true;
+gate_open(Option, Opts) -> truthy(hb_opts:get(Option, false, Opts)).
+
+%% @doc `agent-tools' as a list of names, a JSON array, or a comma-separated
+%% text. Any other value leaves the set unchanged.
+requested_tool_names(not_found) -> all;
+requested_tool_names(List) when is_list(List) ->
+    [string:trim(Name) || Name <- List, is_binary(Name)];
+requested_tool_names(Bin) when is_binary(Bin) ->
+    case decode_json(Bin) of
+        {ok, List} when is_list(List) -> requested_tool_names(List);
+        _ ->
+            [
+                Name
+            ||
+                Part <- binary:split(Bin, <<",">>, [global]),
+                Name <- [string:trim(Part)],
+                Name =/= <<>>
+            ]
+    end;
+requested_tool_names(_) -> all.
+
+%% @doc `agent-tool-choice' when tools are offered: `auto', `none',
+%% `required', or a named function object (map or JSON text).
+initial_tool_choice(_Req, [], _Opts) -> undefined;
+initial_tool_choice(Req, _Tools, Opts) ->
+    case req(<<"agent-tool-choice">>, Req, Opts) of
+        Mode when is_binary(Mode) ->
+            case lists:member(Mode, ?TOOL_CHOICE_MODES) of
+                true -> Mode;
+                false ->
+                    case decode_json(Mode) of
+                        {ok, Choice} -> named_tool_choice(Choice);
+                        error -> <<"auto">>
+                    end
+            end;
+        Choice -> named_tool_choice(Choice)
+    end.
+
+named_tool_choice(#{ <<"type">> := <<"function">>,
+                     <<"function">> := #{ <<"name">> := Name } })
+        when is_binary(Name), Name =/= <<>> ->
+    #{ <<"type">> => <<"function">>,
+       <<"function">> => #{ <<"name">> => Name } };
+named_tool_choice(_) ->
+    <<"auto">>.
+
+%% @doc `agent-system-prompt', or the prompt generated from the tool set.
+system_prompt(Req, Tools, Opts) ->
+    case nonempty_text(req(<<"agent-system-prompt">>, Req, Opts)) of
+        {ok, Prompt} -> Prompt;
+        error -> default_system_prompt(Tools)
+    end.
+
+default_system_prompt([]) ->
+    <<?PROMPT_PREAMBLE/binary,
+      " Answer the user's request directly and concisely.">>;
+default_system_prompt(Tools) ->
+    Lines =
+        << <<"- ", Name/binary, ": ", Description/binary, "\n">>
+        || #{ name := Name, description := Description } <- Tools >>,
+    <<?PROMPT_PREAMBLE/binary, " You can call these tools:\n", Lines/binary,
+      "Call a tool only when you need information or an action that it "
+      "provides. When you have enough information, reply with the final "
+      "answer as plain text and do not call any tool. Keep answers "
+      "concise.">>.
+
+%% @doc The caller's `agent-messages' when they are usable, otherwise the
+%% system prompt followed by `agent-user-prompt'.
+initial_messages(Req, SystemPrompt, Opts) ->
+    System = #{ <<"role">> => <<"system">>, <<"content">> => SystemPrompt },
+    case caller_messages(req(<<"agent-messages">>, Req, Opts), Opts) of
+        {ok, Messages} ->
+            case lists:any(fun is_system_message/1, Messages) of
+                true -> Messages;
+                false -> [System | Messages]
+            end;
+        error ->
+            Prompt =
+                case nonempty_text(req(<<"agent-user-prompt">>, Req, Opts)) of
+                    {ok, Text} -> Text;
+                    error -> ?DEFAULT_USER_PROMPT
+                end,
+            [System, #{ <<"role">> => <<"user">>, <<"content">> => Prompt }]
+    end.
+
+is_system_message(#{ <<"role">> := <<"system">> }) -> true;
+is_system_message(_) -> false.
+
+%% @doc Accept a list of messages, a JSON array, or a message with ordinal
+%% keys (`1', `2', ...). Every element must be an object with a known
+%% `role', and the list must encode as JSON.
+caller_messages(not_found, _Opts) -> error;
+caller_messages(Bin, Opts) when is_binary(Bin) ->
+    case decode_json(Bin) of
+        {ok, List} when is_list(List) -> caller_messages(List, Opts);
+        _ -> error
+    end;
+caller_messages(List, Opts) when is_list(List), List =/= [] ->
+    Loaded = try hb_cache:ensure_all_loaded(List, Opts) catch _:_ -> List end,
+    Valid =
+        lists:all(
+            fun(#{ <<"role">> := Role }) -> lists:member(Role, ?MESSAGE_ROLES);
+               (_) -> false
+            end,
+            Loaded
+        ),
+    case Valid andalso json_encodable(Loaded) of
+        true -> {ok, Loaded};
+        false -> error
+    end;
+caller_messages(Map, Opts) when is_map(Map), map_size(Map) > 0 ->
+    case ordinal_values(Map) of
+        {ok, List} -> caller_messages(List, Opts);
+        error -> error
+    end;
+caller_messages(_, _Opts) -> error.
+
+ordinal_values(Map) ->
+    try
+        Indexed =
+            [{binary_to_integer(hb_util:bin(K)), V} || {K, V} <- maps:to_list(Map)],
+        Sorted = lists:keysort(1, Indexed),
+        case [I || {I, _} <- Sorted] =:= lists:seq(1, length(Sorted)) of
+            true -> {ok, [V || {_, V} <- Sorted]};
+            false -> error
+        end
+    catch _:_ -> error
+    end.
+
+%%%===================================================================
+%%% Model calls
+%%%===================================================================
+
+%% @doc The OpenAI chat-completions payload for the next call.
+request_payload(State) ->
+    #{ messages := Messages, tools := Tools,
+       tool_choice := Choice, model := Model } = State,
+    WithMessages = #{ <<"messages">> => Messages },
+    WithModel =
+        case Model of
+            undefined -> WithMessages;
+            _ -> WithMessages#{ <<"model">> => Model }
+        end,
+    case Tools of
+        [] -> WithModel;
+        _ ->
+            WithModel#{
+                <<"tools">> => [tool_definition(Tool) || Tool <- Tools],
+                <<"tool_choice">> => Choice
+            }
+    end.
+
+%% @doc Resolve `completions' on the inference device named by the node
+%% option `agent-inference-device'. Only `path' and the JSON `body' are sent;
+%% routing and credentials are the inference device's node options.
+call_model(State = #{ opts := Opts }) ->
+    Device =
+        hb_opts:get(<<"agent-inference-device">>, ?DEFAULT_INFERENCE_DEVICE, Opts),
+    try
+        Body = hb_json:encode(request_payload(State)),
+        hb_ao:resolve(
+            #{ <<"device">> => Device },
+            #{ <<"path">> => <<"completions">>, <<"body">> => Body },
+            no_cache(Opts)
+        )
+    of
+        {ok, Result} -> model_result(Result, Opts);
+        {error, Reason} -> {error, <<"model_error">>, error_detail(Reason, Opts)};
+        Other -> {error, <<"model_error">>, error_detail(Other, Opts)}
+    catch
+        Class:Reason ->
+            {error, <<"model_error">>,
+                #{ <<"message">> => describe({Class, Reason}) }}
+    end.
+
+%% @doc Interpret the inference device's result message.
+model_result(Result, Opts) when is_map(Result) ->
+    case status_code(hb_maps:get(<<"status">>, Result, 200, Opts)) of
+        Status when is_integer(Status), Status >= 400 ->
+            {error, <<"model_error">>, error_detail(Result, Opts)};
+        _ ->
+            case hb_maps:get(<<"body">>, Result, not_found, Opts) of
+                not_found when is_map_key(<<"choices">>, Result) -> {ok, Result};
+                Body -> decode_response(Body)
+            end
+    end;
+model_result(Body, _Opts) when is_binary(Body) ->
+    decode_response(Body);
+model_result(_Other, _Opts) ->
+    {error, <<"invalid_response">>,
+        #{ <<"message">> => <<"the inference result is not a message">> }}.
+
+decode_response(Response) when is_map(Response) ->
+    {ok, Response};
+decode_response(Body) when is_binary(Body) ->
+    case decode_json(Body) of
+        {ok, Response} when is_map(Response) -> {ok, Response};
+        _ ->
+            {error, <<"invalid_response">>,
+                #{ <<"message">> => <<"the response body is not a JSON object">> }}
+    end;
+decode_response(_) ->
+    {error, <<"invalid_response">>,
+        #{ <<"message">> => <<"the response has no body">> }}.
+
+%% @doc Classify a decoded chat completion.
+parse_response(Response) ->
+    case error_envelope(Response) of
+        none -> parse_choices(Response);
+        Detail -> {error, <<"model_error">>, Detail}
+    end.
+
+parse_choices(Response) ->
+    case maps:get(<<"choices">>, Response, []) of
+        [Choice | _] when is_map(Choice) -> parse_choice(Choice);
+        _ ->
+            {error, <<"invalid_response">>,
+                #{ <<"message">> => <<"the response has no choices">> }}
+    end.
+
+parse_choice(Choice) ->
+    case maps:get(<<"message">>, Choice, not_found) of
+        Message when is_map(Message) ->
+            dispatch(finish_reason(Choice, Message), Message);
+        _ ->
+            {error, <<"invalid_response">>,
+                #{ <<"message">> => <<"the first choice has no message">> }}
+    end.
+
+%% @doc A missing or null `finish_reason' is inferred from the message.
+finish_reason(Choice, Message) ->
+    case maps:get(<<"finish_reason">>, Choice, null) of
+        null ->
+            case tool_call_list(Message) of
+                [] -> <<"stop">>;
+                _ -> <<"tool_calls">>
+            end;
+        Reason when is_binary(Reason) -> Reason;
+        Other -> describe(Other)
+    end.
+
+dispatch(<<"stop">>, Message) ->
+    {answer, answer_text(Message)};
+dispatch(<<"tool_calls">>, Message) ->
+    case tool_call_list(Message) of
+        [] ->
+            incomplete(<<"tool_calls">>, <<"missing-tool-calls">>);
+        RawCalls ->
+            Calls = normalize_tool_calls(RawCalls),
+            Frame =
+                assistant_frame(
+                    Message,
+                    #{ <<"tool_calls">> => [frame_call(Call) || Call <- Calls] }
+                ),
+            {tool_calls, Frame, Calls}
+    end;
+dispatch(<<"length">>, Message) ->
+    case {has_tool_call(Message), content_text(Message)} of
+        {true, _} -> incomplete(<<"length">>, <<"truncated-tool-call">>);
+        {false, <<>>} -> incomplete(<<"length">>, <<"empty-content">>);
+        {false, Text} -> {continue, assistant_frame(Message, #{}), Text}
+    end;
+dispatch(<<"content_filter">>, _Message) ->
+    {error, <<"content_filtered">>,
+        #{ <<"finish-reason">> => <<"content_filter">> }};
+dispatch(<<"error">>, _Message) ->
+    {error, <<"model_error">>, #{ <<"finish-reason">> => <<"error">> }};
+dispatch(Other, _Message) ->
+    {error, <<"unsupported_finish_reason">>,
+        #{ <<"finish-reason">> => bound_text(Other, ?MAX_DETAIL_BYTES) }}.
+
+incomplete(FinishReason, Cause) ->
+    {error, <<"incomplete_response">>,
+        #{ <<"finish-reason">> => FinishReason, <<"cause">> => Cause }}.
+
+tool_call_list(Message) ->
+    case maps:get(<<"tool_calls">>, Message, null) of
+        Calls when is_list(Calls) -> Calls;
+        _ -> []
+    end.
+
+%% @doc Any tool call, complete or not, including the single-call
+%% `function_call' form.
+has_tool_call(Message) ->
+    tool_call_list(Message) =/= [] orelse
+        is_map(maps:get(<<"function_call">>, Message, null)).
+
+%% @doc The visible text of an assistant message. Array content keeps its
+%% text parts.
+content_text(Message) ->
+    case maps:get(<<"content">>, Message, null) of
+        Text when is_binary(Text) -> Text;
+        Parts when is_list(Parts) ->
+            << <<Text/binary>>
+            || #{ <<"text">> := Text } <- Parts, is_binary(Text) >>;
+        _ -> <<>>
+    end.
+
+%% @doc The final answer: the content, or the `refusal' text when the
+%% content is empty.
+answer_text(Message) ->
+    case content_text(Message) of
+        <<>> ->
+            case maps:get(<<"refusal">>, Message, null) of
+                Refusal when is_binary(Refusal) -> Refusal;
+                _ -> <<>>
+            end;
+        Text -> Text
+    end.
+
+%% @doc The assistant frame appended to the history. Reasoning fields are
+%% kept so that reasoning models can continue after tool results.
+assistant_frame(Message, Extra) ->
+    Content =
+        case content_text(Message) of
+            <<>> -> null;
+            Text -> Text
+        end,
+    Reasoning =
+        maps:filter(
+            fun(_Key, Value) -> is_binary(Value) end,
+            maps:with([<<"reasoning_content">>, <<"reasoning">>], Message)
+        ),
+    maps:merge(
+        Reasoning,
+        Extra#{ <<"role">> => <<"assistant">>, <<"content">> => Content }
     ).
 
-%% @doc Default tool executor. Dispatches by function name.
-default_execute_tool(#{name := <<"http_request">>, args := Args}, Opts) ->
-    execute_http_request(Args, Opts);
-default_execute_tool(#{name := <<"lookup_data">>, args := Args}, Opts) ->
-    execute_lookup(Args, Opts);
-default_execute_tool(#{name := <<"search_messages">>, args := Args}, Opts) ->
-    execute_search(Args, Opts);
-default_execute_tool(#{name := <<"get_arweave_tx">>, args := Args}, Opts) ->
-    execute_get_arweave_tx(Args, Opts);
-default_execute_tool(#{name := <<"bundle_item">>, args := Args}, Opts) ->
-    execute_bundle_item(Args, Opts);
-default_execute_tool(#{name := Name}, _Opts) ->
-    <<"Unknown tool: ", Name/binary>>.
+normalize_tool_calls(RawCalls) ->
+    lists:zipwith(
+        fun normalize_tool_call/2,
+        RawCalls,
+        lists:seq(1, length(RawCalls))
+    ).
 
-%% @doc Execute an HTTP request via relay@1.0.
-execute_http_request(Args, Opts) ->
-    Method = maps:get(<<"method">>, Args, <<"GET">>),
-    Url = maps:get(<<"url">>, Args, <<>>),
-    Body = maps:get(<<"body">>, Args, <<>>),
-    ContentType = maps:get(<<"content_type">>, Args, <<"text/plain">>),
-    case hb_ao:resolve(
-        #{<<"device">> => <<"relay@1.0">>,
-          <<"content-type">> => ContentType},
-        #{<<"path">> => <<"call">>,
-          <<"target">> => <<"payload">>,
-          <<"payload">> => #{
-              <<"path">> => Url,
-              <<"method">> => Method,
-              <<"body">> => Body,
-              <<"content-type">> => ContentType
-          }},
-        Opts#{hashpath => ignore,
-              cache_control => [<<"no-store">>, <<"no-cache">>]}
-    ) of
-        {ok, Res} ->
-            hb_ao:get(<<"body">>, Res, <<"No body">>, Opts);
-        {error, Reason} ->
-            iolist_to_binary(io_lib:format("HTTP request failed: ~p", [Reason]))
+normalize_tool_call(Call, Index) when is_map(Call) ->
+    Function =
+        case maps:get(<<"function">>, Call, #{}) of
+            F when is_map(F) -> F;
+            _ -> #{}
+        end,
+    #{
+        id =>
+            case maps:get(<<"id">>, Call, null) of
+                Id when is_binary(Id), Id =/= <<>> -> Id;
+                _ -> generated_call_id(Index)
+            end,
+        name =>
+            case maps:get(<<"name">>, Function, null) of
+                Name when is_binary(Name) -> Name;
+                _ -> <<>>
+            end,
+        arguments => maps:get(<<"arguments">>, Function, <<>>)
+    };
+normalize_tool_call(_Call, Index) ->
+    #{ id => generated_call_id(Index), name => <<>>, arguments => <<>> }.
+
+generated_call_id(Index) ->
+    <<"call_", (integer_to_binary(Index))/binary>>.
+
+frame_call(#{ id := Id, name := Name, arguments := Arguments }) ->
+    #{
+        <<"id">> => Id,
+        <<"type">> => <<"function">>,
+        <<"function">> => #{
+            <<"name">> => Name,
+            <<"arguments">> => arguments_text(Arguments)
+        }
+    }.
+
+arguments_text(Arguments) when is_binary(Arguments) -> Arguments;
+arguments_text(Arguments) ->
+    try hb_json:encode(Arguments) catch _:_ -> <<>> end.
+
+%% @doc The detail of an OpenAI-style error envelope (an `error' object or
+%% text, or `"object": "error"'), or `none'.
+error_envelope(#{ <<"error">> := Error }) when is_map(Error) ->
+    error_fields(Error);
+error_envelope(#{ <<"error">> := Error }) when is_binary(Error) ->
+    #{ <<"message">> => bound_text(Error, ?MAX_DETAIL_BYTES) };
+error_envelope(Response = #{ <<"object">> := <<"error">> }) ->
+    error_fields(Response);
+error_envelope(_) ->
+    none.
+
+error_fields(Map) ->
+    Fields =
+        maps:from_list(
+            [
+                {Key, detail_value(Value)}
+            ||
+                Key <- [<<"message">>, <<"type">>, <<"code">>],
+                Value <- [maps:get(Key, Map, null)],
+                is_binary(Value) orelse is_integer(Value)
+            ]
+        ),
+    case map_size(Fields) of
+        0 -> #{ <<"message">> => <<"the response carries an error">> };
+        _ -> Fields
     end.
 
-%% @doc Look up an item from the local cache by ID via lookup@1.0.
-execute_lookup(Args, Opts) ->
-    ID = maps:get(<<"id">>, Args, <<>>),
-    case hb_ao:resolve(
-        #{<<"device">> => <<"lookup@1.0">>},
-        #{<<"path">> => <<"read">>, <<"target">> => ID},
-        Opts#{hashpath => ignore}
-    ) of
-        {ok, Res} when is_map(Res) -> hb_json:encode(Res);
-        {ok, Res} when is_binary(Res) -> Res;
-        {ok, Res} -> hb_util:bin(Res);
-        {error, not_found} -> <<"Not found: ", ID/binary>>;
-        {error, Reason} ->
-            iolist_to_binary(io_lib:format("Lookup failed: ~p", [Reason]))
-    end.
+detail_value(Value) when is_binary(Value) -> bound_text(Value, ?MAX_DETAIL_BYTES);
+detail_value(Value) -> Value.
 
-%% @doc Search the node cache for messages matching a key-value spec via query@1.0.
-execute_search(Args, Opts) ->
-    MatchSpec = maps:get(<<"match">>, Args, #{}),
-    ReturnType = maps:get(<<"return">>, Args, <<"paths">>),
-    %% Merge match keys into the request so query@1.0's `all' path picks them up.
-    Req = maps:merge(MatchSpec, #{<<"path">> => <<"all">>, <<"return">> => ReturnType}),
-    case hb_ao:resolve(
-        #{<<"device">> => <<"query@1.0">>},
-        Req,
-        Opts#{hashpath => ignore}
-    ) of
-        {ok, Results} -> hb_json:encode(Results);
-        {error, Reason} ->
-            iolist_to_binary(io_lib:format("Search failed: ~p", [Reason]))
-    end.
+%% @doc Describe a failed inference call: its status and the runtime's error
+%% message when available.
+error_detail(Reason, Opts) when is_map(Reason) ->
+    Status =
+        case status_code(hb_maps:get(<<"status">>, Reason, not_found, Opts)) of
+            Code when is_integer(Code) -> #{ <<"status">> => Code };
+            _ -> #{}
+        end,
+    FromBody =
+        case hb_maps:get(<<"body">>, Reason, not_found, Opts) of
+            Body when is_binary(Body), Body =/= <<>> ->
+                case decode_json(Body) of
+                    {ok, Decoded} when is_map(Decoded) ->
+                        case error_envelope(Decoded) of
+                            none -> body_message(Body);
+                            Fields -> Fields
+                        end;
+                    _ -> body_message(Body)
+                end;
+            Body when is_map(Body) ->
+                case error_envelope(Body) of
+                    none -> #{};
+                    Fields -> Fields
+                end;
+            _ -> #{}
+        end,
+    Message =
+        case {FromBody, hb_maps:get(<<"message">>, Reason, not_found, Opts)} of
+            {#{ <<"message">> := _ }, _} -> #{};
+            {_, Text} when is_binary(Text) ->
+                #{ <<"message">> => bound_text(Text, ?MAX_DETAIL_BYTES) };
+            _ when map_size(Status) > 0 -> #{};
+            _ -> #{ <<"message">> => describe(Reason) }
+        end,
+    maps:merge(maps:merge(Status, FromBody), Message);
+error_detail(Reason, _Opts) ->
+    #{ <<"message">> => describe(Reason) }.
 
-%% @doc Fetch an Arweave transaction by TXID via arweave@2.9-pre.
-execute_get_arweave_tx(Args, Opts) ->
-    TXID = maps:get(<<"id">>, Args, <<>>),
-    case hb_ao:resolve(
-        #{<<"device">> => <<"arweave@2.9-pre">>},
-        #{<<"path">> => <<"tx">>, <<"tx">> => TXID},
-        Opts#{hashpath => ignore}
-    ) of
-        {ok, Res} when is_map(Res) -> hb_json:encode(Res);
-        {ok, Res} when is_binary(Res) -> Res;
-        {ok, Res} -> hb_util:bin(Res);
-        {error, not_found} -> <<"Transaction not found: ", TXID/binary>>;
-        {error, Reason} ->
-            iolist_to_binary(io_lib:format("Arweave TX fetch failed: ~p", [Reason]))
-    end.
+body_message(Body) ->
+    #{ <<"message">> => bound_text(Body, ?MAX_DETAIL_BYTES) }.
 
-%% @doc Submit a data item to Arweave via the node's bundler@1.0.
-execute_bundle_item(Args, Opts) ->
-    Data = maps:get(<<"data">>, Args, <<>>),
-    ContentType = maps:get(<<"content_type">>, Args, <<"text/plain">>),
-    case hb_ao:resolve(
-        #{<<"device">> => <<"bundler@1.0">>},
-        #{<<"path">> => <<"item">>,
-          <<"data">> => Data,
-          <<"content-type">> => ContentType},
-        Opts#{hashpath => ignore}
-    ) of
-        {ok, Res} when is_binary(Res) -> Res;
-        {ok, Res} -> hb_util:bin(Res);
-        {error, Reason} ->
-            iolist_to_binary(io_lib:format("Bundle failed: ~p", [Reason]))
-    end.
-
-%% @doc Truncate tool results to avoid exceeding LLM context limits.
-truncate_result(Result) when is_binary(Result),
-                             byte_size(Result) > ?MAX_TOOL_RESULT_SIZE ->
-    <<Truncated:?MAX_TOOL_RESULT_SIZE/binary, _/binary>> = Result,
-    <<Truncated/binary, "\n... [truncated]">>;
-truncate_result(Result) when is_binary(Result) ->
-    Result;
-truncate_result(Result) ->
-    truncate_result(iolist_to_binary(io_lib:format("~p", [Result]))).
+status_code(Code) when is_integer(Code) -> Code;
+status_code(Code) when is_binary(Code) ->
+    try binary_to_integer(Code) catch _:_ -> undefined end;
+status_code(_) -> undefined.
 
 %%%===================================================================
-%%% Configuration Helpers
+%%% Tools
 %%%===================================================================
 
-%% @doc Merge agent API config from a Source message into Opts.
-%% Keys already present in Opts are not overwritten.
-%% This allows Lua ao.resolve calls to pass config via Req/Base.
-merge_agent_config(Source, Opts) ->
-    Keys = [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>,
-        <<"agent-inference-device">>],
-    lists:foldl(fun(Key, Acc) ->
-        case maps:is_key(Key, Acc) of
-            true -> Acc;
-            false ->
-                case hb_ao:get(Key, Source, not_found, Opts#{hashpath => ignore}) of
-                    not_found -> Acc;
-                    Val -> Acc#{Key => Val}
-                end
-        end
-    end, Opts, Keys).
-
-%%%===================================================================
-%%% Default Configuration (hardcoded for MVP)
-%%%===================================================================
-
-default_system_prompt() ->
-    <<"You are a helpful AI assistant running on the AO network. "
-      "You have the following tools available:\n"
-      "- http_request: Make HTTP requests to any URL.\n"
-      "- lookup_data: Retrieve a cached message or data item by its ID.\n"
-      "- search_messages: Search the node cache for messages matching key-value criteria.\n"
-      "- get_arweave_tx: Fetch an Arweave transaction by its transaction ID.\n"
-      "- bundle_item: Submit data to be bundled and uploaded to Arweave.\n"
-      "When you have enough information to answer the user's question, "
-      "respond with a text message (do not call any tools). "
-      "Keep responses concise.">>.
-
-default_tools() ->
-    [tool_def(http_request), tool_def(lookup_data),
-     tool_def(search_messages), tool_def(get_arweave_tx),
-     tool_def(bundle_item)].
-
-tool_def(http_request) ->
-    #{
-        <<"type">> => <<"function">>,
-        <<"function">> => #{
-            <<"name">> => <<"http_request">>,
-            <<"description">> => <<"Make an HTTP request to a URL.">>,
-            <<"parameters">> => #{
-                <<"type">> => <<"object">>,
-                <<"properties">> => #{
-                    <<"url">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> => <<"The URL to request.">>
-                    },
-                    <<"method">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"enum">> => [<<"GET">>, <<"POST">>, <<"PUT">>, <<"DELETE">>],
-                        <<"description">> => <<"HTTP method. Defaults to GET.">>
-                    },
-                    <<"body">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> => <<"Request body (for POST/PUT).">>
-                    },
-                    <<"content_type">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> =>
-                            <<"Content-Type header. Defaults to text/plain.">>
-                    }
+%% @doc The built-in tool table. Each entry is the single source of a tool's
+%% name, description (used in the system prompt and the tool definition),
+%% JSON schema properties (whose keys are the only arguments passed to the
+%% executor), required arguments, default executor device, the node option
+%% that must be true for the tool to exist, and the executor function.
+tool_table() ->
+    [
+        #{
+            name => <<"http_request">>,
+            description =>
+                <<"Make an HTTP request to a public http or https URL and "
+                  "return the response status, content type and body.">>,
+            properties => #{
+                <<"url">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"Absolute http or https URL.">>
                 },
-                <<"required">> => [<<"url">>]
-            }
+                <<"method">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"enum">> => ?HTTP_METHODS,
+                    <<"description">> => <<"HTTP method. Defaults to GET.">>
+                },
+                <<"body">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"Request body.">>
+                },
+                <<"content_type">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> =>
+                        <<"Content type of the body. Defaults to text/plain.">>
+                }
+            },
+            required => [<<"url">>],
+            device => <<"relay@1.0">>,
+            requires => none,
+            executor => fun http_request/3
+        },
+        #{
+            name => <<"lookup_data">>,
+            description =>
+                <<"Read a message or data item from the node's cache by its "
+                  "43-character ID.">>,
+            properties => #{
+                <<"id">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"43-character base64url ID.">>
+                }
+            },
+            required => [<<"id">>],
+            device => <<"cache@1.0">>,
+            requires => none,
+            executor => fun lookup_data/3
+        },
+        #{
+            name => <<"search_messages">>,
+            description =>
+                <<"Search the node's cache for messages whose keys have the "
+                  "given values.">>,
+            properties => #{
+                <<"match">> => #{
+                    <<"type">> => <<"object">>,
+                    <<"description">> =>
+                        <<"Keys and the values they must have. Values are "
+                          "strings, numbers or booleans.">>
+                },
+                <<"return">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"enum">> => ?SEARCH_RETURNS,
+                    <<"description">> =>
+                        <<"paths (default), messages, or count.">>
+                }
+            },
+            required => [<<"match">>],
+            device => <<"query@1.0">>,
+            requires => none,
+            executor => fun search_messages/3
+        },
+        #{
+            name => <<"get_arweave_tx">>,
+            description =>
+                <<"Fetch an Arweave transaction header by its 43-character "
+                  "transaction ID.">>,
+            properties => #{
+                <<"id">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"Arweave transaction ID.">>
+                }
+            },
+            required => [<<"id">>],
+            device => <<"arweave@2.9">>,
+            requires => none,
+            executor => fun get_arweave_tx/3
+        },
+        #{
+            name => <<"bundle_item">>,
+            description =>
+                <<"Permanently store data on Arweave: the node signs it as a "
+                  "data item with its own wallet and submits it to its "
+                  "bundler.">>,
+            properties => #{
+                <<"data">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> => <<"The data to store.">>
+                },
+                <<"content_type">> => #{
+                    <<"type">> => <<"string">>,
+                    <<"description">> =>
+                        <<"Content type of the data. Defaults to text/plain.">>
+                }
+            },
+            required => [<<"data">>],
+            device => <<"bundler@1.0">>,
+            requires => <<"agent-allow-bundle">>,
+            executor => fun bundle_item/3
         }
-    };
-tool_def(lookup_data) ->
+    ].
+
+%% @doc The OpenAI tool definition generated from a table entry.
+tool_definition(#{ name := Name, description := Description,
+                   properties := Properties, required := Required }) ->
     #{
         <<"type">> => <<"function">>,
         <<"function">> => #{
-            <<"name">> => <<"lookup_data">>,
-            <<"description">> =>
-                <<"Retrieve a message or data item from the node's local cache by its ID.">>,
+            <<"name">> => Name,
+            <<"description">> => Description,
             <<"parameters">> => #{
                 <<"type">> => <<"object">>,
-                <<"properties">> => #{
-                    <<"id">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> => <<"The hash ID of the item to retrieve.">>
-                    }
-                },
-                <<"required">> => [<<"id">>]
-            }
-        }
-    };
-tool_def(search_messages) ->
-    #{
-        <<"type">> => <<"function">>,
-        <<"function">> => #{
-            <<"name">> => <<"search_messages">>,
-            <<"description">> =>
-                <<"Search the node's cache for messages matching key-value criteria.">>,
-            <<"parameters">> => #{
-                <<"type">> => <<"object">>,
-                <<"properties">> => #{
-                    <<"match">> => #{
-                        <<"type">> => <<"object">>,
-                        <<"description">> =>
-                            <<"JSON object of key-value pairs to match against cached messages.">>
-                    },
-                    <<"return">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"enum">> => [<<"paths">>, <<"messages">>, <<"count">>],
-                        <<"description">> =>
-                            <<"What to return: paths (default), full messages, or count.">>
-                    }
-                },
-                <<"required">> => [<<"match">>]
-            }
-        }
-    };
-tool_def(get_arweave_tx) ->
-    #{
-        <<"type">> => <<"function">>,
-        <<"function">> => #{
-            <<"name">> => <<"get_arweave_tx">>,
-            <<"description">> =>
-                <<"Fetch an Arweave transaction header by its 43-character base64url transaction ID.">>,
-            <<"parameters">> => #{
-                <<"type">> => <<"object">>,
-                <<"properties">> => #{
-                    <<"id">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> => <<"The Arweave transaction ID.">>
-                    }
-                },
-                <<"required">> => [<<"id">>]
-            }
-        }
-    };
-tool_def(bundle_item) ->
-    #{
-        <<"type">> => <<"function">>,
-        <<"function">> => #{
-            <<"name">> => <<"bundle_item">>,
-            <<"description">> =>
-                <<"Submit a data item to be bundled and uploaded to Arweave.">>,
-            <<"parameters">> => #{
-                <<"type">> => <<"object">>,
-                <<"properties">> => #{
-                    <<"data">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> => <<"The data content to store on Arweave.">>
-                    },
-                    <<"content_type">> => #{
-                        <<"type">> => <<"string">>,
-                        <<"description">> =>
-                            <<"Content-Type of the data. Defaults to text/plain.">>
-                    }
-                },
-                <<"required">> => [<<"data">>]
+                <<"properties">> => Properties,
+                <<"required">> => Required,
+                <<"additionalProperties">> => false
             }
         }
     }.
+
+%% @doc The device a tool resolves: node option `agent-tool-devices' (a map
+%% from tool name to device), or the table default.
+tool_device(#{ name := Name, device := Default }, Opts) ->
+    case hb_opts:get(<<"agent-tool-devices">>, #{}, Opts) of
+        Devices when is_map(Devices) ->
+            Hyphenated = binary:replace(Name, <<"_">>, <<"-">>, [global]),
+            case maps:get(Name, Devices, maps:get(Hyphenated, Devices, not_found)) of
+                not_found -> Default;
+                Device -> Device
+            end;
+        _ -> Default
+    end.
+
+%% @doc Execute the tool calls of one completion, in order. Calls beyond
+%% the per-turn bound are answered without being executed.
+execute_tool_calls(Calls, State = #{ max_result_bytes := MaxBytes }) ->
+    {Executed, Skipped} =
+        lists:split(min(length(Calls), ?MAX_TOOL_CALLS_PER_TURN), Calls),
+    [
+        tool_message(Call, execute_tool_call(Call, State), MaxBytes)
+    ||
+        Call <- Executed
+    ] ++
+    [
+        tool_message(
+            Call,
+            rejected_text(
+                Name,
+                <<"a completion may request at most ",
+                  (integer_to_binary(?MAX_TOOL_CALLS_PER_TURN))/binary,
+                  " tool calls">>
+            ),
+            MaxBytes
+        )
+    ||
+        Call = #{ name := Name } <- Skipped
+    ].
+
+tool_message(#{ id := Id }, Content, MaxBytes) ->
+    #{
+        <<"role">> => <<"tool">>,
+        <<"tool_call_id">> => Id,
+        <<"content">> => bound_text(Content, MaxBytes)
+    }.
+
+%% @doc Execute one call: only enabled tools, only JSON-object arguments,
+%% only declared argument keys.
+execute_tool_call(#{ name := Name, arguments := Raw }, State) ->
+    #{ tools := Tools, opts := Opts } = State,
+    case [Tool || Tool = #{ name := ToolName } <- Tools, ToolName =:= Name] of
+        [] ->
+            rejected_text(
+                Name,
+                <<"no tool with this name is available. Available tools: ",
+                  (tool_names(Tools))/binary>>
+            );
+        [Tool | _] ->
+            case decode_arguments(Raw) of
+                {ok, Args} ->
+                    #{ properties := Properties } = Tool,
+                    invoke(Tool, maps:with(maps:keys(Properties), Args), Opts);
+                {error, Why} ->
+                    rejected_text(Name, Why)
+            end
+    end.
+
+tool_names([]) -> <<"none">>;
+tool_names(Tools) ->
+    iolist_to_binary(lists:join(<<", ">>, [Name || #{ name := Name } <- Tools])).
+
+decode_arguments(Args) when is_map(Args) -> {ok, Args};
+decode_arguments(Raw) when is_binary(Raw) ->
+    case decode_json(Raw) of
+        {ok, Args} when is_map(Args) -> {ok, Args};
+        {ok, _} ->
+            {error, <<"the arguments are valid JSON but not a JSON object (",
+                      (argument_summary(Raw))/binary, ")">>};
+        error ->
+            {error, <<"the arguments are not valid JSON (",
+                      (argument_summary(Raw))/binary, ")">>}
+    end;
+decode_arguments(Other) ->
+    {error, <<"the arguments are not a JSON object (",
+              (argument_summary(describe(Other)))/binary, ")">>}.
+
+argument_summary(Raw) ->
+    <<(integer_to_binary(byte_size(Raw)))/binary, " bytes: \"",
+      (preview(Raw))/binary, "\"">>.
+
+invoke(Tool = #{ name := Name, executor := Executor }, Args, Opts) ->
+    try Executor(Args, tool_device(Tool, Opts), Opts) of
+        {ok, Text} -> Text;
+        {rejected, Why} -> rejected_text(Name, Why);
+        {error, Why} -> failed_text(Name, Why)
+    catch
+        Class:Reason -> failed_text(Name, describe({Class, Reason}))
+    end.
+
+rejected_text(Name, Why) ->
+    <<"Tool error: `", Name/binary, "` was not executed: ", Why/binary,
+      ". No state was changed.">>.
+
+failed_text(Name, Why) ->
+    <<"Tool error: `", Name/binary, "` failed: ", Why/binary, ".">>.
+
+%%% Executors. Each receives the filtered arguments, the device to resolve
+%%% and the node options, and returns `{ok, Text}', `{rejected, Why}' (the
+%%% tool did nothing) or `{error, Why}'.
+
+%% @doc `http_request' through the relay device.
+http_request(Args, Device, Opts) ->
+    maybe
+        {ok, Url} ?= required_text(<<"url">>, Args),
+        {ok, Method} ?= http_method(maps:get(<<"method">>, Args, null)),
+        {ok, Body} ?= http_body(Args),
+        ok ?= check_url(Url, Opts),
+        Payload =
+            case Body of
+                none -> #{ <<"path">> => Url, <<"method">> => Method };
+                {Bytes, ContentType} ->
+                    #{
+                        <<"path">> => Url,
+                        <<"method">> => Method,
+                        <<"body">> => Bytes,
+                        <<"content-type">> => ContentType
+                    }
+            end,
+        http_result(
+            hb_ao:resolve(
+                #{ <<"device">> => Device },
+                #{
+                    <<"path">> => <<"call">>,
+                    <<"target">> => <<"payload">>,
+                    <<"payload">> => Payload
+                },
+                no_cache(Opts)
+            ),
+            Opts
+        )
+    end.
+
+http_method(null) -> {ok, <<"GET">>};
+http_method(Method) when is_binary(Method) ->
+    Upper = string:uppercase(Method),
+    case lists:member(Upper, ?HTTP_METHODS) of
+        true -> {ok, Upper};
+        false -> {rejected, <<"method must be GET, POST, PUT or DELETE">>}
+    end;
+http_method(_) ->
+    {rejected, <<"method must be GET, POST, PUT or DELETE">>}.
+
+http_body(Args) ->
+    case maps:get(<<"body">>, Args, null) of
+        null -> {ok, none};
+        Body when is_binary(Body) ->
+            {ok, {Body, content_type(Args, <<"text/plain">>)}};
+        Json when is_map(Json); is_list(Json) ->
+            {ok, {hb_json:encode(Json), content_type(Args, <<"application/json">>)}};
+        _ -> {rejected, <<"body must be a string">>}
+    end.
+
+content_type(Args, Default) ->
+    case maps:get(<<"content_type">>, Args, null) of
+        Type when is_binary(Type), Type =/= <<>> -> Type;
+        _ -> Default
+    end.
+
+%% @doc Only absolute http/https URLs. Unless the node option
+%% `agent-http-allow-private' is true, `localhost' names and literal
+%% addresses outside public unicast space are refused before any network
+%% activity.
+check_url(Url, Opts) ->
+    case uri_string:parse(Url) of
+        #{ scheme := Scheme, host := Host } when Host =/= <<>>, Host =/= "" ->
+            case string:lowercase(hb_util:bin(Scheme)) of
+                Allowed when Allowed =:= <<"http">>; Allowed =:= <<"https">> ->
+                    AllowPrivate =
+                        truthy(
+                            hb_opts:get(<<"agent-http-allow-private">>, false, Opts)),
+                    case AllowPrivate orelse public_host(hb_util:bin(Host)) of
+                        true -> ok;
+                        false ->
+                            {rejected,
+                                <<"the URL host is a local, private or "
+                                  "special-use address">>}
+                    end;
+                _ -> {rejected, <<"only http and https URLs are allowed">>}
+            end;
+        _ -> {rejected, <<"the URL must be an absolute http or https URL">>}
+    end.
+
+public_host(Host) ->
+    Name = hb_hostname:normalize(Host),
+    case inet:parse_address(binary_to_list(Name)) of
+        {ok, Address} -> hb_hostname:is_public_ip(Address);
+        {error, _} ->
+            not (Name =:= <<"localhost">> orelse
+                 binary:longest_common_suffix([Name, <<".localhost">>]) =:= 10)
+    end.
+
+http_result({_Status, Response}, Opts) when is_map(Response) ->
+    Status = hb_maps:get(<<"status">>, Response, <<"unknown">>, Opts),
+    TypeLine =
+        case hb_maps:get(<<"content-type">>, Response, not_found, Opts) of
+            Type when is_binary(Type) -> <<"content-type: ", Type/binary, "\n">>;
+            _ -> <<>>
+        end,
+    Body =
+        case hb_maps:get(<<"body">>, Response, <<>>, Opts) of
+            Bytes when is_binary(Bytes) -> Bytes;
+            Other -> render(Other, Opts)
+        end,
+    {ok, <<"status: ", (hb_util:bin(Status))/binary, "\n", TypeLine/binary,
+           "\n", Body/binary>>};
+http_result({error, Reason}, _Opts) ->
+    {error, describe(Reason)};
+http_result(Other, _Opts) ->
+    {error, describe(Other)}.
+
+%% @doc `lookup_data' through the cache device's `read' key.
+lookup_data(Args, Device, Opts) ->
+    maybe
+        {ok, ID} ?= required_id(<<"id">>, Args),
+        case hb_ao:resolve(
+                #{ <<"device">> => Device },
+                #{ <<"path">> => <<"read">>, <<"read">> => ID },
+                no_cache(Opts)) of
+            {ok, Result} -> {ok, render(Result, Opts)};
+            {error, not_found} -> {ok, <<"Not found: ", ID/binary>>};
+            Other -> {error, describe(Other)}
+        end
+    end.
+
+%% @doc `search_messages' through the query device's `only' key.
+search_messages(Args, Device, Opts) ->
+    maybe
+        {ok, Match} ?= match_spec(maps:get(<<"match">>, Args, not_found)),
+        {ok, Return} ?= search_return(maps:get(<<"return">>, Args, <<"paths">>)),
+        case hb_ao:resolve(
+                #{ <<"device">> => Device },
+                #{
+                    <<"path">> => <<"only">>,
+                    <<"only">> => Match,
+                    <<"return">> => Return
+                },
+                no_cache(Opts)) of
+            {ok, Result} -> {ok, render(Result, Opts)};
+            {error, not_found} -> {ok, <<"No matching messages.">>};
+            Other -> {error, describe(Other)}
+        end
+    end.
+
+match_spec(Match) when is_map(Match), map_size(Match) > 0 ->
+    Scalar =
+        lists:all(
+            fun({Key, Value}) ->
+                is_binary(Key) andalso
+                    (is_binary(Value) orelse is_integer(Value) orelse
+                        is_boolean(Value))
+            end,
+            maps:to_list(Match)
+        ),
+    case Scalar of
+        true -> {ok, Match};
+        false -> match_spec(invalid)
+    end;
+match_spec(_) ->
+    {rejected,
+        <<"match must be a non-empty object whose values are strings, numbers "
+          "or booleans">>}.
+
+search_return(Return) ->
+    case lists:member(Return, ?SEARCH_RETURNS) of
+        true -> {ok, Return};
+        false -> {rejected, <<"return must be paths, messages or count">>}
+    end.
+
+%% @doc `get_arweave_tx' through the Arweave device's `tx' key, header only.
+get_arweave_tx(Args, Device, Opts) ->
+    maybe
+        {ok, ID} ?= required_id(<<"id">>, Args),
+        case hb_ao:resolve(
+                #{ <<"device">> => Device },
+                #{
+                    <<"path">> => <<"tx">>,
+                    <<"tx">> => ID,
+                    <<"method">> => <<"GET">>,
+                    <<"exclude-data">> => true
+                },
+                no_cache(Opts)) of
+            {ok, Result} -> {ok, render(Result, Opts)};
+            {error, not_found} -> {ok, <<"Transaction not found: ", ID/binary>>};
+            Other -> {error, describe(Other)}
+        end
+    end.
+
+%% @doc `bundle_item': sign the data as an ANS-104 item with the node's
+%% wallet and submit it to the bundler device's `item' key.
+bundle_item(Args, Device, Opts) ->
+    maybe
+        {ok, Data} ?= required_text(<<"data">>, Args),
+        Item =
+            hb_message:commit(
+                #{
+                    <<"data">> => Data,
+                    <<"content-type">> => content_type(Args, <<"text/plain">>)
+                },
+                Opts,
+                <<"ans104@1.0">>
+            ),
+        case hb_ao:resolve(
+                #{ <<"device">> => Device },
+                #{
+                    <<"path">> => <<"item">>,
+                    <<"bundler-subject">> => <<"item">>,
+                    <<"item">> => Item
+                },
+                no_cache(Opts)) of
+            {ok, Result} -> {ok, bundle_text(Result, Opts)};
+            Other -> {error, describe(Other)}
+        end
+    end.
+
+bundle_text(Result, Opts) when is_map(Result) ->
+    case hb_maps:get(<<"id">>, Result, not_found, Opts) of
+        ID when is_binary(ID) ->
+            <<"Submitted data item ", ID/binary, " to the node's bundler.">>;
+        _ -> render(Result, Opts)
+    end;
+bundle_text(Result, Opts) ->
+    render(Result, Opts).
+
+required_text(Key, Args) ->
+    case maps:get(Key, Args, null) of
+        Text when is_binary(Text), Text =/= <<>> -> {ok, Text};
+        null -> {rejected, <<"missing required argument `", Key/binary, "`">>};
+        _ -> {rejected, <<"`", Key/binary, "` must be a non-empty string">>}
+    end.
+
+required_id(Key, Args) ->
+    case required_text(Key, Args) of
+        {ok, ID} ->
+            case is_txid(ID) of
+                true -> {ok, ID};
+                false ->
+                    {rejected,
+                        <<"`", Key/binary, "` must be a 43-character base64url ID">>}
+            end;
+        Rejected -> Rejected
+    end.
+
+is_txid(ID) when byte_size(ID) =:= 43 ->
+    lists:all(
+        fun(C) ->
+            (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse
+                (C >= $0 andalso C =< $9) orelse C =:= $- orelse C =:= $_
+        end,
+        binary_to_list(ID)
+    );
+is_txid(_) -> false.
+
+%%%===================================================================
+%%% Text and value helpers
+%%%===================================================================
+
+%% @doc Options for calls to other devices: their results are not cached and
+%% carry no hashpath.
+no_cache(Opts) ->
+    Opts#{
+        <<"hashpath">> => ignore,
+        <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+    }.
+
+truthy(true) -> true;
+truthy(1) -> true;
+truthy(Bin) when is_binary(Bin) ->
+    lists:member(string:lowercase(string:trim(Bin)), [<<"true">>, <<"1">>]);
+truthy(_) -> false.
+
+%% @doc A positive integer from an integer, an integral float, or decimal
+%% text.
+positive_int(N) when is_integer(N), N > 0 -> {ok, N};
+positive_int(F) when is_float(F), F >= 1.0, F == trunc(F) -> {ok, trunc(F)};
+positive_int(Bin) when is_binary(Bin) ->
+    try binary_to_integer(string:trim(Bin)) of
+        N when N > 0 -> {ok, N};
+        _ -> error
+    catch _:_ -> error
+    end;
+positive_int(_) -> error.
+
+%% @doc Text from a binary or a number, as valid UTF-8. Empty text counts
+%% as absent.
+nonempty_text(Bin) when is_binary(Bin), Bin =/= <<>> -> {ok, utf8_sanitize(Bin)};
+nonempty_text(N) when is_integer(N) -> {ok, integer_to_binary(N)};
+nonempty_text(F) when is_float(F) -> {ok, float_to_binary(F, [short])};
+nonempty_text(_) -> error.
+
+decode_json(Bin) ->
+    try {ok, hb_json:decode(Bin)} catch _:_ -> error end.
+
+json_encodable(Term) ->
+    try hb_json:encode(Term), true catch _:_ -> false end.
+
+%% @doc Render a tool result as text: binaries as they are, other values as
+%% JSON without commitments or private keys.
+render(Bin, _Opts) when is_binary(Bin) -> Bin;
+render(Term, Opts) ->
+    Clean =
+        try clean(hb_private:reset(hb_cache:ensure_all_loaded(Term, Opts)))
+        catch _:_ -> Term
+        end,
+    try hb_json:encode(Clean)
+    catch _:_ -> iolist_to_binary(io_lib:format("~0tP", [Clean, 64]))
+    end.
+
+clean(Map) when is_map(Map) ->
+    maps:map(fun(_Key, Value) -> clean(Value) end,
+        maps:without([<<"commitments">>], Map));
+clean(List) when is_list(List) -> [clean(Value) || Value <- List];
+clean(Value) -> Value.
+
+%% @doc A short, printable description of a term.
+describe(Bin) when is_binary(Bin) -> bound_text(Bin, ?MAX_DETAIL_BYTES);
+describe(Term) ->
+    bound_text(
+        iolist_to_binary(io_lib:format("~0tP", [Term, 12])),
+        ?MAX_DETAIL_BYTES
+    ).
+
+preview(Bin) -> bound_text(Bin, ?PREVIEW_BYTES).
+
+%% @doc At most `Max' bytes of valid UTF-8 taken from the start of `Bin',
+%% cut on a character boundary; invalid sequences become U+FFFD. A shortened
+%% text ends with a marker giving the shown and original sizes.
+bound_text(Bin, Max) ->
+    Clean = utf8_sanitize(utf8_prefix(Bin, Max)),
+    Kept = utf8_prefix(Clean, Max),
+    case byte_size(Bin) > Max orelse byte_size(Clean) > Max of
+        false -> Kept;
+        true ->
+            <<Kept/binary, "\n[truncated: ",
+              (integer_to_binary(byte_size(Kept)))/binary, " of ",
+              (integer_to_binary(byte_size(Bin)))/binary, " bytes shown]">>
+    end.
+
+%% @doc The longest prefix of at most `Max' bytes that does not split a
+%% UTF-8 sequence.
+utf8_prefix(Bin, Max) when byte_size(Bin) =< Max -> Bin;
+utf8_prefix(Bin, Max) -> utf8_prefix(Bin, Max, 3).
+
+utf8_prefix(Bin, Cut, Steps) when Cut > 0, Steps > 0 ->
+    case binary:at(Bin, Cut) band 16#C0 of
+        16#80 -> utf8_prefix(Bin, Cut - 1, Steps - 1);
+        _ -> binary:part(Bin, 0, Cut)
+    end;
+utf8_prefix(Bin, Cut, _Steps) ->
+    binary:part(Bin, 0, Cut).
+
+%% @doc Replace every invalid UTF-8 sequence with U+FFFD.
+utf8_sanitize(Bin) ->
+    case unicode:characters_to_binary(Bin) of
+        Bin -> Bin;
+        _ -> utf8_sanitize(Bin, <<>>)
+    end.
+
+utf8_sanitize(<<Char/utf8, Rest/binary>>, Acc) ->
+    utf8_sanitize(Rest, <<Acc/binary, Char/utf8>>);
+utf8_sanitize(<<_, Rest/binary>>, Acc) ->
+    utf8_sanitize(Rest, <<Acc/binary, 16#FFFD/utf8>>);
+utf8_sanitize(<<>>, Acc) ->
+    Acc.
 
 %%%===================================================================
 %%% Tests
 %%%===================================================================
 
-%% Helper: create a mock LLM function that returns a sequence of responses.
-mock_llm_sequence(Responses) ->
-    Counter = atomics:new(1, [{signed, false}]),
-    fun(_RequestBody, _Opts) ->
-        Idx = atomics:add_get(Counter, 1, 1),
-        case Idx =< length(Responses) of
-            true -> lists:nth(Idx, Responses);
-            false -> {error, <<"No more mock responses">>}
-        end
-    end.
+-ifdef(TEST).
 
-%% Helper: build a mock OpenAI response with a text answer (no tool_calls).
-mock_text_response(Content) ->
-    {ok, hb_json:encode(#{
+%%% Stub devices. Tests configure the inference device and the tool devices
+%%% through node options, exactly as an operator would, using device messages
+%%% whose keys are functions. Every call is recorded in an ETS table.
+
+%% @doc Test fixture: a recording table and node options that route the model
+%% and every tool to stub devices. `Replies' is a list of model replies (the
+%% last one repeats) or a function of the call number and the decoded request.
+setup(Replies) -> setup(Replies, #{}).
+setup(Replies, ExtraOpts) ->
+    Table = ets:new(agent_test, [ordered_set, public]),
+    Opts =
+        maps:merge(
+            #{
+                <<"agent-inference-device">> => model_stub(Table, Replies),
+                <<"agent-tool-devices">> => tool_stubs(Table)
+            },
+            ExtraOpts
+        ),
+    {Table, Opts}.
+
+model_stub(Table, Replies) ->
+    Counter = counters:new(1, []),
+    #{
+        <<"completions">> =>
+            fun(Base, Req, Opts) ->
+                counters:add(Counter, 1, 1),
+                N = counters:get(Counter, 1),
+                Body = hb_json:decode(maps:get(<<"body">>, Req)),
+                ets:insert(Table, {{model, N}, Body, Base, Req, Opts}),
+                stub_reply(pick_reply(N, Body, Replies))
+            end
+    }.
+
+pick_reply(N, Body, Replies) when is_function(Replies) -> Replies(N, Body);
+pick_reply(N, _Body, Replies) -> lists:nth(min(N, length(Replies)), Replies).
+
+stub_reply({ok, Response}) when is_map(Response) ->
+    {ok, #{
+        <<"status">> => 200,
+        <<"content-type">> => <<"application/json">>,
+        <<"body">> => hb_json:encode(Response)
+    }};
+stub_reply({result, Result}) ->
+    {ok, Result};
+stub_reply({raw, Body}) ->
+    {ok, #{ <<"status">> => 200, <<"body">> => Body }};
+stub_reply(Other) ->
+    Other.
+
+tool_stubs(Table) ->
+    #{
+        <<"http_request">> =>
+            recorder(Table, http, <<"call">>,
+                fun(_) ->
+                    {ok, #{
+                        <<"status">> => 200,
+                        <<"content-type">> => <<"text/plain">>,
+                        <<"body">> => <<"pong">>
+                    }}
+                end),
+        <<"lookup_data">> =>
+            recorder(Table, lookup, <<"read">>,
+                fun(_) -> {ok, #{ <<"data">> => <<"cached">> }} end),
+        <<"search_messages">> =>
+            recorder(Table, search, <<"only">>,
+                fun(_) -> {ok, [<<"path-a">>, <<"path-b">>]} end),
+        <<"get_arweave_tx">> =>
+            recorder(Table, arweave, <<"tx">>,
+                fun(_) -> {ok, #{ <<"owner">> => <<"someone">> }} end),
+        <<"bundle_item">> =>
+            recorder(Table, bundle, <<"item">>,
+                fun(_) ->
+                    {ok, #{ <<"id">> => binary:copy(<<"b">>, 43),
+                            <<"timestamp">> => 1 }}
+                end)
+    }.
+
+recorder(Table, Kind, Key, Handler) ->
+    #{
+        Key =>
+            fun(_Base, Req, _Opts) ->
+                ets:insert(
+                    Table,
+                    {{tool, erlang:unique_integer([monotonic, positive])},
+                        Kind, Req}
+                ),
+                Handler(Req)
+            end
+    }.
+
+model_requests(Table) ->
+    [Body || {{model, _}, Body, _, _, _} <- ets:tab2list(Table)].
+
+tool_requests(Table, Kind) ->
+    [Req || {{tool, _}, K, Req} <- ets:tab2list(Table), K =:= Kind].
+
+%% @doc Resolve `run' with the given request keys.
+run_agent(ReqKeys, Opts) ->
+    run_agent(#{ <<"device">> => <<"agent@1.0">> }, ReqKeys, Opts).
+run_agent(Base, ReqKeys, Opts) ->
+    {ok, Result} =
+        run(
+            Base,
+            maps:merge(
+                #{
+                    <<"path">> => <<"run">>,
+                    <<"agent-user-prompt">> => <<"Test task">>
+                },
+                ReqKeys
+            ),
+            Opts
+        ),
+    Result.
+
+%%% Model reply builders (OpenAI chat-completion shape).
+
+reply_with(Message, FinishReason) ->
+    {ok, #{
+        <<"id">> => <<"chatcmpl-test">>,
+        <<"object">> => <<"chat.completion">>,
         <<"choices">> => [#{
-            <<"message">> => #{
-                <<"role">> => <<"assistant">>,
-                <<"content">> => Content
-            }
+            <<"index">> => 0,
+            <<"message">> => maps:merge(#{ <<"role">> => <<"assistant">> }, Message),
+            <<"finish_reason">> => FinishReason
         }]
-    })}.
+    }}.
 
-%% Helper: build a mock OpenAI response with tool_calls.
-mock_tool_call_response(ToolCalls) ->
-    {ok, hb_json:encode(#{
-        <<"choices">> => [#{
-            <<"message">> => #{
-                <<"role">> => <<"assistant">>,
-                <<"content">> => null,
-                <<"tool_calls">> => ToolCalls
-            }
-        }]
-    })}.
+answer_reply(Content) ->
+    reply_with(#{ <<"content">> => Content }, <<"stop">>).
 
-%% Helper: build a single tool_call structure.
-make_tool_call(Id, FuncName, ArgsMap) ->
+tool_reply(Calls) ->
+    reply_with(#{ <<"content">> => null, <<"tool_calls">> => Calls }, <<"tool_calls">>).
+
+tool_call(Id, Name, Args) when is_binary(Args) ->
     #{
         <<"id">> => Id,
         <<"type">> => <<"function">>,
-        <<"function">> => #{
-            <<"name">> => FuncName,
-            <<"arguments">> => hb_json:encode(ArgsMap)
-        }
-    }.
+        <<"function">> => #{ <<"name">> => Name, <<"arguments">> => Args }
+    };
+tool_call(Id, Name, Args) ->
+    tool_call(Id, Name, hb_json:encode(Args)).
 
-%% Helper: a mock tool function that records calls and returns a fixed result.
-mock_tool_fun(Result) ->
-    fun(_ToolInfo, _Opts) -> Result end.
+http_call(Id) ->
+    tool_call(Id, <<"http_request">>, #{ <<"url">> => <<"https://example.com/">> }).
 
-%% Helper: a mock tool function that records calls.
-mock_tool_fun_with_tracker(Result) ->
-    Tracker = ets:new(tool_calls_tracker, [bag, public]),
-    Fun = fun(ToolInfo, _Opts) ->
-        ets:insert(Tracker, {call, ToolInfo}),
-        Result
-    end,
-    {Fun, Tracker}.
+tool_contents(Messages) ->
+    [Content || #{ <<"role">> := <<"tool">>, <<"content">> := Content } <- Messages].
 
-%% @doc LLM directly returns text answer, no tool calls.
-single_turn_no_tools_test() ->
-    LLMFun = mock_llm_sequence([
-        mock_text_response(<<"Hello! How can I help you?">>)
-    ]),
-    ToolFun = mock_tool_fun(<<"should not be called">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Hi there">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => ToolFun
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Hello! How can I help you?">>,
-                 maps:get(<<"agent-answer">>, Result)),
-    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)).
+contains(Bin, Part) -> binary:match(Bin, Part) =/= nomatch.
 
-%% @doc LLM calls a tool, then returns final answer.
-single_tool_call_test() ->
-    ToolCall = make_tool_call(
-        <<"call_1">>,
-        <<"http_request">>,
-        #{<<"url">> => <<"https://example.com/api">>}
+%%% Answers and the result message.
+
+single_turn_answer_test() ->
+    {Table, Opts} = setup([answer_reply(<<"Hello! How can I help?">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"Hello! How can I help?">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)),
+    ?assertNot(maps:is_key(<<"agent-error">>, Result)),
+    [Request] = model_requests(Table),
+    ?assertEqual(
+        [<<"system">>, <<"user">>],
+        [Role || #{ <<"role">> := Role } <- maps:get(<<"messages">>, Request)]
     ),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"The result is 42.">>)
-    ]),
-    ToolFun = mock_tool_fun(<<"{\"value\": 42}">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Get the value">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => ToolFun
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"The result is 42.">>,
-                 maps:get(<<"agent-answer">>, Result)),
-    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)).
+    ?assertEqual(<<"auto">>, maps:get(<<"tool_choice">>, Request)),
+    ?assertEqual(
+        [<<"http_request">>, <<"lookup_data">>, <<"search_messages">>,
+         <<"get_arweave_tx">>],
+        [Name || #{ <<"function">> := #{ <<"name">> := Name } }
+            <- maps:get(<<"tools">>, Request)]
+    ).
 
-%% @doc LLM returns multiple tool calls in a single response.
+result_echoes_base_test() ->
+    {_Table, Opts} = setup([answer_reply(<<"done">>)]),
+    Base = #{
+        <<"device">> => <<"agent@1.0">>,
+        <<"agent-user-prompt">> => <<"echoed">>,
+        <<"agent-error">> => <<"stale">>,
+        <<"agent-error-detail">> => #{ <<"stale">> => true },
+        <<"commitments">> => #{ <<"stale">> => #{} }
+    },
+    Result = run_agent(Base, #{}, Opts),
+    ?assertEqual(<<"echoed">>, maps:get(<<"agent-user-prompt">>, Result)),
+    ?assertEqual(<<"agent@1.0">>, maps:get(<<"device">>, Result)),
+    ?assertEqual(<<"done">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertNot(maps:is_key(<<"agent-error">>, Result)),
+    ?assertNot(maps:is_key(<<"agent-error-detail">>, Result)),
+    ?assertNot(maps:is_key(<<"commitments">>, Result)).
+
+refusal_is_the_answer_when_content_is_empty_test() ->
+    {_Table, Opts} =
+        setup([reply_with(#{ <<"content">> => null,
+                             <<"refusal">> => <<"I cannot help with that.">> },
+                          <<"stop">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"I cannot help with that.">>, maps:get(<<"agent-answer">>, Result)).
+
+array_content_test() ->
+    {_Table, Opts} =
+        setup([reply_with(
+            #{ <<"content">> => [
+                #{ <<"type">> => <<"text">>, <<"text">> => <<"Hello, ">> },
+                #{ <<"type">> => <<"image_url">>, <<"image_url">> => #{} },
+                #{ <<"type">> => <<"text">>, <<"text">> => <<"world.">> }
+            ] },
+            <<"stop">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"Hello, world.">>, maps:get(<<"agent-answer">>, Result)).
+
+%%% Tool rounds.
+
+tool_round_trip_test() ->
+    {Table, Opts} =
+        setup([
+            tool_reply([http_call(<<"call_1">>)]),
+            answer_reply(<<"It said pong.">>)
+        ]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"It said pong.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)),
+    [HttpReq] = tool_requests(Table, http),
+    ?assertEqual(
+        #{ <<"path">> => <<"https://example.com/">>, <<"method">> => <<"GET">> },
+        maps:get(<<"payload">>, HttpReq)
+    ),
+    [_, Second] = model_requests(Table),
+    Messages = maps:get(<<"messages">>, Second),
+    ?assertEqual(
+        [<<"system">>, <<"user">>, <<"assistant">>, <<"tool">>],
+        [Role || #{ <<"role">> := Role } <- Messages]
+    ),
+    [_, _, Assistant, Tool] = Messages,
+    ?assertEqual(null, maps:get(<<"content">>, Assistant)),
+    [#{ <<"id">> := <<"call_1">> }] = maps:get(<<"tool_calls">>, Assistant),
+    ?assertEqual(<<"call_1">>, maps:get(<<"tool_call_id">>, Tool)),
+    ?assertEqual(
+        <<"status: 200\ncontent-type: text/plain\n\npong">>,
+        maps:get(<<"content">>, Tool)
+    ).
+
 multiple_tool_calls_test() ->
-    ToolCall1 = make_tool_call(
-        <<"call_1">>, <<"http_request">>,
-        #{<<"url">> => <<"https://api.example.com/a">>}
+    Calls = [
+        tool_call(<<"a">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/a">> }),
+        tool_call(<<"b">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/b">> })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"Both fetched.">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"Both fetched.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(
+        [<<"https://example.com/a">>, <<"https://example.com/b">>],
+        [Path || #{ <<"payload">> := #{ <<"path">> := Path } }
+            <- tool_requests(Table, http)]
     ),
-    ToolCall2 = make_tool_call(
-        <<"call_2">>, <<"http_request">>,
-        #{<<"url">> => <<"https://api.example.com/b">>}
-    ),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall1, ToolCall2]),
-        mock_text_response(<<"Combined result.">>)
-    ]),
-    {ToolFun, Tracker} = mock_tool_fun_with_tracker(<<"ok">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Fetch both">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => ToolFun
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Combined result.">>,
-                 maps:get(<<"agent-answer">>, Result)),
-    %% Verify both tools were called
-    Calls = ets:lookup(Tracker, call),
-    ?assertEqual(2, length(Calls)),
-    ets:delete(Tracker).
+    [_, Second] = model_requests(Table),
+    ?assertEqual(
+        [<<"a">>, <<"b">>],
+        [Id || #{ <<"role">> := <<"tool">>, <<"tool_call_id">> := Id }
+            <- maps:get(<<"messages">>, Second)]
+    ).
 
-%% @doc Max iterations reached, agent force-stops.
-max_iterations_test() ->
-    %% LLM always returns tool_calls, never a final answer
-    ToolCall = make_tool_call(
-        <<"call_loop">>, <<"http_request">>,
-        #{<<"url">> => <<"https://example.com">>}
+tool_calls_per_turn_are_bounded_test() ->
+    Calls = [http_call(integer_to_binary(N)) || N <- lists:seq(1, 20)],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    ?assertEqual(16, length(tool_requests(Table, http))),
+    [_, Second] = model_requests(Table),
+    Contents = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assertEqual(20, length(Contents)),
+    ?assert(contains(lists:last(Contents), <<"at most 16 tool calls">>)).
+
+tool_failure_is_reported_to_the_model_test() ->
+    Failing = #{ <<"call">> => fun(_, _, _) -> throw(upstream_unavailable) end },
+    {Table, Opts0} =
+        setup([tool_reply([http_call(<<"c">>)]), answer_reply(<<"It failed.">>)]),
+    Opts = Opts0#{ <<"agent-tool-devices">> => #{ <<"http_request">> => Failing } },
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"It failed.">>, maps:get(<<"agent-answer">>, Result)),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"`http_request` failed">>)),
+    ?assert(contains(Content, <<"upstream_unavailable">>)).
+
+http_error_status_is_an_observation_test() ->
+    NotFound =
+        #{ <<"call">> =>
+            fun(_, _, _) ->
+                {error, #{ <<"status">> => 404, <<"body">> => <<"missing">> }}
+            end },
+    {Table, Opts0} =
+        setup([tool_reply([http_call(<<"c">>)]), answer_reply(<<"Not there.">>)]),
+    Opts = Opts0#{ <<"agent-tool-devices">> => #{ <<"http_request">> => NotFound } },
+    _ = run_agent(#{}, Opts),
+    [_, Second] = model_requests(Table),
+    ?assertEqual(
+        [<<"status: 404\n\nmissing">>],
+        tool_contents(maps:get(<<"messages">>, Second))
+    ).
+
+%%% Iteration limit.
+
+always_calls_tool(_N, _Body) ->
+    tool_reply([http_call(<<"loop">>)]).
+
+max_iterations_from_http_text_test() ->
+    {Table, Opts} = setup(fun always_calls_tool/2),
+    Result = run_agent(#{ <<"agent-max-iterations">> => <<"2">> }, Opts),
+    ?assertEqual(<<"max_iterations_exceeded">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual(#{ <<"limit">> => 2 }, maps:get(<<"agent-error-detail">>, Result)),
+    ?assertEqual(
+        <<"Max iterations reached. Could not complete the task.">>,
+        maps:get(<<"agent-answer">>, Result)
     ),
-    AlwaysToolCall = fun(_Body, _Opts) ->
-        mock_tool_call_response([ToolCall])
+    ?assertEqual(2, length(model_requests(Table))),
+    ?assertEqual(2, length(tool_requests(Table, http))).
+
+max_iterations_integer_test() ->
+    {Table, Opts} = setup(fun always_calls_tool/2),
+    Result = run_agent(#{ <<"agent-max-iterations">> => 3 }, Opts),
+    ?assertEqual(<<"max_iterations_exceeded">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(3, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual(3, length(model_requests(Table))).
+
+max_iterations_normalization_test() ->
+    Opts = #{},
+    Max = fun(Value) ->
+        max_iterations(#{ <<"agent-max-iterations">> => Value }, Opts)
     end,
-    ToolFun = mock_tool_fun(<<"result">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Loop forever">>,
-            <<"agent-max-iterations">> => 3},
-    Opts = #{
-        <<"agent-llm-fun">> => AlwaysToolCall,
-        <<"agent-tool-fun">> => ToolFun
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"max_iterations_exceeded">>,
-                 maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(10, max_iterations(#{}, Opts)),
+    ?assertEqual(4, Max(<<" 4 ">>)),
+    ?assertEqual(5, Max(5.0)),
+    lists:foreach(
+        fun(Invalid) -> ?assertEqual(10, Max(Invalid)) end,
+        [<<"0">>, <<"-3">>, <<"abc">>, <<>>, 0, -1, 2.5, #{}, [1]]
+    ).
+
+max_iterations_operator_limit_test() ->
+    Limited = fun(Limit, Value) ->
+        max_iterations(
+            #{ <<"agent-max-iterations">> => Value },
+            #{ <<"agent-max-iterations-limit">> => Limit }
+        )
+    end,
+    ?assertEqual(25, max_iterations(#{ <<"agent-max-iterations">> => 1000 }, #{})),
+    ?assertEqual(3, Limited(3, <<"50">>)),
+    ?assertEqual(4, Limited(<<"4">>, 10)),
+    ?assertEqual(3, max_iterations(#{}, #{ <<"agent-max-iterations-limit">> => 3 })),
+    ?assertEqual(25, Limited(<<"invalid">>, 100)),
+    {Table, Opts} =
+        setup(fun always_calls_tool/2, #{ <<"agent-max-iterations-limit">> => 3 }),
+    Result = run_agent(#{ <<"agent-max-iterations">> => <<"50">> }, Opts),
+    ?assertEqual(3, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual(3, length(model_requests(Table))).
+
+%%% Tool arguments.
+
+invalid_json_arguments_are_not_executed_test() ->
+    Call = tool_call(<<"bad">>, <<"http_request">>, <<"{\"url\": \"https://exa">>),
+    {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"Retrying failed.">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"Retrying failed.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual([], tool_requests(Table, http)),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"was not executed">>)),
+    ?assert(contains(Content, <<"not valid JSON">>)),
+    ?assert(contains(Content, <<"No state was changed.">>)),
+    ?assert(contains(Content, <<"20 bytes">>)).
+
+non_object_arguments_are_not_executed_test() ->
+    lists:foreach(
+        fun(Args) ->
+            Call = tool_call(<<"c">>, <<"http_request">>, Args),
+            {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"ok">>)]),
+            Result = run_agent(#{}, Opts),
+            ?assertEqual(<<"ok">>, maps:get(<<"agent-answer">>, Result)),
+            ?assertEqual([], tool_requests(Table, http)),
+            [_, Second] = model_requests(Table),
+            [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+            ?assert(contains(Content, <<"not a JSON object">>))
+        end,
+        [<<"[]">>, <<"null">>, <<"\"https://example.com\"">>, <<"42">>]
+    ).
+
+argument_preview_is_bounded_utf8_test() ->
+    Long = <<"{", (binary:copy(<<16#20AC/utf8>>, 200))/binary>>,
+    Call = tool_call(<<"c">>, <<"http_request">>, Long),
+    {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assertEqual(Content, unicode:characters_to_binary(Content)),
+    ?assert(byte_size(Content) < 400).
+
+arguments_are_filtered_to_declared_keys_test() ->
+    ID = binary:copy(<<"a">>, 43),
+    Calls = [
+        tool_call(<<"l">>, <<"lookup_data">>,
+            #{ <<"id">> => ID, <<"store">> => <<"elsewhere">> }),
+        tool_call(<<"h">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/">>,
+               <<"peer">> => <<"http://10.0.0.1">>,
+               <<"commit-request">> => true })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [LookupReq] = tool_requests(Table, lookup),
+    ?assertEqual(ID, maps:get(<<"read">>, LookupReq)),
+    ?assertNot(maps:is_key(<<"store">>, LookupReq)),
+    [HttpReq] = tool_requests(Table, http),
+    ?assertEqual(
+        #{ <<"path">> => <<"https://example.com/">>, <<"method">> => <<"GET">> },
+        maps:get(<<"payload">>, HttpReq)
+    ),
+    ?assertNot(maps:is_key(<<"peer">>, HttpReq)).
+
+unknown_tool_is_not_executed_test() ->
+    Call = tool_call(<<"u">>, <<"run_shell">>, #{ <<"cmd">> => <<"ls">> }),
+    {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"No such tool.">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"No such tool.">>, maps:get(<<"agent-answer">>, Result)),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"`run_shell` was not executed">>)),
+    ?assert(contains(Content, <<"http_request, lookup_data">>)).
+
+%%% finish_reason dispatch.
+
+truncated_tool_call_is_not_executed_test() ->
+    Truncated =
+        reply_with(
+            #{ <<"content">> => null,
+               <<"tool_calls">> => [tool_call(<<"t">>, <<"http_request">>,
+                                              <<"{\"url\": \"https://ex">>)] },
+            <<"length">>),
+    {Table, Opts} = setup([Truncated]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"incomplete_response">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"finish-reason">> => <<"length">>,
+           <<"cause">> => <<"truncated-tool-call">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ),
+    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual([], tool_requests(Table, http)).
+
+truncated_answer_is_continued_test() ->
+    {Table, Opts} =
+        setup([
+            reply_with(#{ <<"content">> => <<"The answer is ">> }, <<"length">>),
+            reply_with(#{ <<"content">> => <<"forty">> }, <<"length">>),
+            answer_reply(<<"-two.">>)
+        ]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"The answer is forty-two.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(3, maps:get(<<"agent-iterations">>, Result)),
+    [_, Second, _] = model_requests(Table),
+    [_, _, Partial, Continue] = maps:get(<<"messages">>, Second),
+    ?assertEqual(
+        #{ <<"role">> => <<"assistant">>, <<"content">> => <<"The answer is ">> },
+        Partial
+    ),
+    ?assertEqual(<<"user">>, maps:get(<<"role">>, Continue)).
+
+continuations_count_against_the_limit_test() ->
+    {Table, Opts} =
+        setup([reply_with(#{ <<"content">> => <<"more">> }, <<"length">>)]),
+    Result = run_agent(#{ <<"agent-max-iterations">> => 2 }, Opts),
+    ?assertEqual(<<"max_iterations_exceeded">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(2, length(model_requests(Table))).
+
+truncated_empty_answer_is_incomplete_test() ->
+    {_Table, Opts} =
+        setup([reply_with(#{ <<"content">> => <<>>,
+                             <<"reasoning_content">> => <<"thinking">> },
+                          <<"length">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"incomplete_response">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        <<"empty-content">>,
+        maps:get(<<"cause">>, maps:get(<<"agent-error-detail">>, Result))
+    ).
+
+partial_answer_resets_at_tool_boundary_test() ->
+    {_Table, Opts} =
+        setup([
+            reply_with(#{ <<"content">> => <<"draft ">> }, <<"length">>),
+            tool_reply([http_call(<<"c">>)]),
+            answer_reply(<<"final">>)
+        ]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"final">>, maps:get(<<"agent-answer">>, Result)),
     ?assertEqual(3, maps:get(<<"agent-iterations">>, Result)).
 
-%% @doc Tool execution returns an error, which is passed back to LLM.
-tool_error_handling_test() ->
-    ToolCall = make_tool_call(
-        <<"call_err">>, <<"http_request">>,
-        #{<<"url">> => <<"https://fail.example.com">>}
+content_filter_ends_the_run_test() ->
+    {_Table, Opts} =
+        setup([reply_with(#{ <<"content">> => <<"partial">> }, <<"content_filter">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"content_filtered">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"finish-reason">> => <<"content_filter">> },
+        maps:get(<<"agent-error-detail">>, Result)
     ),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"Sorry, the request failed.">>)
-    ]),
-    ToolFun = mock_tool_fun(<<"HTTP request failed: timeout">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Try failing URL">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => ToolFun
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    %% Agent should still complete despite tool error
-    ?assertEqual(<<"Sorry, the request failed.">>,
-                 maps:get(<<"agent-answer">>, Result)),
-    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)).
+    ?assertEqual(
+        <<"The model response was blocked by a content filter.">>,
+        maps:get(<<"agent-answer">>, Result)
+    ).
 
-%% @doc Verify conversation history is in correct OpenAI format.
-message_history_test() ->
-    ToolCall = make_tool_call(
-        <<"call_hist">>, <<"http_request">>,
-        #{<<"url">> => <<"https://example.com">>}
+error_finish_reason_ends_the_run_test() ->
+    {_Table, Opts} = setup([reply_with(#{ <<"content">> => null }, <<"error">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"finish-reason">> => <<"error">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ).
+
+unknown_finish_reason_ends_the_run_test() ->
+    {_Table, Opts} = setup([reply_with(#{ <<"content">> => <<"x">> }, <<"abort">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"unsupported_finish_reason">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"finish-reason">> => <<"abort">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ).
+
+missing_finish_reason_is_inferred_test() ->
+    {Table, Opts} =
+        setup([
+            reply_with(#{ <<"content">> => null,
+                          <<"tool_calls">> => [http_call(<<"c">>)] }, null),
+            reply_with(#{ <<"content">> => <<"inferred">> }, null)
+        ]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"inferred">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(1, length(tool_requests(Table, http))).
+
+tool_calls_finish_without_calls_test() ->
+    {_Table, Opts} =
+        setup([reply_with(#{ <<"content">> => <<"x">> }, <<"tool_calls">>)]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"incomplete_response">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        <<"missing-tool-calls">>,
+        maps:get(<<"cause">>, maps:get(<<"agent-error-detail">>, Result))
+    ).
+
+%%% Model call failures.
+
+model_call_error_test() ->
+    Failure =
+        {error, #{
+            <<"status">> => 503,
+            <<"body">> =>
+                hb_json:encode(#{ <<"error">> => #{
+                    <<"message">> => <<"overloaded">>,
+                    <<"type">> => <<"server_error">> } })
+        }},
+    {_Table, Opts} = setup([Failure]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)),
+    ?assertEqual(
+        #{ <<"status">> => 503, <<"message">> => <<"overloaded">>,
+           <<"type">> => <<"server_error">> },
+        maps:get(<<"agent-error-detail">>, Result)
+    ).
+
+error_status_in_result_test() ->
+    {_Table, Opts} =
+        setup([{result, #{ <<"status">> => 400,
+                       <<"body">> =>
+                           <<"{\"object\":\"error\",\"message\":\"bad model\","
+                             "\"code\":400}">> }}]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"status">> => 400, <<"message">> => <<"bad model">>, <<"code">> => 400 },
+        maps:get(<<"agent-error-detail">>, Result)
+    ).
+
+error_envelope_in_success_body_test() ->
+    {_Table, Opts} =
+        setup([{ok, #{ <<"error">> => #{ <<"message">> => <<"quota">>,
+                                         <<"code">> => <<"rate_limited">> } }}]),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(
+        #{ <<"message">> => <<"quota">>, <<"code">> => <<"rate_limited">> },
+        maps:get(<<"agent-error-detail">>, Result)
     ),
-    %% Track what messages the LLM receives on 2nd call
-    MessageTracker = ets:new(msg_tracker, [set, public]),
-    LLMFun = fun(RequestBody, _Opts) ->
-        Decoded = hb_json:decode(RequestBody),
-        Messages = maps:get(<<"messages">>, Decoded, []),
-        ets:insert(MessageTracker, {length(Messages), Messages}),
-        case length(Messages) of
-            2 -> %% First call: [system, user]
-                mock_tool_call_response([ToolCall]);
-            _ -> %% Second call: should have full history
-                mock_text_response(<<"Done.">>)
-        end
-    end,
-    ToolFun = mock_tool_fun(<<"tool output">>),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Test history">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => ToolFun
+    {_, BareOpts} = setup([{ok, #{ <<"error">> => #{ <<"param">> => null } }}]),
+    Bare = run_agent(#{}, BareOpts),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Bare)),
+    ?assertEqual(
+        #{ <<"message">> => <<"the response carries an error">> },
+        maps:get(<<"agent-error-detail">>, Bare)
+    ).
+
+invalid_response_test() ->
+    lists:foreach(
+        fun(Reply) ->
+            {_Table, Opts} = setup([Reply]),
+            Result = run_agent(#{}, Opts),
+            ?assertEqual(<<"invalid_response">>, maps:get(<<"agent-error">>, Result)),
+            ?assert(is_binary(
+                maps:get(<<"message">>, maps:get(<<"agent-error-detail">>, Result))))
+        end,
+        [
+            {raw, <<"not json">>},
+            {raw, <<"[1,2]">>},
+            {ok, #{ <<"choices">> => [] }},
+            {ok, #{ <<"choices">> => [#{ <<"finish_reason">> => <<"stop">> }] }}
+        ]
+    ).
+
+inference_device_failure_test() ->
+    Crashing = #{ <<"completions">> => fun(_, _, _) -> error(runtime_down) end },
+    Result = run_agent(#{}, #{ <<"agent-inference-device">> => Crashing }),
+    ?assertEqual(<<"model_error">>, maps:get(<<"agent-error">>, Result)),
+    ?assertEqual(<<"The model call failed.">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)),
+    Detail = maps:get(<<"agent-error-detail">>, Result),
+    ?assert(contains(maps:get(<<"message">>, Detail), <<"runtime_down">>)).
+
+%%% Routing and authority.
+
+routing_comes_from_node_options_only_test() ->
+    {Table, Opts} = setup([answer_reply(<<"ok">>)]),
+    {OtherTable, Other} = setup([answer_reply(<<"wrong device">>)]),
+    Hostile = #{
+        <<"agent-inference-device">> => maps:get(<<"agent-inference-device">>, Other),
+        <<"agent-tool-devices">> => #{ <<"http_request">> => <<"relay@1.0">> },
+        <<"agent-api-peer">> => <<"http://127.0.0.1:1">>,
+        <<"agent-api-path">> => <<"/steal">>,
+        <<"agent-api-key">> => <<"secret">>,
+        <<"inference-peer">> => <<"http://127.0.0.1:1">>
     },
-    {ok, _Result} = run(Base, Req, Opts),
-    %% Check 2nd call had correct history:
-    %% [system, user, assistant(tool_calls), tool(result)] = 4 messages
-    [{4, SecondCallMessages}] = ets:lookup(MessageTracker, 4),
-    %% Verify message roles in order
-    Roles = [maps:get(<<"role">>, M) || M <- SecondCallMessages],
-    ?assertEqual([<<"system">>, <<"user">>, <<"assistant">>, <<"tool">>], Roles),
-    %% Verify the tool message has the correct tool_call_id
-    ToolMsg = lists:last(SecondCallMessages),
-    ?assertEqual(<<"call_hist">>, maps:get(<<"tool_call_id">>, ToolMsg)),
-    ?assertEqual(<<"tool output">>, maps:get(<<"content">>, ToolMsg)),
-    ets:delete(MessageTracker).
-
-%% @doc truncate_result/1 correctly truncates long binaries.
-truncate_result_test() ->
-    Short = <<"short">>,
-    ?assertEqual(Short, truncate_result(Short)),
-    Long = binary:copy(<<"x">>, 5000),
-    Truncated = truncate_result(Long),
-    ?assert(byte_size(Truncated) < 5000),
-    ?assert(binary:match(Truncated, <<"[truncated]">>) =/= nomatch).
-
-%% @doc Unknown tool name returns a descriptive error binary.
-unknown_tool_test() ->
-    ToolCall = make_tool_call(
-        <<"call_unk">>, <<"unknown_func">>,
-        #{<<"arg">> => <<"val">>}
+    Base = maps:merge(#{ <<"device">> => <<"agent@1.0">> }, Hostile),
+    Result = run_agent(Base, Hostile, Opts),
+    ?assertEqual(<<"ok">>, maps:get(<<"agent-answer">>, Result)),
+    ?assertEqual([], model_requests(OtherTable)),
+    [{_, _, InfBase, InfReq, InfOpts}] = ets:tab2list(Table),
+    ?assertEqual([<<"device">>], maps:keys(InfBase)),
+    ?assertEqual([<<"body">>, <<"path">>], lists:sort(maps:keys(InfReq))),
+    lists:foreach(
+        fun(Key) -> ?assertNot(maps:is_key(Key, InfOpts)) end,
+        [<<"agent-api-peer">>, <<"agent-api-path">>, <<"agent-api-key">>,
+         <<"inference-peer">>]
     ),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"I don't know that tool.">>)
-    ]),
-    %% Use default_execute_tool which handles unknown tools
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Use unknown tool">>},
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => fun default_execute_tool/2
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"I don't know that tool.">>,
-                 maps:get(<<"agent-answer">>, Result)).
+    [Request] = model_requests(Table),
+    ?assertEqual(
+        [<<"messages">>, <<"tool_choice">>, <<"tools">>],
+        lists:sort(maps:keys(Request))
+    ).
 
-%% @doc Test: Lua ao.resolve style call — config in Req, not Opts.
-%% Simulates: ao.resolve({path="/~agent@1.0/run", ["agent-api-peer"]=..., ...})
-lua_resolve_style_test() ->
-    LLMFun = mock_llm_sequence([
-        mock_text_response(<<"Paris">>)
-    ]),
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{
-        <<"path">> => <<"run">>,
-        <<"agent-user-prompt">> => <<"Capital of France?">>,
-        <<"agent-model">> => <<"test-model">>,
-        <<"agent-api-peer">> => <<"https://api.example.com">>,
-        <<"agent-api-path">> => <<"/v1/chat/completions">>,
-        <<"agent-api-key">> => <<"sk_test_key">>
-    },
-    Opts = #{
-        <<"agent-llm-fun">> => LLMFun,
-        <<"agent-tool-fun">> => fun default_execute_tool/2
-    },
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Paris">>, maps:get(<<"agent-answer">>, Result)),
-    ?assertEqual(1, maps:get(<<"agent-iterations">>, Result)).
-
-%% @doc lookup_data tool call is routed with correct args.
-lookup_data_tool_test() ->
-    ToolCall = make_tool_call(<<"c_lookup">>, <<"lookup_data">>,
-                              #{<<"id">> => <<"deadbeef123">>}),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"Found the item.">>)
-    ]),
-    ToolFun = fun(#{name := <<"lookup_data">>, args := Args}, _Opts) ->
-        ?assertEqual(<<"deadbeef123">>, maps:get(<<"id">>, Args)),
-        <<"mock cached data">>
+default_model_test() ->
+    Model = fun(ReqKeys, ExtraOpts) ->
+        {Table, Opts} = setup([answer_reply(<<"ok">>)], ExtraOpts),
+        _ = run_agent(ReqKeys, Opts),
+        [Request] = model_requests(Table),
+        maps:get(<<"model">>, Request, absent)
     end,
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Look up the item">>},
-    Opts = #{<<"agent-llm-fun">> => LLMFun, <<"agent-tool-fun">> => ToolFun},
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Found the item.">>, maps:get(<<"agent-answer">>, Result)),
-    ?assertEqual(2, maps:get(<<"agent-iterations">>, Result)).
+    ?assertEqual(absent, Model(#{}, #{})),
+    ?assertEqual(
+        <<"node-model">>,
+        Model(#{}, #{ <<"agent-default-model">> => <<"node-model">> })
+    ),
+    ?assertEqual(
+        <<"caller-model">>,
+        Model(#{ <<"agent-model">> => <<"caller-model">> },
+              #{ <<"agent-default-model">> => <<"node-model">> })
+    ).
 
-%% @doc search_messages tool call is routed with correct args.
-search_messages_tool_test() ->
-    ToolCall = make_tool_call(<<"c_search">>, <<"search_messages">>,
-                              #{<<"match">> => #{<<"type">> => <<"Process">>},
-                                <<"return">> => <<"paths">>}),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"Found 2 processes.">>)
-    ]),
-    ToolFun = fun(#{name := <<"search_messages">>, args := Args}, _Opts) ->
-        Match = maps:get(<<"match">>, Args),
-        ?assertEqual(<<"Process">>, maps:get(<<"type">>, Match)),
-        ?assertEqual(<<"paths">>, maps:get(<<"return">>, Args)),
-        <<"[\"/path/a\",\"/path/b\"]">>
+%%% Tool set, prompt and choice.
+
+system_prompt_lists_enabled_tools_test() ->
+    {Table, Opts} = setup([answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [Request] = model_requests(Table),
+    [#{ <<"content">> := Prompt } | _] = maps:get(<<"messages">>, Request),
+    lists:foreach(
+        fun(Name) -> ?assert(contains(Prompt, <<"- ", Name/binary, ":">>)) end,
+        [<<"http_request">>, <<"lookup_data">>, <<"search_messages">>,
+         <<"get_arweave_tx">>]
+    ),
+    ?assertNot(contains(Prompt, <<"bundle_item">>)).
+
+disabled_tools_test() ->
+    {Table, Opts} = setup([answer_reply(<<"pong">>)]),
+    Result =
+        run_agent(
+            #{ <<"agent-disable-tools">> => <<"true">>,
+               <<"agent-tool-choice">> => <<"required">> },
+            Opts
+        ),
+    ?assertEqual(<<"pong">>, maps:get(<<"agent-answer">>, Result)),
+    [Request] = model_requests(Table),
+    ?assertNot(maps:is_key(<<"tools">>, Request)),
+    ?assertNot(maps:is_key(<<"tool_choice">>, Request)),
+    [#{ <<"content">> := Prompt } | _] = maps:get(<<"messages">>, Request),
+    ?assertNot(contains(Prompt, <<"tool">>)),
+    ?assertNot(contains(Prompt, <<"http_request">>)).
+
+system_prompt_override_test() ->
+    {Table, Opts} = setup([answer_reply(<<"ok">>)]),
+    _ = run_agent(#{ <<"agent-system-prompt">> => <<"Be terse.">> }, Opts),
+    [Request] = model_requests(Table),
+    ?assertEqual(
+        #{ <<"role">> => <<"system">>, <<"content">> => <<"Be terse.">> },
+        hd(maps:get(<<"messages">>, Request))
+    ).
+
+agent_tools_selects_a_subset_test() ->
+    Calls = [
+        http_call(<<"h">>),
+        tool_call(<<"l">>, <<"lookup_data">>, #{ <<"id">> => binary:copy(<<"a">>, 43) })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{ <<"agent-tools">> => <<"lookup_data, unknown_tool">> }, Opts),
+    [First, Second] = model_requests(Table),
+    ?assertEqual(
+        [<<"lookup_data">>],
+        [Name || #{ <<"function">> := #{ <<"name">> := Name } }
+            <- maps:get(<<"tools">>, First)]
+    ),
+    ?assertEqual([], tool_requests(Table, http)),
+    ?assertEqual(1, length(tool_requests(Table, lookup))),
+    [HttpResult, _] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(HttpResult, <<"`http_request` was not executed">>)),
+    Names = fun(Value) ->
+        Tools = enabled_tools(#{ <<"agent-tools">> => Value }, #{}),
+        [Name || #{ name := Name } <- Tools]
     end,
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Find all processes">>},
-    Opts = #{<<"agent-llm-fun">> => LLMFun, <<"agent-tool-fun">> => ToolFun},
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Found 2 processes.">>, maps:get(<<"agent-answer">>, Result)).
+    ?assertEqual([<<"http_request">>, <<"get_arweave_tx">>],
+                 Names([<<"get_arweave_tx">>, <<"http_request">>])),
+    ?assertEqual([<<"search_messages">>], Names(<<"[\"search_messages\"]">>)),
+    ?assertEqual([], Names(<<"unknown_tool">>)),
+    ?assertEqual([], Names(<<"bundle_item">>)).
 
-%% @doc get_arweave_tx tool call is routed with correct args.
-get_arweave_tx_tool_test() ->
-    TXID = <<"43characterbase64urlTXIDxxxxxxxxxxxxxxxx123">>,
-    ToolCall = make_tool_call(<<"c_tx">>, <<"get_arweave_tx">>,
-                              #{<<"id">> => TXID}),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"Transaction found.">>)
-    ]),
-    ToolFun = fun(#{name := <<"get_arweave_tx">>, args := Args}, _Opts) ->
-        ?assertEqual(TXID, maps:get(<<"id">>, Args)),
-        <<"{\"id\":\"", TXID/binary, "\"}">>
+bundle_item_is_disabled_by_default_test() ->
+    Call = tool_call(<<"b">>, <<"bundle_item">>, #{ <<"data">> => <<"hello">> }),
+    {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{ <<"agent-tools">> => <<"bundle_item,http_request">> }, Opts),
+    [First, Second] = model_requests(Table),
+    ?assertEqual(
+        [<<"http_request">>],
+        [Name || #{ <<"function">> := #{ <<"name">> := Name } }
+            <- maps:get(<<"tools">>, First)]
+    ),
+    ?assertEqual([], tool_requests(Table, bundle)),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"`bundle_item` was not executed">>)).
+
+bundle_item_when_enabled_test() ->
+    Call =
+        tool_call(<<"b">>, <<"bundle_item">>,
+            #{ <<"data">> => <<"hello">>, <<"content_type">> => <<"text/markdown">> }),
+    {Table, Opts} =
+        setup(
+            [tool_reply([Call]), answer_reply(<<"Stored.">>)],
+            #{ <<"agent-allow-bundle">> => true, <<"priv-wallet">> => ar_wallet:new() }
+        ),
+    Result = run_agent(#{}, Opts),
+    ?assertEqual(<<"Stored.">>, maps:get(<<"agent-answer">>, Result)),
+    [First, Second] = model_requests(Table),
+    ?assert(lists:member(
+        <<"bundle_item">>,
+        [Name || #{ <<"function">> := #{ <<"name">> := Name } }
+            <- maps:get(<<"tools">>, First)]
+    )),
+    [BundleReq] = tool_requests(Table, bundle),
+    Item = maps:get(<<"item">>, BundleReq),
+    ?assertEqual(<<"hello">>, maps:get(<<"data">>, Item)),
+    ?assertEqual(<<"text/markdown">>, maps:get(<<"content-type">>, Item)),
+    ?assert(maps:is_key(<<"commitments">>, Item)),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"Submitted data item ">>)).
+
+tool_choice_passthrough_test() ->
+    Choice = fun(Value) ->
+        {Table, Opts} =
+            setup([tool_reply([http_call(<<"c">>)]), answer_reply(<<"ok">>)]),
+        _ = run_agent(#{ <<"agent-tool-choice">> => Value }, Opts),
+        [maps:get(<<"tool_choice">>, Request) || Request <- model_requests(Table)]
     end,
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Get the Arweave TX">>},
-    Opts = #{<<"agent-llm-fun">> => LLMFun, <<"agent-tool-fun">> => ToolFun},
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Transaction found.">>, maps:get(<<"agent-answer">>, Result)).
+    Named = #{ <<"type">> => <<"function">>,
+               <<"function">> => #{ <<"name">> => <<"http_request">> } },
+    ?assertEqual([<<"required">>, <<"auto">>], Choice(<<"required">>)),
+    ?assertEqual([Named, <<"auto">>], Choice(hb_json:encode(Named))),
+    ?assertEqual([Named, <<"auto">>], Choice(Named)),
+    ?assertEqual([<<"auto">>, <<"auto">>], Choice(<<"sometimes">>)).
 
-%% @doc bundle_item tool call is routed with correct args.
-bundle_item_tool_test() ->
-    Data = <<"Hello Arweave">>,
-    ToolCall = make_tool_call(<<"c_bundle">>, <<"bundle_item">>,
-                              #{<<"data">> => Data,
-                                <<"content_type">> => <<"text/plain">>}),
-    LLMFun = mock_llm_sequence([
-        mock_tool_call_response([ToolCall]),
-        mock_text_response(<<"Data submitted to Arweave.">>)
-    ]),
-    ToolFun = fun(#{name := <<"bundle_item">>, args := Args}, _Opts) ->
-        ?assertEqual(Data, maps:get(<<"data">>, Args)),
-        ?assertEqual(<<"text/plain">>, maps:get(<<"content_type">>, Args)),
-        <<"Message queued.">>
+%%% Conversation inputs.
+
+agent_messages_test() ->
+    Messages = [
+        #{ <<"role">> => <<"system">>, <<"content">> => <<"Custom system.">> },
+        #{ <<"role">> => <<"user">>, <<"content">> => <<"Earlier question">> },
+        #{ <<"role">> => <<"assistant">>, <<"content">> => <<"Earlier answer">> },
+        #{ <<"role">> => <<"user">>, <<"content">> => <<"Follow-up">> }
+    ],
+    FirstMessages = fun(Value) ->
+        {Table, Opts} = setup([answer_reply(<<"ok">>)]),
+        _ = run_agent(#{ <<"agent-messages">> => Value }, Opts),
+        [Request] = model_requests(Table),
+        maps:get(<<"messages">>, Request)
     end,
-    Base = #{<<"device">> => <<"agent@1.0">>},
-    Req = #{<<"path">> => <<"run">>,
-            <<"agent-user-prompt">> => <<"Store this to Arweave">>},
-    Opts = #{<<"agent-llm-fun">> => LLMFun, <<"agent-tool-fun">> => ToolFun},
-    {ok, Result} = run(Base, Req, Opts),
-    ?assertEqual(<<"Data submitted to Arweave.">>, maps:get(<<"agent-answer">>, Result)).
+    ?assertEqual(Messages, FirstMessages(hb_json:encode(Messages))),
+    ?assertEqual(Messages, FirstMessages(Messages)),
+    ?assertEqual(
+        Messages,
+        FirstMessages(maps:from_list(
+            lists:zip([<<"1">>, <<"2">>, <<"3">>, <<"4">>], Messages)))
+    ),
+    [System | Rest] = FirstMessages(tl(Messages)),
+    ?assertEqual(<<"system">>, maps:get(<<"role">>, System)),
+    ?assertEqual(tl(Messages), Rest),
+    lists:foreach(
+        fun(Invalid) ->
+            ?assertEqual(
+                [<<"system">>, <<"user">>],
+                [Role || #{ <<"role">> := Role } <- FirstMessages(Invalid)]
+            )
+        end,
+        [<<"[not json">>, <<"[]">>, <<"{\"role\":\"user\"}">>,
+         [#{ <<"role">> => <<"wizard">>, <<"content">> => <<"x">> }]]
+    ).
 
-%% @doc Integration test: real LLM API call via OpenRouter with tool use.
-%% Requires a valid OPENROUTER_API_KEY environment variable or direct substitution.
-%% Run with: rebar3 eunit --module=dev_agent --test=integration_real_api_test
-integration_real_api_test_() ->
+reasoning_content_is_preserved_test() ->
+    Reply =
+        reply_with(
+            #{ <<"content">> => null,
+               <<"reasoning_content">> => <<"I should fetch the page.">>,
+               <<"tool_calls">> => [http_call(<<"c">>)] },
+            <<"tool_calls">>),
+    {Table, Opts} = setup([Reply, answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [_, Second] = model_requests(Table),
+    [Assistant] =
+        [M || M = #{ <<"role">> := <<"assistant">> }
+            <- maps:get(<<"messages">>, Second)],
+    ?assertEqual(
+        <<"I should fetch the page.">>,
+        maps:get(<<"reasoning_content">>, Assistant)
+    ).
+
+%%% Executors.
+
+http_request_refuses_non_public_hosts_test() ->
+    Refused = [
+        <<"http://127.0.0.1/">>, <<"http://localhost:8734/~meta@1.0/info">>,
+        <<"http://LOCALHOST./">>, <<"http://api.localhost/">>,
+        <<"http://10.1.2.3/">>, <<"http://172.16.0.1/">>,
+        <<"http://192.168.1.1/">>, <<"http://169.254.169.254/latest/meta-data">>,
+        <<"http://0.0.0.0/">>, <<"http://[::1]/">>, <<"http://[fe80::1]/">>,
+        <<"http://[::ffff:127.0.0.1]/">>, <<"http://2130706433/">>,
+        <<"http://127.1/">>
+    ],
+    lists:foreach(
+        fun(Url) ->
+            ?assertMatch({rejected, _}, check_url(Url, #{}))
+        end,
+        Refused
+    ),
+    lists:foreach(
+        fun(Url) -> ?assertMatch({rejected, _}, check_url(Url, #{})) end,
+        [<<"ftp://example.com/">>, <<"file:///etc/hosts">>, <<"example.com">>,
+         <<"/relative">>, <<"https://">>]
+    ),
+    ?assertEqual(ok, check_url(<<"https://example.com/path?q=1">>, #{})),
+    ?assertEqual(ok, check_url(<<"http://8.8.8.8/">>, #{})),
+    Allow = #{ <<"agent-http-allow-private">> => true },
+    ?assertEqual(ok, check_url(<<"http://127.0.0.1:8734/">>, Allow)),
+    ?assertMatch({rejected, _}, check_url(<<"ftp://127.0.0.1/">>, Allow)),
+    Call = tool_call(<<"c">>, <<"http_request">>,
+        #{ <<"url">> => <<"http://169.254.169.254/">> }),
+    {Table, Opts} = setup([tool_reply([Call]), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    ?assertEqual([], tool_requests(Table, http)),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"special-use address">>)).
+
+http_request_body_and_method_test() ->
+    Calls = [
+        tool_call(<<"p">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/post">>, <<"method">> => <<"post">>,
+               <<"body">> => <<"x=1">> }),
+        tool_call(<<"j">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/json">>, <<"method">> => <<"PUT">>,
+               <<"body">> => #{ <<"a">> => 1 } }),
+        tool_call(<<"m">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/">>, <<"method">> => <<"TRACE">> }),
+        tool_call(<<"n">>, <<"http_request">>,
+            #{ <<"url">> => <<"https://example.com/n">>, <<"method">> => null })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [Post, Put, Default] = [P || #{ <<"payload">> := P } <- tool_requests(Table, http)],
+    ?assertEqual(<<"GET">>, maps:get(<<"method">>, Default)),
+    ?assertEqual(
+        #{ <<"path">> => <<"https://example.com/post">>, <<"method">> => <<"POST">>,
+           <<"body">> => <<"x=1">>, <<"content-type">> => <<"text/plain">> },
+        Post
+    ),
+    ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Put)),
+    ?assertEqual(<<"{\"a\":1}">>, maps:get(<<"body">>, Put)),
+    [_, Second] = model_requests(Table),
+    [_, _, Trace, _] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Trace, <<"method must be GET, POST, PUT or DELETE">>)).
+
+tool_results_are_bounded_test() ->
+    Big = #{ <<"call">> =>
+        fun(_, _, _) ->
+            {ok, #{ <<"status">> => 200, <<"body">> => binary:copy(<<"y">>, 10000) }}
+        end },
+    {Table, Opts0} =
+        setup([tool_reply([http_call(<<"c">>)]), answer_reply(<<"ok">>)],
+              #{ <<"agent-max-tool-result-bytes">> => 100 }),
+    Opts = Opts0#{ <<"agent-tool-devices">> => #{ <<"http_request">> => Big } },
+    _ = run_agent(#{}, Opts),
+    [_, Second] = model_requests(Table),
+    [Content] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assert(contains(Content, <<"[truncated: 100 of ">>)),
+    ?assert(byte_size(Content) < 150).
+
+lookup_and_arweave_executors_test() ->
+    ID = <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ-_01234">>,
+    Calls = [
+        tool_call(<<"l">>, <<"lookup_data">>, #{ <<"id">> => ID }),
+        tool_call(<<"t">>, <<"get_arweave_tx">>, #{ <<"id">> => ID }),
+        tool_call(<<"x">>, <<"lookup_data">>, #{ <<"id">> => <<"../../etc">> })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [Lookup] = tool_requests(Table, lookup),
+    ?assertEqual(#{ <<"path">> => <<"read">>, <<"read">> => ID }, Lookup),
+    [Tx] = tool_requests(Table, arweave),
+    ?assertEqual(
+        #{ <<"path">> => <<"tx">>, <<"tx">> => ID, <<"method">> => <<"GET">>,
+           <<"exclude-data">> => true },
+        Tx
+    ),
+    [_, Second] = model_requests(Table),
+    [LookupResult, TxResult, Invalid] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assertEqual(<<"{\"data\":\"cached\"}">>, LookupResult),
+    ?assertEqual(<<"{\"owner\":\"someone\"}">>, TxResult),
+    ?assert(contains(Invalid, <<"43-character base64url ID">>)).
+
+search_executor_test() ->
+    Calls = [
+        tool_call(<<"s">>, <<"search_messages">>,
+            #{ <<"match">> => #{ <<"type">> => <<"Process">> },
+               <<"return">> => <<"count">> }),
+        tool_call(<<"n">>, <<"search_messages">>,
+            #{ <<"match">> => #{ <<"nested">> => #{ <<"a">> => 1 } } }),
+        tool_call(<<"r">>, <<"search_messages">>,
+            #{ <<"match">> => #{ <<"a">> => 1 }, <<"return">> => <<"everything">> })
+    ],
+    {Table, Opts} = setup([tool_reply(Calls), answer_reply(<<"ok">>)]),
+    _ = run_agent(#{}, Opts),
+    [Search] = tool_requests(Table, search),
+    ?assertEqual(
+        #{ <<"path">> => <<"only">>, <<"only">> => #{ <<"type">> => <<"Process">> },
+           <<"return">> => <<"count">> },
+        Search
+    ),
+    [_, Second] = model_requests(Table),
+    [Found, Nested, Return] = tool_contents(maps:get(<<"messages">>, Second)),
+    ?assertEqual(<<"[\"path-a\",\"path-b\"]">>, Found),
+    ?assert(contains(Nested, <<"was not executed">>)),
+    ?assert(contains(Return, <<"return must be paths, messages or count">>)).
+
+%%% Text helpers.
+
+bound_text_test() ->
+    ?assertEqual(<<"short">>, bound_text(<<"short">>, 10)),
+    Text = binary:copy(<<16#20AC/utf8>>, 10),
+    Bounded = bound_text(Text, 10),
+    [Kept, _] = binary:split(Bounded, <<"\n[truncated">>),
+    ?assertEqual(binary:copy(<<16#20AC/utf8>>, 3), Kept),
+    ?assert(contains(Bounded, <<"[truncated: 9 of 30 bytes shown]">>)),
+    ?assertEqual(<<"a", 16#FFFD/utf8, "b">>, bound_text(<<"a", 255, "b">>, 10)),
+    Binary = <<0, 255, 254, 253, 252, 251>>,
+    Safe = bound_text(Binary, 4),
+    ?assertEqual(Safe, unicode:characters_to_binary(Safe)),
+    ?assert(json_encodable(#{ <<"content">> => Safe })).
+
+truthy_test() ->
+    lists:foreach(fun(V) -> ?assert(truthy(V)) end,
+        [true, 1, <<"true">>, <<"TRUE">>, <<"1">>, <<" true ">>]),
+    lists:foreach(fun(V) -> ?assertNot(truthy(V)) end,
+        [false, 0, <<"false">>, <<"yes">>, not_found, <<>>]).
+
+%%% Live check. It runs only when AGENT_TEST_INFERENCE_PEER names an
+%%% OpenAI-compatible runtime; AGENT_TEST_INFERENCE_PATH,
+%%% AGENT_TEST_INFERENCE_API_KEY and AGENT_TEST_MODEL are optional. The runtime
+%%% is configured through inference@1.0 node options; the request carries no
+%%% backend settings.
+live_inference_test_() ->
     {timeout, 120, fun() ->
-        application:ensure_all_started(gun),
-        case os:getenv("OPENROUTER_API_KEY") of
+        case os:getenv("AGENT_TEST_INFERENCE_PEER") of
             false ->
-                ?debugMsg("Skipping real API test: OPENROUTER_API_KEY is not set"),
-                ok;
-            EnvApiKey ->
-                integration_real_api(list_to_binary(EnvApiKey))
+                ?debugMsg(
+                    "Skipping live agent test: AGENT_TEST_INFERENCE_PEER is not set");
+            Peer ->
+                live_inference(list_to_binary(Peer))
         end
     end}.
 
-integration_real_api(ApiKey) ->
-        Base = #{<<"device">> => <<"agent@1.0">>},
-        Req = #{
-            <<"path">> => <<"run">>,
-            <<"agent-user-prompt">> =>
-                <<"Use the http_request tool to GET https://httpbin.org/get "
-                  "and tell me what the 'origin' IP address is from the response.">>,
-            <<"agent-model">> => <<"openai/gpt-4o-mini">>,
-            <<"agent-max-iterations">> => 5
-        },
-        Opts = #{
-            <<"agent-api-peer">> => <<"https://openrouter.ai">>,
-            <<"agent-api-path">> => <<"/api/v1/chat/completions">>,
-            <<"agent-api-key">> => ApiKey,
-            protocol => http2
-        },
-        {ok, Result} = run(Base, Req, Opts),
-        Answer = maps:get(<<"agent-answer">>, Result),
-        Iterations = maps:get(<<"agent-iterations">>, Result),
-        ?debugFmt("~n=== Integration Test Result ===~n"
-                  "Answer: ~s~nIterations: ~p~nFull result: ~p~n",
-                  [Answer, Iterations, Result]),
-        %% Should have completed in more than 1 iteration (tool was called)
-        ?assert(Iterations >= 2),
-        %% Answer should contain meaningful content (not an error)
-        ?assert(byte_size(Answer) > 10),
-        ?assertNot(maps:is_key(<<"agent-error">>, Result)).
+live_inference(Peer) ->
+    Optional =
+        fun(Env, Key) ->
+            case os:getenv(Env) of
+                false -> #{};
+                Value -> #{ Key => list_to_binary(Value) }
+            end
+        end,
+    Opts =
+        lists:foldl(
+            fun maps:merge/2,
+            #{ <<"inference-peer">> => Peer },
+            [
+                Optional("AGENT_TEST_INFERENCE_PATH", <<"inference-path">>),
+                Optional("AGENT_TEST_INFERENCE_API_KEY", <<"inference-api-key">>),
+                Optional("AGENT_TEST_MODEL", <<"agent-default-model">>)
+            ]
+        ),
+    {ok, Result} =
+        run(
+            #{ <<"device">> => <<"agent@1.0">> },
+            #{
+                <<"path">> => <<"run">>,
+                <<"agent-user-prompt">> => <<"Reply with the single word pong.">>,
+                <<"agent-disable-tools">> => true,
+                <<"agent-max-iterations">> => 2
+            },
+            Opts
+        ),
+    ?debugFmt("Live agent result: ~p", [Result]),
+    ?assertNot(maps:is_key(<<"agent-error">>, Result)),
+    ?assert(byte_size(maps:get(<<"agent-answer">>, Result)) > 0).
+
+-endif.
