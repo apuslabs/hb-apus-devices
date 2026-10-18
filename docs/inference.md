@@ -169,7 +169,9 @@ term, is refused with 400 before it is decoded.
 `publish` signs a document as an ANS-104 data item and submits it to the
 node's bundler; it spends the publication wallet's funds. It accepts a
 receipt, or a JSON object that carries one under `report.receipt`, of at most
-8 MiB, whose `node-address` is this node. These are structural checks, not a
+8 MiB, whose `node-address` is this node, or a publication record whose
+`attestation` is bound to its `raw` document (its `nonce` is the SHA-256 of
+`raw`). These are structural checks, not a
 signature check, so restrict `publish` to your gateway: set
 `receipt-publishers` to the gateway's signing address, or refuse
 `/~inference_receipt@1.0/publish` to every other caller in front of the node.
@@ -199,27 +201,16 @@ front of the node:
 - `/~inference@1.0/*` requests with `tee=true` go to `inference@1.0` on the
   node, except `/~inference@1.0/completions` with `tee=true`, which the
   gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
-- the gateway handles `GET /health`, `GET /attestations`,
-  `POST /attestations`, `GET /attestations/:id`,
-  `POST /attestations/:id/verify-hashpath`, `POST /tags/query` and
-  `POST /query/dataitem` itself: they read its index of published records,
-  check an indexed record with `verify-hashpath` on the node, or (`POST
-  /attestations`) publish the posted record as described below;
-- it answers 403 to any other request whose percent-decoded URL contains
-  `inference_receipt@1.0/publish`, and sends the rest to the node;
-- for each 200, non-streaming response from the node to a request whose path
-  contains `completions`, the gateway publishes a record and adds
-  `load_dataitem_id` and `arweave_tx_id` to the response, or adds
-  `receipt_upload` with `status: failed` when publication does not succeed.
-  To publish, it requires the response's `attestation.raw`, builds a
-  publication record that carries the response's `receipt`, as the gateway
-  normalizes it, under `report.receipt`, checks that the record holds no
-  client metadata, and posts `{"receipt": <record as JSON text>}` to
-  `inference_receipt@1.0/publish`. An attested completion served by
-  `inference@1.0` alone carries no receipt, so `publish` refuses its record;
-- `POST /attestations` posts the record in its body to `publish` after the
-  same client-metadata check, so a posted record is published when it passes
-  the checks of `publish`.
+- every other request goes to the node;
+- for each attested completion, the gateway publishes a public record
+  through `inference_receipt@1.0/publish`: the request's chat messages and
+  generation parameters, the response, the GPU attestation and, when
+  present, the node's receipt under `report.receipt`. It adds
+  `load_dataitem_id` and `arweave_tx_id` to the response;
+- the gateway is the only caller of `publish`: it answers 403 to external
+  requests for `inference_receipt@1.0/publish`, and it serves its index of
+  published records (`/attestations`, `/tags/query`, `/query/dataitem`)
+  read-only, checking an indexed record with `verify-hashpath` on the node.
 
 ## Tests
 

@@ -230,7 +230,10 @@ publishable_document(Value, Opts) ->
 %% @doc The document is a JSON object that is a receipt (`type' is
 %% `apus-inference-receipt'), or that carries one under `report.receipt'.
 %% The receipt must hold the required keys with their JSON types, and its
-%% `node-address' must be this node's address. `signed-receipt' is not
+%% `node-address' must be this node's address. A publication record whose
+%% receipt does not name the node is accepted when its `attestation' is the
+%% one `inference@1.0' attaches with `tee=true': `nonce' is the SHA-256 of
+%% `raw' and GPU evidence is present (bound_attestation/1). `signed-receipt' is not
 %% verified here: a JSON round trip in another language can change committed
 %% values (an integral float such as `1.0' becomes an integer, and integers
 %% beyond 2^53 are rounded), so a signature check would refuse genuine
@@ -240,8 +243,17 @@ publishable_receipt(Data, Opts) ->
     case Document of
         #{<<"type">> := ?RECEIPT_TYPE} ->
             receipt_requirements(Document, Opts);
-        #{<<"report">> := #{<<"receipt">> := Receipt}} when is_map(Receipt) ->
-            receipt_requirements(Receipt, Opts);
+        #{<<"report">> := #{<<"receipt">> := Receipt}} = Record
+                when is_map(Receipt) ->
+            case receipt_requirements(Receipt, Opts) of
+                ok -> ok;
+                Error ->
+                    case bound_attestation(
+                            maps:get(<<"attestation">>, Record, undefined)) of
+                        true -> ok;
+                        false -> Error
+                    end
+            end;
         Map when is_map(Map) ->
             {error, <<"receipt-not-found">>};
         _ ->
@@ -261,6 +273,15 @@ receipt_requirements(#{<<"type">> := ?RECEIPT_TYPE} = Receipt, Opts) ->
     end;
 receipt_requirements(_Receipt, _Opts) ->
     {error, <<"invalid-type">>}.
+
+%% @doc Whether an attestation is bound to its `raw' document: `nonce' is the
+%% lowercase hex SHA-256 of `raw', as `inference@1.0' derives it, and the
+%% attestation carries at least one evidence entry.
+bound_attestation(#{<<"raw">> := Raw, <<"nonce">> := Nonce,
+        <<"evidences">> := [_ | _]}) when is_binary(Raw), is_binary(Nonce) ->
+    Nonce =:= binary:encode_hex(crypto:hash(sha256, Raw), lowercase);
+bound_attestation(_) ->
+    false.
 
 json_type(string, Value) -> is_binary(Value) andalso Value =/= <<>>;
 json_type(object, Value) -> is_map(Value).
@@ -1634,6 +1655,30 @@ publish_accepts_only_receipts_of_this_node_test() ->
         Publish(Oversized)),
     ?assertEqual({ok, hb_json:encode(Receipt)},
         publishable_document(Receipt, Opts)).
+
+%% The reference gateway publishes a record for every attested completion.
+%% A record of an `inference@1.0' completion carries no node receipt; it is
+%% accepted when its attestation nonce is the SHA-256 of its `raw' document.
+publish_accepts_attestation_records_bound_to_raw_test() ->
+    Opts = #{<<"priv-wallet">> => ar_wallet:new()},
+    Raw = <<"{\"request\":{\"model\":\"m\"},\"tee\":true}">>,
+    Nonce = binary:encode_hex(crypto:hash(sha256, Raw), lowercase),
+    Attestation = #{<<"raw">> => Raw, <<"nonce">> => Nonce,
+        <<"evidences">> => [#{<<"evidence">> => <<"e">>}]},
+    Record = fun(A) ->
+        hb_json:encode(#{
+            <<"report">> => #{<<"receipt">> =>
+                #{<<"type">> => ?RECEIPT_TYPE, <<"receipt-id">> => <<"r">>}},
+            <<"attestation">> => A
+        })
+    end,
+    ?assertMatch({ok, _}, publishable_document(Record(Attestation), Opts)),
+    ?assertMatch({error, 422, _}, publishable_document(
+        Record(Attestation#{<<"nonce">> => binary:copy(<<"0">>, 64)}), Opts)),
+    ?assertMatch({error, 422, _}, publishable_document(
+        Record(Attestation#{<<"evidences">> => []}), Opts)),
+    ?assertMatch({error, 422, _}, publishable_document(
+        Record(maps:remove(<<"raw">>, Attestation)), Opts)).
 
 publish_posts_signed_bundle_before_returning_test_() ->
     {timeout, 20, fun() ->

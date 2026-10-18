@@ -253,6 +253,12 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      absent or of another type.
   5. The receipt's `node-address` MUST equal the address of the node's
      identity wallet. Otherwise return the 422 error `receipt-node-mismatch`.
+     A publication record (`report.receipt`) whose receipt does not satisfy
+     steps 4 and 5 is still accepted when its `attestation` is bound to its
+     `raw` document as `inference@1.0` produces it with `tee=true`: `raw` is
+     a string, `nonce` is the lowercase hex SHA-256 of `raw`, and `evidences`
+     is a non-empty list. Such a record documents an attested completion
+     served by `inference@1.0` without a receipt.
   6. The device checks the structure and `node-address` only; it does not
      verify `signed-receipt`. A receipt that reaches it through a client's
      JSON round trip, such as the reference gateway's JavaScript parse and
@@ -410,7 +416,9 @@ of §8. In these bodies `verified` is the JSON literal `false`.
   this reach to them, so it SHOULD pass `publish` only receipts that the
   node returned to that gateway.
 - **What `publish` checks.** The checks of §4 establish that a document has
-  the shape of a receipt and names this node in `node-address`, within 8 MiB.
+  the shape of a receipt and names this node in `node-address`, or that a
+  publication record carries an attestation bound to its `raw` document,
+  within 8 MiB.
   They are not a signature check: `node-address` is a public value, so a
   caller can build a document that passes them, and a publication record can
   carry fields beside its receipt. Proof that the node produced a receipt is
@@ -490,31 +498,18 @@ of §8. In these bodies `verified` is the JSON literal `false`.
     chat request whose user message is the request's `prompt`, with its
     `model`, `max_tokens` and `temperature`, `tee: true` and the
     deployment's declarations;
-  - the gateway handles `GET /health`, `GET /attestations`,
-    `POST /attestations`, `GET /attestations/:id`,
-    `POST /attestations/:id/verify-hashpath`, `POST /tags/query` and
-    `POST /query/dataitem` itself: they read its index of published
-    records, check an indexed record with `verify-hashpath` on the node, or
-    (`POST /attestations`) publish the posted record as described below;
-  - it answers 403 to any other request whose percent-decoded URL contains
-    `inference_receipt@1.0/publish`, and sends every other request,
-    including this device's `health`, `models` and `completions`, to the
-    node;
-  - for each 200, non-streaming response from the node to a request whose
-    path contains `completions`, the gateway publishes a record and adds
-    `load_dataitem_id` and `arweave_tx_id` to the response, or adds
-    `receipt_upload` with `status: failed` when publication does not
-    succeed. To publish, it requires the response's `attestation.raw`,
-    builds a publication record that carries the response's receipt, as the
-    gateway normalizes it, under `report.receipt`, checks that the record
-    holds no client metadata, and posts `{"receipt": <publication record as
-    JSON text>}` to `publish`; each accepted record creates an Arweave data
-    item. A record without a receipt that passes the checks of §4, such as
-    that of an attested completion served by `inference@1.0` alone, is
-    refused by `publish`;
-  - `POST /attestations` posts the record in its body to `publish` after
-    the same client-metadata check, so a posted record is published when it
-    passes the checks of §4 (§7).
+  - every other request, including this device's `health`, `models` and
+    `completions`, goes to the node;
+  - for each attested completion, the gateway publishes a public record
+    through `publish`: the request's chat messages and generation
+    parameters, the response, the GPU attestation and, when present, the
+    node's receipt under `report.receipt`. It adds `load_dataitem_id` and
+    `arweave_tx_id` to the response;
+  - the gateway is the only caller of `publish`: it answers 403 to external
+    requests for `inference_receipt@1.0/publish`, and it serves its index of
+    published records (`/attestations`, `/tags/query`, `/query/dataitem`)
+    read-only, checking an indexed record with `verify-hashpath` on the
+    node.
 
 ## 10. Conformance (normative checklist)
 

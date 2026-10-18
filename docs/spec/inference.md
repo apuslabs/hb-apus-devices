@@ -371,10 +371,9 @@ error whose body is a JSON object is returned with that body unchanged.
     gateway rewrites to `/~inference_receipt@1.0/v1/chat/completions`;
   - the gateway publishes receipts through the `publish` key of
     `inference_receipt@1.0` and adds `load_dataitem_id` and `arweave_tx_id`
-    to those responses. `publish` accepts only documents that carry a receipt
-    naming the node in `node-address`, so an attested completion served by
-    this device alone, which carries no receipt, is not published, and the
-    gateway adds `receipt_upload` with `status: failed` to its response.
+    to those responses. For an attested completion served by this device
+    alone, the published record carries the `attestation` of §5, which
+    `publish` accepts because its `nonce` is the SHA-256 of its `raw`.
 
   Address the node itself to exercise every key of this device.
 
