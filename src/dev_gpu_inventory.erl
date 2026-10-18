@@ -11,7 +11,6 @@
 -specification("docs/spec/gpu_inventory.md").
 -export([info/1, report/3, digest/3, snapshot/3]).
 -include_lib("hb/include/hb.hrl").
--include_lib("eunit/include/eunit.hrl").
 
 -define(VERSION, <<"1.0">>).
 -define(DEFAULT_ROOT, <<"/sys">>).
@@ -515,6 +514,7 @@ reason_text(_) -> <<"error">>.
 %%% ------------------------------------------------------------------
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 %% Run `Fun' with a fresh directory that is removed afterwards.
 with_test_dir(Fun) ->

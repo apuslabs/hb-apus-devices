@@ -16,7 +16,6 @@
 -export([info/1, boot/3, fresh/3, verify/3, snapshot/3]).
 -include_lib("hb/include/hb.hrl").
 -include_lib("kernel/include/file.hrl").
--include_lib("eunit/include/eunit.hrl").
 
 -define(VERSION, <<"1.0">>).
 -define(OBSERVATION_TYPE, <<"apus-gpu-system-measurement">>).
@@ -605,6 +604,7 @@ first_defined([Value | _]) -> Value.
 %%% ------------------------------------------------------------------
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 -define(TEST_DIGEST, <<"OQ6jjieUQbTtI-MX-ai4cEGhp-ZwEo9lm1fYxyB51uk">>).
 

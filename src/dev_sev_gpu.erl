@@ -16,7 +16,6 @@
 -specification("docs/spec/sev_gpu.md").
 -export([info/1, generate/3, verify/3]).
 -include_lib("hb/include/hb.hrl").
--include_lib("eunit/include/eunit.hrl").
 
 %% The module that owns the NVAT NIF. It is not a device module, so Device
 %% Forge does not rename it and the library's `ERL_NIF_INIT' name matches.
@@ -570,6 +569,7 @@ decode_object(_) ->
 %%% ------------------------------------------------------------------
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
 -define(TEST_NONCE,
     <<"da4a06c3604a5fac8aa0b4aaf5a6354cdd0dc7c193299bc3464f30b5cbfb931a">>).
