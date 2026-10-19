@@ -44,7 +44,7 @@ whose \`implements-device\` tag is the specification ID.
 | Published at | $published_at |
 | Signer | \`$signer\` |
 | Source commit | \`$commit\` |
-| HyperBEAM | \`apuslabs/HyperBEAM\` at \`$hyperbeam_ref\` |
+| HyperBEAM | \`permaweb/HyperBEAM\` at \`$hyperbeam_ref\` |
 
 | Device | Specification ID | Implementation ID |
 |---|---|---|

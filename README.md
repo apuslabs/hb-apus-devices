@@ -244,7 +244,7 @@ The devices are built and tested against:
 
 | Component | Version |
 |---|---|
-| HyperBEAM and Device Forge | [`apuslabs/HyperBEAM`](https://github.com/apuslabs/HyperBEAM) at `28baa3d27d70c4268f439587ba0398fb7771e0e3` |
+| HyperBEAM and Device Forge | [`permaweb/HyperBEAM`](https://github.com/permaweb/HyperBEAM) at `1aebe74afd88f5fa35b188a16bd10aac04c4541e` |
 | Erlang/OTP | 27 |
 | rebar3 | 3.27 |
 | PermawebOS measurement devices | [`permaweb/os`](https://github.com/permaweb/os) at `63f88cc3a73af0e5af13b58887b2870d8b486c48` |
@@ -253,9 +253,11 @@ The devices are built and tested against:
 | Model runtime | SGLang with an OpenAI-compatible chat-completions API |
 
 `rebar.config` pins both the HyperBEAM dependency and the Device Forge plugin
-to `apuslabs/HyperBEAM` at `28baa3d27d70c4268f439587ba0398fb7771e0e3`: the
-upstream `permaweb/HyperBEAM` edge commit
-`2c03978a3d201444bf7aada3eb35809153e41ef3` merged with AO-Core `vary`, which
-projects handler inputs through each handler's `-spec`. `inference@1.0` speaks
+to upstream `permaweb/HyperBEAM` at
+`1aebe74afd88f5fa35b188a16bd10aac04c4541e`, the tip of `cookbook/schema-vary`,
+which projects handler inputs through each handler's `-spec`. Devices are
+tested against upstream `edge` too; that branch does not yet carry the schema
+work, and the receipt device's signature checks fail there. See
+[`docs/hyperbeam-pin.md`](docs/hyperbeam-pin.md) before moving the pin. `inference@1.0` speaks
 the OpenAI chat-completions protocol, so other compatible runtimes plug in
 through node options.
