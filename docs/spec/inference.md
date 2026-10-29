@@ -164,7 +164,10 @@ unchanged, and requests never choose the peer.
      payload, unchanged. If `body` is a map, the payload is that map encoded
      as JSON after removing `commitments` and private keys. Otherwise the
      payload is a JSON object of the generation parameters present on the
-     request.
+     request. In every case the fields the runtime cannot honour (`min_p`,
+     which aborts the deterministic runtime's scheduler) are removed; a binary
+     `body` without them keeps its exact bytes, and one with them is
+     re-encoded without them.
   3. Send `POST <runtime origin><inference-path>` through `relay@1.0` with
      `content-type: application/json` and, when `inference-api-key` is set,
      `authorization: Bearer <key>`.
@@ -415,7 +418,7 @@ error whose body is a JSON object is returned with that body unchanged.
    with status 400 before contacting the runtime.
 5. The runtime payload is the binary `body` unchanged, a map `body` without
    `commitments` and private keys, or the generation parameters present on
-   the request.
+   the request, in every case without `min_p`.
 6. All runtime calls go through `relay@1.0`, use the node's `http-client`,
    and go to the runtime origin; an `inference-peer` outside the rules of §3
    yields 500 `runtime_misconfigured` without any runtime call.

@@ -43,6 +43,10 @@
 %% a caller identifier that does not affect sampling, so it is withheld.
 -define(PUBLIC_PARAM_KEYS, (?PARAM_KEYS -- [<<"user">>])).
 
+%% Request fields the runtime cannot honour, removed from every runtime
+%% payload. SGLang's deterministic sampler aborts its scheduler on `min_p',
+%% after which the runtime answers no request until it is restarted.
+-define(RUNTIME_UNSUPPORTED_KEYS, [<<"min_p">>]).
 %% Execution-profile declarations `inference_receipt@1.0' admits into the
 %% request it executes here. Both specifications state this list.
 -define(DECLARATION_KEYS, [
@@ -238,15 +242,26 @@ body_params(Req, Opts) ->
 
 %% The JSON document sent to the runtime: a binary `body' unchanged, a map
 %% `body' without AO-Core metadata, or else the generation parameters found
-%% on the request message.
+%% on the request message. Fields the runtime cannot honour are removed.
 backend_payload(Req, Opts) ->
     case hb_ao:get(<<"body">>, Req, not_found, Opts) of
-        Body when is_binary(Body) -> Body;
+        Body when is_binary(Body) -> without_unsupported(Body);
         Body when is_map(Body) ->
             Loaded = hb_cache:ensure_all_loaded(Body, Opts),
-            hb_json:encode(
-                hb_private:reset(maps:without([<<"commitments">>], Loaded)));
+            hb_json:encode(maps:without(?RUNTIME_UNSUPPORTED_KEYS,
+                hb_private:reset(maps:without([<<"commitments">>], Loaded))));
         _ -> hb_json:encode(generation_params(Req, Opts))
+    end.
+%% A binary body keeps its exact bytes unless it is a JSON object carrying a
+%% field the runtime cannot honour; it is then re-encoded without that field.
+without_unsupported(Body) ->
+    case decode_object(Body) of
+        {ok, Map} ->
+            case maps:with(?RUNTIME_UNSUPPORTED_KEYS, Map) of
+                Found when map_size(Found) =:= 0 -> Body;
+                _ -> hb_json:encode(maps:without(?RUNTIME_UNSUPPORTED_KEYS, Map))
+            end;
+        error -> Body
     end.
 
 generation_params(Req, Opts) ->
@@ -1260,5 +1275,19 @@ map_body_is_sent_without_commitments_test() ->
     Body = (chat_request())#{<<"commitments">> => #{<<"id">> => #{}}},
     ?assertEqual(chat_request(),
         hb_json:decode(backend_payload(#{<<"body">> => Body}, #{}))).
+
+unsupported_fields_are_removed_from_the_payload_test() ->
+    WithMinP = (chat_request())#{<<"min_p">> => 0.05},
+    ?assertEqual(chat_request(),
+        hb_json:decode(backend_payload(#{<<"body">> => WithMinP}, #{}))),
+    ?assertEqual(chat_request(),
+        hb_json:decode(backend_payload(
+            #{<<"body">> => hb_json:encode(WithMinP)}, #{}))).
+
+binary_body_without_unsupported_fields_is_sent_unchanged_test() ->
+    Body = <<"{\"model\": \"m\",\n \"messages\": [], \"top_k\": 20}">>,
+    ?assertEqual(Body, backend_payload(#{<<"body">> => Body}, #{})),
+    ?assertEqual(<<"not json">>,
+        backend_payload(#{<<"body">> => <<"not json">>}, #{})).
 
 -endif.
