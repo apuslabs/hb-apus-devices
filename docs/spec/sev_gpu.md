@@ -1,5 +1,6 @@
 # `sev_gpu@1.0` — NVIDIA confidential-computing GPU attestation
 
+- **Device name:** `sev_gpu@1.0`
 - **Depends-on:** `none`
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
@@ -57,9 +58,9 @@ directly. Both backends produce the same result shape.
 
 ## 3. Device interface
 
-**Dispatch shape:** explicit keys. `info/1` exports exactly `generate` and
-`verify`; every other key falls through to `message@1.0`. Neither key reads the
-base message.
+- **Dispatch shape:** explicit keys. `info/1` exports exactly `generate` and
+  `verify`, and the device installs no default handler; every other key falls
+  through to `message@1.0`. Neither key reads the base message.
 
 | Key | Request keys | Result on success |
 |---|---|---|
@@ -147,6 +148,10 @@ module and prints one line on standard error naming both files.
   5. Build the result (§5.2) and set `verified` per §5.4.
 - **Returns:** `{ok, JSON}` with the result object of §5.2. A negative
   attestation outcome is a successful resolution with `verified` false.
+- **Side effects:** one NVAT evidence collection and attestation, in the
+  NIF or as two `nvattest` runs; NVAT contacts NVIDIA's RIM and OCSP services
+  (§6). The first NIF call loads the NIF for the life of the node (§3). The
+  device writes no file and nothing to the node's store.
 
 On both backends NVAT's attestation step collects its own evidence for the
 same nonce, so the returned `evidences` and the `claims` come from two
@@ -195,6 +200,9 @@ attests the submitted evidence itself.
      claims rule (§5.4) holds for the claims NVAT returned, with the evidence
      nonce as the expected nonce.
 - **Returns:** `{ok, <<"true">>}` or `{ok, <<"false">>}`.
+- **Side effects:** unless step 1 to 3 ends the request, one NVAT appraisal,
+  which contacts NVIDIA's RIM and OCSP services (§6), and one evidence file
+  in the scratch directory, deleted after the appraisal (§7).
 
 ## 5. Data formats & encodings
 

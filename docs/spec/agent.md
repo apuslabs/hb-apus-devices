@@ -1,5 +1,6 @@
 # `agent@1.0` — tool-using agent loop over an OpenAI-compatible chat model
 
+- **Device name:** `agent@1.0`
 - **Depends-on:** `inference@1.0` (default model device), `relay@1.0` (`http_request`), `cache@1.0` (`lookup_data`), `query@1.0` (`search_messages`), `arweave@2.9` (`get_arweave_tx`), `bundler@1.0` and `ans104@1.0` (`bundle_item`, only when enabled)
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)

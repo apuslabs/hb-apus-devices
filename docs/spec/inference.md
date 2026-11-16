@@ -1,5 +1,6 @@
 # `inference@1.0` — OpenAI-compatible inference on an operator-configured model runtime
 
+- **Device name:** `inference@1.0`
 - **Depends-on:** `relay@1.0` (every HTTP call to the runtime), `sev_gpu@1.0` (default attestation device for `tee=true`; the operator may name another device that answers `generate`), `httpsig@1.0` (HyperBEAM's default ID device, which computes the message IDs and the HashPath recorded in `raw.ao-core`).
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
@@ -175,6 +176,11 @@ runtime that does not answer within them is reported as unreachable (503).
      or `Inference-Error` (error).
 - **Returns:** `{ok, Result}` on success; `{error, Result}` on an error. Both
   are HTTP-shaped unless step 7 applies.
+- **Side effects:** one outbound HTTP request to the runtime through
+  `relay@1.0`. When the runtime succeeds and `tee` is truthy, one resolution
+  of `generate` on the attestation device; for `sev_gpu@1.0` that is a GPU
+  attestation run. Nothing is written to the node's store or result cache
+  (§6).
 
 ### `chat` — route a chat request
 
@@ -183,6 +189,7 @@ runtime that does not answer within them is reported as unreachable (503).
   and `chat-mode` set to `true`, into the base message. `chat-mode` is a
   marker; no key of this device reads it.
 - **Returns:** `{ok, MergedMessage}`. Never errors.
+- **Side effects:** none.
 
 ### `v1` — route the OpenAI `/v1` prefix
 
@@ -190,6 +197,7 @@ runtime that does not answer within them is reported as unreachable (503).
 - **Behaviour:** deep-merge the request, with `device` set to
   `inference@1.0`, into the base message.
 - **Returns:** `{ok, MergedMessage}`. Never errors.
+- **Side effects:** none.
 
 ### `models` — return the runtime's model list
 
@@ -201,6 +209,8 @@ runtime that does not answer within them is reported as unreachable (503).
 - **Returns:** on a 2xx answer, `{ok, Result}` with the runtime's status,
   `content-type` (default `application/json`) and body; otherwise the error
   of §8, HTTP-shaped.
+- **Side effects:** one outbound HTTP request to the runtime through
+  `relay@1.0`.
 
 ### `health` — probe the runtime
 
@@ -212,6 +222,8 @@ runtime that does not answer within them is reported as unreachable (503).
 - **Returns:** when healthy, `{ok, #{healthy => true, runtime-status =>
   <status>, checked-at => <Unix milliseconds>}}` (served as HTTP 200);
   otherwise the error of §8, HTTP-shaped.
+- **Side effects:** one outbound HTTP request to the runtime through
+  `relay@1.0`.
 
 ## 5. Data formats & encodings
 

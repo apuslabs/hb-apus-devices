@@ -1,5 +1,6 @@
 # `inference_measurement@1.0` — GPU-aware system measurement
 
+- **Device name:** `inference_measurement@1.0`
 - **Depends-on:** `gpu_inventory@1.0` (default inventory device: `report`, `snapshot`), `sev_gpu@1.0` (default GPU TEE device: `generate`, `verify`), `measurement@1.0` (default base measurement device: `info`, `boot`, `fresh`, `verify`), `message@1.0` (signers, commitments, verification and IDs of envelopes), `httpsig@1.0` (the node's default commitment device: it signs observation envelopes and verifies their signatures), `json@1.0` and `structured@1.0` (decoding an envelope posted to `verify` as JSON text into a message)
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
@@ -64,8 +65,9 @@ labelled `host-observed` and never presented as a hardware measurement.
 
 ## 3. Device interface
 
-**Dispatch shape:** explicit keys. `info/1` exports exactly `boot`, `fresh`,
-`verify` and `snapshot`; every other key falls through to `message@1.0`.
+- **Dispatch shape:** explicit keys. `info/1` exports exactly `boot`, `fresh`,
+  `verify` and `snapshot`, and the device installs no default handler; every
+  other key falls through to `message@1.0`.
 
 | Key | Request keys | Result on success |
 |---|---|---|
@@ -131,6 +133,12 @@ select the default. Requests and base messages cannot select devices or paths.
      node's commitment device and key. If committing fails, the envelope is
      returned unsigned.
 - **Returns:** `{ok, Envelope}`.
+- **Side effects:** those of the resolved keys: `report` on the inventory
+  device, `generate` on the GPU TEE device (for `sev_gpu@1.0`, a GPU
+  attestation run), `info` on the base device in `auto` mode, and, for a
+  composed envelope, `fresh` and `verify` on the base device (for
+  `measurement@1.0`, a new SEV-SNP attestation report). Observation envelopes are signed with the node's
+  key. Nothing is written to the node's store or result cache.
 
 ### `boot` — cached host measurement with fresh GPU attestation
 
@@ -141,6 +149,9 @@ without a nonce. The GPU evidence is fresh and bound to `D`;
 `integration-mode` is `boot-measurement` and `nonce-binding-hardware-bound`
 is false, because the cached host report predates `D`. Observation
 envelopes have `purpose` `boot`.
+
+- **Side effects:** those of `fresh`, with `boot` in place of `fresh` on the
+  base device.
 
 ### `verify` — check an envelope
 
@@ -192,6 +203,10 @@ envelopes have `purpose` `boot`.
      on this node and does not affect `verified`.
   5. Any other `type` fails with status 400 and `invalid-envelope`.
 - **Returns:** `{ok, Result}`.
+- **Side effects:** those of the resolved keys: `verify` on the base device
+  for a `lapee-measurement` envelope, and `verify` on the GPU TEE device
+  when `gpu-tee` carries evidence (for `sev_gpu@1.0`, one NVAT appraisal).
+  Nothing is signed or stored.
 
 ### `snapshot` — runtime GPU values
 
@@ -201,6 +216,8 @@ envelopes have `purpose` `boot`.
   Any other result fails with status 502 and `invalid-snapshot`; an error is
   returned unchanged.
 - **Returns:** `{ok, Snapshot}`; see `gpu_inventory@1.0`.
+- **Side effects:** those of `snapshot` on the inventory device (for
+  `gpu_inventory@1.0`, one `nvidia-smi` run).
 
 All dependency resolutions run with `cache-control: no-cache, no-store`, so
 no dependency result is read from or written to the node's cache. The

@@ -1,5 +1,6 @@
 # `gpu_inventory@1.0` — host-observed GPU and PCIe inventory
 
+- **Device name:** `gpu_inventory@1.0`
 - **Depends-on:** `none`
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
@@ -47,10 +48,11 @@ into hardware-measured nonces, and `sev_gpu@1.0` attests the GPU itself.
 
 ## 3. Device interface
 
-**Dispatch shape:** explicit keys. `info/1` exports exactly `report`, `digest`
-and `snapshot`; every other key falls through to `message@1.0`. No key reads
-the base message or the request: a request cannot select the sysfs root or the
-executable.
+- **Dispatch shape:** explicit keys. `info/1` exports exactly `report`,
+  `digest` and `snapshot`, and the device installs no default handler; every
+  other key falls through to `message@1.0`.
+- **Inputs:** no key reads the base message or the request: a request cannot
+  select the sysfs root or the executable.
 
 | Key | Result on success |
 |---|---|
@@ -113,6 +115,11 @@ reported in `errors`.
 | `inventory-digest` | §5.3. |
 | `errors` | Source errors, as text. |
 
+- **Side effects:** reads the sysfs tree and runs `nvidia-smi` at most once;
+  a request served by a reused report or by a collection in progress does
+  neither (§6). On first use, starts the node's collection coordinator
+  (§6). No network access and no store writes.
+
 ### `digest` — the inventory digest
 
 - **Reads:** node options only.
@@ -120,6 +127,7 @@ reported in `errors`.
   and return its `inventory-digest`.
 - **Returns:** `{ok, #{type => apus-gpu-inventory-digest, version => 1.0,
   inventory-digest => <digest>, provenance-class => host-observed}}`.
+- **Side effects:** those of `report`.
 
 ### `snapshot` — volatile runtime values
 
@@ -132,6 +140,9 @@ reported in `errors`.
 - **Returns:** `{ok, Snapshot}` with `type` = `apus-gpu-runtime-snapshot`,
   `version`, `collected-at-unix`, `provenance` = `{class: "runtime-observed",
   sources}`, `supported` (at least one row), `devices` and `errors`.
+- **Side effects:** runs `nvidia-smi` once, unless the request joins a
+  collection in progress. On first use, starts the node's collection
+  coordinator (§6). No network access and no store writes.
 
 ## 5. Data formats & encodings
 

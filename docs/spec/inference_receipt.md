@@ -1,5 +1,6 @@
 # `inference_receipt@1.0` — signed, HashPath-verifiable receipts for `inference@1.0` completions
 
+- **Device name:** `inference_receipt@1.0`
 - **Depends-on:** `inference@1.0` (the recorded completion step, `models`, `health`), `gpu_inventory@1.0` (`report`), `inference_measurement@1.0` (`fresh`), `bundler@1.0` (`item`, for `publish`), `ans104@1.0` (commitment device for published data items), `httpsig@1.0` (HyperBEAM's default commitment device, which commits `signed-receipt`, and default ID device, which computes the message IDs and HashPaths in `ao-core`).
 - **Status:** Stable
 - **Maintainer:** Apus Network (https://apus.network)
@@ -150,6 +151,12 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      `receipt` key holding the receipt message. A response that is not a
      message is returned unchanged.
 - **Returns:** `{ok, Response}`; `{error, Error}` from step 2 or step 3.
+- **Side effects:** those of the resolved keys: `inference@1.0`
+  `completions` (a runtime request and, with `tee`, an attestation),
+  `gpu_inventory@1.0` `report` and `inference_measurement@1.0` `fresh` (a
+  fresh host measurement and GPU attestation). The receipt is signed with
+  the node's identity. Nothing is written to the node's store or result
+  cache (§6), and nothing is published.
 
 ### `chat` — route a chat request
 
@@ -158,12 +165,14 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
   `inference_receipt@1.0` and `chat-mode` set to `true`, into the base
   message.
 - **Returns:** `{ok, MergedMessage}`. Never errors.
+- **Side effects:** none.
 
 ### `v1` — route the OpenAI `/v1` prefix
 
 - **Reads:** the base message and the request.
 - **Behaviour:** identical to `chat`.
 - **Returns:** `{ok, MergedMessage}`. Never errors.
+- **Side effects:** none.
 
 ### `models` — model list without a receipt
 
@@ -171,6 +180,7 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 - **Behaviour:** resolve `inference@1.0` with `path: models` and the node
   options.
 - **Returns:** the `inference@1.0` result, unchanged.
+- **Side effects:** those of `inference@1.0` `models`: one runtime request.
 
 ### `health` — runtime health without a receipt
 
@@ -178,6 +188,7 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
 - **Behaviour:** resolve `inference@1.0` with `path: health` and the node
   options.
 - **Returns:** the `inference@1.0` result, unchanged.
+- **Side effects:** those of `inference@1.0` `health`: one runtime request.
 
 ### `verify-hashpath` — recompute a recorded HashPath
 
@@ -225,6 +236,8 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
   `hashpath-chain-mismatch` or `hashpath-not-captured` (nothing recorded;
   `recomputed-hashpath` is then informational). Unusable input returns an
   error result (§8).
+- **Side effects:** none. Posted values are never resolved through a
+  device.
 
 ### `publish` — store a receipt that names this node as an ANS-104 data item
 
@@ -274,8 +287,9 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      the document's bytes, unchanged.
 - **Returns:** `{ok, #{id, bundle-id, bundle-status => complete, body =>
   BundlerResponse}}` (served as HTTP 200), or the errors of §8.
-- **Side effects:** signs a data item and spends the publication wallet's
-  funds on its upload.
+- **Side effects:** signs a data item with the publication wallet and
+  submits it to `bundler@1.0`, which posts it to Arweave permanently and
+  spends the publication wallet's funds on the upload.
 
 ## 5. Data formats & encodings
 

@@ -24,7 +24,12 @@ message that carries its BEAM archive.
 | `agent@1.0` | `dev_agent` | ReAct agent loop over `inference@1.0` with built-in AO-Core tools | [agent.md](docs/spec/agent.md) |
 
 Each specification is the normative description of its device: keys,
-request and response formats, node options, errors and security model.
+request and response formats, node options, errors and security model. The
+specifications follow the layout of HyperBEAM's own device specifications
+([`specs/`](https://github.com/permaweb/HyperBEAM/tree/edge/specs) in
+`permaweb/HyperBEAM`): a header with the device name and its dependencies,
+eleven numbered sections from Overview to Out of scope, and, for every key,
+what it reads, how it behaves, what it returns and its side effects.
 
 ## How the devices compose
 
