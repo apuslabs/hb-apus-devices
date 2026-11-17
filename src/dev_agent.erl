@@ -1070,7 +1070,7 @@ http_request(Args, Device, Opts) ->
                 #{ <<"device">> => Device },
                 #{
                     <<"path">> => <<"call">>,
-                    <<"target">> => <<"payload">>,
+                    <<"relay-subject">> => <<"payload">>,
                     <<"payload">> => Payload
                 },
                 no_cache(Opts)
@@ -2500,6 +2500,24 @@ http_request_refuses_non_public_hosts_test() ->
     [_, Second] = model_requests(Table),
     [Content] = tool_contents(maps:get(<<"messages">>, Second)),
     ?assert(contains(Content, <<"special-use address">>)).
+
+%% `http_request' reaches the URL through `relay@1.0', which relays the
+%% message under `relay-subject' and applies the node's host policy: an
+%% internal host stays blocked unless the node allows internal hosts, even
+%% with `agent-http-allow-private'.
+http_request_relays_under_the_node_host_policy_test() ->
+    {ok, URL, Handle} = hb_mock_server:start([{"/data", data, {200, <<"relayed">>}}]),
+    try
+        Args = #{ <<"url">> => <<URL/binary, "/data">> },
+        Private = #{ <<"agent-http-allow-private">> => true },
+        {ok, Text} = http_request(Args, <<"relay@1.0">>,
+            Private#{ <<"hosts-block-internal">> => false }),
+        ?assert(contains(Text, <<"status: 200">>)),
+        ?assert(contains(Text, <<"relayed">>)),
+        ?assertNotMatch({ok, _}, http_request(Args, <<"relay@1.0">>, Private))
+    after
+        hb_mock_server:stop(Handle)
+    end.
 
 http_request_body_and_method_test() ->
     Calls = [

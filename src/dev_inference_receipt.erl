@@ -289,11 +289,11 @@ json_type(string, Value) -> is_binary(Value) andalso Value =/= <<>>;
 json_type(object, Value) -> is_map(Value).
 
 %% The address of the node's identity wallet, which signs `signed-receipt'.
+%% HyperBEAM keeps the node's `priv-wallet' out of the options that a request
+%% executes with and gives its `address' there instead; `hb_opts:address/1'
+%% reads either.
 node_address(Opts) ->
-    case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
-        no_viable_wallet -> undefined;
-        Wallet -> hb_util:human_id(ar_wallet:to_address(Wallet))
-    end.
+    hb_opts:address(Opts).
 
 %% An error result that HyperBEAM serves as `Status' with a JSON body. A
 %% `reason' that has no JSON encoding is left out.
@@ -319,12 +319,13 @@ authorized_publisher(Req, Opts) ->
                 true -> <<"receipt">>;
                 false -> <<"body">>
             end,
+            AllowedURIs = [hb_committer:uri(Entry) || Entry <- Allowed],
             lists:any(
                 fun(Signer) ->
-                    lists:member(Signer, Allowed) andalso
-                        signed_by(Signer, Key, Req, Opts)
+                    lists:member(hb_committer:uri(Signer), AllowedURIs)
+                        andalso signed_by(Signer, Key, Req, Opts)
                 end,
-                safe_signers(Req, Opts)
+                committer_uris(Req, Opts)
             );
         _ -> false
     end.
@@ -425,7 +426,7 @@ verify_hashpath(_Base, Req, Opts) ->
     case verification_messages(TermInput, Input, Opts) of
         {ok, Base, Request, Response, Rest} ->
             try
-                Recomputed = hb_path:hashpath(Base, Request, Opts),
+                Recomputed = recompute_hashpath(Base, Request, Response, Opts),
                 Recorded = recorded_hashpaths(Sections, Response, Opts),
                 ChainVerified = Rest == [] orelse
                     hb_path:verify_hashpath([Request, Response | Rest], Opts),
@@ -527,20 +528,22 @@ recorded_hashpaths(Sections, Response, Opts) ->
 %% A receipt with no recorded HashPath (`ao-core.status=not-captured') has
 %% nothing to compare against, so it is reported as unverified rather than
 %% compared with an unrelated value such as the response ID.
-hashpath_result(Recomputed, [], _ChainVerified) ->
+hashpath_result({_Step, Claim}, [], _ChainVerified) ->
     #{
         <<"verified">> => false,
         <<"reason">> => <<"hashpath-not-captured">>,
-        <<"recomputed-hashpath">> => Recomputed
+        <<"recomputed-hashpath">> => Claim
     };
-hashpath_result(Recomputed, [{_, Expected} | _] = Recorded, ChainVerified) ->
-    Matches = lists:all(fun({_, Hashpath}) -> Hashpath =:= Recomputed end,
+hashpath_result({_Step, Claim} = Recomputed, [{_, Expected} | _] = Recorded,
+        ChainVerified) ->
+    Matches = lists:all(
+        fun({_, Hashpath}) -> hashpath_matches(Hashpath, Recomputed) end,
         Recorded),
     Result = #{
         <<"verified">> => Matches andalso ChainVerified,
         <<"expected-hashpath">> => Expected,
         <<"hashpath-sources">> => [Source || {Source, _} <- Recorded],
-        <<"recomputed-hashpath">> => Recomputed
+        <<"recomputed-hashpath">> => Claim
     },
     case {Matches, ChainVerified} of
         {true, true} -> Result;
@@ -785,19 +788,47 @@ ao_core_evidence(Base, Req, Response, Opts) ->
         <<"verification-input-term">> =>
             transcript_term(#{base => Base, request => Req, response => Response}),
         <<"verification-status">> =>
-            hashpath_verification(Base, Req, Hashpath, Opts)
+            hashpath_verification(Base, Req, Response, Hashpath, Opts)
     }.
 
 %% Compare against the captured HashPath, as verify-hashpath does. The
 %% response's private copy may be absent when the value came from the
 %% inference device's public evidence.
-hashpath_verification(_Base, _Req, undefined, _Opts) -> <<"not-captured">>;
-hashpath_verification(Base, Req, Hashpath, Opts) ->
-    case catch hb_path:hashpath(Base, Req, Opts) of
-        Hashpath -> <<"verified">>;
-        Other when is_binary(Other) -> <<"failed">>;
-        _ -> <<"unavailable">>
+hashpath_verification(_Base, _Req, _Response, undefined, _Opts) ->
+    <<"not-captured">>;
+hashpath_verification(Base, Req, Response, Hashpath, Opts) ->
+    try recompute_hashpath(Base, Req, Response, Opts) of
+        Recomputed ->
+            case hashpath_matches(Hashpath, Recomputed) of
+                true -> <<"verified">>;
+                false -> <<"failed">>
+            end
+    catch _:_ -> <<"unavailable">>
     end.
+
+%% @doc Recompute the HashPath of a recorded step in the form AO-Core records
+%% it (`hb_hashpath'): `Step' is `ao:<base>/<request>', the step itself, and
+%% `Claim' is `Step' followed by `.<ID>' of the response, the claim that
+%% executing the request on the base gave that response. A response without
+%% an ID gives no claim, and `Claim' is `Step'.
+recompute_hashpath(Base, Request, Response, Opts) ->
+    Step = hb_hashpath:format(
+        #{<<"base">> => Base, <<"request">> => Request}, Opts),
+    Claim =
+        try hb_hashpath:format(#{
+            <<"base">> => Base,
+            <<"request">> => Request,
+            <<"varied-result">> => Response
+        }, Opts)
+        catch _:_ -> Step
+        end,
+    {Step, Claim}.
+
+%% @doc A recorded HashPath matches the transcript when it is the recomputed
+%% claim, which AO-Core assigns to the response, or the step alone, which
+%% `inference@1.0' exposes in its response before that response exists.
+hashpath_matches(Recorded, {Step, Claim}) ->
+    is_binary(Recorded) andalso (Recorded =:= Claim orelse Recorded =:= Step).
 
 %% The inference device can expose the AO-Core link in its JSON response
 %% (inside `attestation.raw' for `tee=true'). It is used when the response
@@ -842,7 +873,15 @@ commitment_device(Response, Opts) ->
         _ -> undefined
     end.
 
+%% The signers of a message as receipts publish them: the Arweave address of
+%% an Arweave key, else the committer's URI. HyperBEAM gives every signer as
+%% the URI of its committer (`uri-did-ar-...' for an Arweave key), so the
+%% address is read back from it.
 safe_signers(Message, Opts) ->
+    [hb_util:committer_address(Signer) || Signer <- committer_uris(Message, Opts)].
+
+%% The signers of a message as HyperBEAM gives them: committer URIs.
+committer_uris(Message, Opts) ->
     case catch hb_message:signers(Message, Opts) of
         Signers when is_list(Signers) -> Signers;
         _ -> []
@@ -1196,10 +1235,13 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
                 maps:without([<<"signed-receipt">>], JsonReceipt)),
             %% `inference@1.0' publishes in `raw' the HashPath of the step
             %% AO-Core executed: the executed request carries no client
-            %% metadata.
+            %% metadata. AO-Core records that step followed by `.<ID>' of
+            %% its result, which `raw' is part of.
             #{<<"ao-core">> := RawAOCore} = hb_json:decode(Raw),
-            ?assertEqual(maps:get(<<"hashpath">>, AOCore),
-                maps:get(<<"hashpath">>, RawAOCore)),
+            RawHashpath = maps:get(<<"hashpath">>, RawAOCore),
+            ?assertMatch(<<RawHashpath:(byte_size(RawHashpath))/binary, ".",
+                    _:43/binary>>,
+                maps:get(<<"hashpath">>, AOCore)),
             ?assertEqual(maps:get(<<"request-id">>, AOCore),
                 maps:get(<<"request-id">>, RawAOCore)),
             %% `publish' accepts this receipt, bare or inside a publication
@@ -1458,10 +1500,11 @@ probes_carry_only_a_path_and_the_request_digest_test() ->
             #{<<"path">> => <<"fresh">>, <<"nonce">> => <<"digest">>}},
         measurement_probe(<<"digest">>)).
 
-%% `Signed' verifies and `Address' is its only signer.
+%% `Signed' verifies and `Address' is its only signer. HyperBEAM names the
+%% signer by its committer URI; the receipt publishes the Arweave address.
 assert_signed_by(Address, Signed, Opts) ->
     ?assert(hb_message:verify(Signed, all, Opts)),
-    ?assertEqual([Address], hb_message:signers(Signed, Opts)).
+    ?assertEqual([Address], safe_signers(Signed, Opts)).
 
 %% The wire contract seen by HTTP clients: plain and attested completions,
 %% streaming refusal, health, the model list, a receipt and its HashPath
@@ -1800,8 +1843,12 @@ v1_route_keeps_receipt_device_test() ->
 verify_hashpath_checks_base_and_request_test() ->
     Base = #{<<"body">> => <<"original base">>},
     Request = #{<<"path">> => <<"echo">>, <<"body">> => <<"request">>},
-    Response = #{<<"body">> => <<"response">>,
-        <<"priv">> => #{<<"hashpath">> => hb_path:hashpath(Base, Request, #{})}},
+    Executed = #{<<"body">> => <<"response">>},
+    %% The HashPath that AO-Core's resolver assigns to this result.
+    {Hashpath, _} = hb_hashpath:generate(Base, Request, Executed,
+        Base, Request, Executed, undefined,
+        #{<<"cache-control">> => [<<"no-store">>]}),
+    Response = Executed#{<<"priv">> => #{<<"hashpath">> => Hashpath}},
     Verify = fun(B, R) ->
         Term = hb_util:encode(term_to_binary(
             #{base => B, request => R, response => Response})),
@@ -1906,8 +1953,14 @@ digest_is_canonical_for_objects_of_any_size_test() ->
 %% Transcript recorded on the reference deployment on 2026-10-12 by
 %% HyperBEAM 28baa3d2 (`ao-core.status=captured'). The HashPath is specific to
 %% the pinned HyperBEAM version.
--define(CAPTURED_HASHPATH, <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
-    "hDjPRer0jfXtHMDhJIRBozzWusYX6-sed0_5HEH2NFk">>).
+%% The HashPath that HyperBEAM v0.11 assigns to the captured step: the step
+%% `ao:<base>/<request>' (`?CAPTURED_STEP_HASHPATH', as `inference@1.0'
+%% exposes it) followed by `.<ID>' of the captured response.
+%% `captured_hashpath_is_what_the_resolver_assigns_test' checks it.
+-define(CAPTURED_STEP_HASHPATH, <<"ao:~inference@1.0/"
+    "ao:lkx_xmGBUw0nIrcQG4TWc3hCq-NAm5D9l_nGsH_DR48">>).
+-define(CAPTURED_HASHPATH, <<?CAPTURED_STEP_HASHPATH/binary,
+    ".ChMHODRUOnf2Gkotz6S2eoO_BSQerEvuFCutyTh94JU">>).
 
 captured_transcript() ->
     #{
@@ -1958,6 +2011,17 @@ verify_http(Msg) ->
         verify_hashpath(#{}, http_request(Msg), #{}),
     Result.
 
+%% The fixture is the HashPath that AO-Core's resolver assigns to the
+%% captured step and response.
+captured_hashpath_is_what_the_resolver_assigns_test() ->
+    #{<<"base">> := Base, <<"request">> := Request,
+        <<"response">> := Response} = captured_transcript(),
+    Result = maps:remove(<<"priv">>, Response),
+    {Hashpath, _} = hb_hashpath:generate(Base, Request, Result,
+        Base, Request, Result, undefined,
+        #{<<"cache-control">> => [<<"no-store">>]}),
+    ?assertEqual(?CAPTURED_HASHPATH, Hashpath).
+
 verify_hashpath_accepts_captured_receipt_test() ->
     AOCore = #{
         <<"status">> => <<"captured">>,
@@ -1981,6 +2045,15 @@ verify_hashpath_accepts_captured_receipt_test() ->
             <<"request">> => Request#{<<"max_tokens">> => 9}}}}),
     ?assertEqual(false, maps:get(<<"verified">>, Tampered)),
     ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, Tampered)),
+    %% The step alone, as `inference@1.0' exposes it, matches; a claim that
+    %% the step gave another response does not.
+    ?assertEqual(true, maps:get(<<"verified">>, verify_http(#{<<"ao-core">> =>
+        AOCore#{<<"hashpath">> => ?CAPTURED_STEP_HASHPATH}}))),
+    OtherResult = verify_http(#{<<"ao-core">> => AOCore#{<<"hashpath">> =>
+        <<?CAPTURED_STEP_HASHPATH/binary, ".",
+            (hb_util:encode(crypto:strong_rand_bytes(32)))/binary>>}}),
+    ?assertEqual(false, maps:get(<<"verified">>, OtherResult)),
+    ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, OtherResult)),
     %% The response's private HashPath does not survive HTTP, so the
     %% transcript alone carries nothing to compare with.
     Bare = verify_http(#{<<"verification-input">> => captured_transcript()}),
@@ -2032,7 +2105,7 @@ receipt_verification_status_uses_captured_hashpath_test() ->
             hb_json:encode(#{<<"ao-core">> => Evidence})}
     end,
     Captured = ao_core_evidence(Base, Request,
-        Response(#{<<"hashpath">> => ?CAPTURED_HASHPATH}), #{}),
+        Response(#{<<"hashpath">> => ?CAPTURED_STEP_HASHPATH}), #{}),
     ?assertEqual(<<"captured">>, maps:get(<<"status">>, Captured)),
     ?assertEqual(<<"verified">>, maps:get(<<"verification-status">>, Captured)),
     ?assertEqual(true, maps:get(<<"verified">>, verify_http(

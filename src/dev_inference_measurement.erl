@@ -517,7 +517,7 @@ verify_observation(Envelope, Opts) ->
     #{
         <<"verified">> => SignatureVerified andalso BindingVerified,
         <<"signature-verified">> => SignatureVerified,
-        <<"signers">> => Signers,
+        <<"signers">> => [hb_util:committer_address(Signer) || Signer <- Signers],
         <<"nonce-binding-verified">> => BindingVerified,
         <<"gpu-tee-verified">> => gpu_evidence_verified(GpuTee, Opts),
         <<"observation-id">> => message_id(Observed, signed, Opts),
@@ -1165,8 +1165,10 @@ observation_as_served_verifies_test() ->
     ?assertEqual(hb_message:id(Envelope, signed, Opts),
         maps:get(<<"observation-id">>, Expected)),
     Served = as_served(Envelope, Opts),
-    ?assertEqual([node_address(Opts), node_address(Opts)],
-        hb_message:signers(Served, Opts)),
+    %% HyperBEAM names each signer by its committer URI, once per committer.
+    ?assertEqual([node_address(Opts)],
+        lists:usort([hb_util:committer_address(Signer)
+            || Signer <- hb_message:signers(Served, Opts)])),
     JSON = hb_message:convert(Served, <<"json@1.0">>, Opts),
     ?assertMatch(#{ <<"status">> := 200, <<"hashpath">> := _ }, hb_json:decode(JSON)),
     lists:foreach(
@@ -1244,7 +1246,9 @@ observation_http_round_trip_test_() ->
             {Node ++ "~inference_measurement@1.0/fresh?nonce=http-1"
                     "&measurement-mode=observation-only", Accept},
             [{timeout, 30000}], [{body_format, binary}]),
-        ?assertMatch(#{ <<"status">> := 200, <<"hashpath">> := _ }, hb_json:decode(Served)),
+        %% The serving node adds `hashpath' (HyperBEAM v0.11 no longer adds
+        %% a `status' key to the result).
+        ?assertMatch(#{ <<"hashpath">> := _ }, hb_json:decode(Served)),
         PostAs = fun(ContentType, Body) ->
             {ok, {{_, 200, _}, _, Reply}} = httpc:request(post,
                 {Node ++ "~inference_measurement@1.0/verify", Accept, ContentType, Body},

@@ -308,10 +308,10 @@ runtime_call(Method, Peer, Path, Body, Opts) ->
             #{<<"device">> => <<"relay@1.0">>, <<"peer">> => Peer},
             #{
                 <<"path">> => <<"call">>,
-                <<"target">> => <<"payload">>,
+                <<"relay-subject">> => <<"payload">>,
                 <<"payload">> => Request
             },
-            relay_opts(Opts)
+            relay_opts(Peer, Opts)
         )
     catch Class:Reason ->
         {error, {Class, Reason}}
@@ -376,11 +376,23 @@ auxiliary_opts(Opts) ->
 %% Runtime calls use the node's general HTTP client (`http-client', default
 %% `hackney') and therefore its connect and receive timeouts, rather than
 %% `relay@1.0''s own client setting.
-relay_opts(Opts) ->
+%%
+%% HyperBEAM v0.11 vets every outbound host and blocks internal addresses by
+%% default (`hosts-block-internal'). The runtime is usually on loopback, so
+%% this one call may reach exactly the configured peer's host, and nothing
+%% else: callers never choose the peer.
+relay_opts(Peer, Opts) ->
+    {ok, Host} = peer_host(Peer),
     (auxiliary_opts(Opts))#{
         <<"relay-http-client">> =>
-            hb_opts:get(<<"http-client">>, hackney, Opts)
+            hb_opts:get(<<"http-client">>, hackney, Opts),
+        <<"hosts-block-internal">> => false,
+        <<"hosts-allowed">> => [Host]
     }.
+
+peer_host(Peer) ->
+    #{host := Host} = uri_string:parse(Peer),
+    {ok, string:lowercase(hb_util:bin(Host))}.
 
 %% Classify a `relay@1.0' result as a 2xx runtime response, a runtime error
 %% response (status passed through) or a transport failure (503).
@@ -587,7 +599,7 @@ ao_core_evidence(Req, Response, Opts) ->
         try public_step_request(Req, Opts) of
             StepReq ->
                 {
-                    try hb_path:hashpath(?STEP_BASE, StepReq, Opts)
+                    try step_hashpath(StepReq, Opts)
                     catch _:_ -> undefined
                     end,
                     safe_message_id(StepReq, Opts)
@@ -609,6 +621,14 @@ ao_core_evidence(Req, Response, Opts) ->
             <<"verification-status">> => <<"captured">>
         }
     ).
+
+%% @doc The HashPath of the public step in the form AO-Core records it
+%% (`hb_hashpath'): `ao:<base>/<request>'. AO-Core assigns the executed step
+%% this HashPath followed by `.<ID>' of its result, which does not exist yet
+%% while the result is being built.
+step_hashpath(StepReq, Opts) ->
+    hb_hashpath:format(
+        #{<<"base">> => ?STEP_BASE, <<"request">> => StepReq}, Opts).
 
 %% @doc The public step request: the step keys found in a JSON object (or
 %% map) `body', overridden by the step keys on the request, with private keys
@@ -908,13 +928,22 @@ ao_core_evidence_excludes_client_metadata_test() ->
     ?assertEqual(RawEvidence(request_with_client_metadata()), RawEvidence(Other)).
 
 %% Values that cannot be computed are omitted, never published as text.
+%% The public step must be loaded to be hashed, so a step that refers to data
+%% the node does not hold has no HashPath and no request ID. HyperBEAM computes
+%% a message ID over unloaded links (equal to the ID of the loaded message), so
+%% the response ID stays computable; when given, it is a message ID.
 ao_core_evidence_omits_unknown_values_test() ->
     Missing = {link, hb_util:encode(crypto:strong_rand_bytes(32)), #{}},
+    Opts = #{<<"store">> => hb_test_utils:test_store()},
     Evidence = ao_core_evidence(#{<<"messages">> => Missing},
-        #{<<"body">> => Missing}, #{<<"store">> => hb_test_utils:test_store()}),
+        #{<<"body">> => Missing}, Opts),
     ?assertEqual(<<"not-captured">>, maps:get(<<"status">>, Evidence)),
-    ?assertEqual([], [Key || Key <- [<<"hashpath">>, <<"request-id">>,
-        <<"response-id">>], maps:is_key(Key, Evidence)]),
+    ?assertEqual([], [Key || Key <- [<<"hashpath">>, <<"request-id">>],
+        maps:is_key(Key, Evidence)]),
+    case maps:find(<<"response-id">>, Evidence) of
+        {ok, ResponseID} -> ?assert(hb_util:is_human_id(ResponseID));
+        error -> ok
+    end,
     ?assertEqual(nomatch,
         binary:match(hb_json:encode(Evidence), <<"undefined">>)).
 
@@ -1071,6 +1100,16 @@ runtime_error_status_is_passed_through_test_() ->
                 ?assertEqual(503, maps:get(<<"status">>, Health))
             end)
     end}.
+
+%% The runtime call may reach the configured peer's host, which is usually
+%% internal, and no other host; the node's own policy is unchanged.
+relay_policy_admits_only_the_peer_host_test() ->
+    Opts = relay_opts(<<"http://127.0.0.1:30001">>, #{}),
+    ?assertNot(hb_hostname:is_blocked(<<"http://127.0.0.1:30001/v1/x">>, Opts)),
+    ?assert(hb_hostname:is_blocked(<<"http://localhost:8734/">>, Opts)),
+    ?assert(hb_hostname:is_blocked(<<"http://10.0.0.1/">>, Opts)),
+    ?assert(hb_hostname:is_blocked(<<"https://example.com/">>, Opts)),
+    ?assert(hb_hostname:is_blocked(<<"http://127.0.0.1:30001/">>, #{})).
 
 retry_after_is_preserved_test() ->
     Res = #{<<"status">> => 429, <<"retry-after">> => <<"7">>,
