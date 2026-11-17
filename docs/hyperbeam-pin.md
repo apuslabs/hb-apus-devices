@@ -15,10 +15,14 @@ of the public node**, not an ordinary dependency bump.
 | Field | Value |
 |---|---|
 | Repository | `permaweb/HyperBEAM` |
-| Commit | `1aebe74afd88f5fa35b188a16bd10aac04c4541e` |
-| Branch | `cookbook/schema-vary` (tip as of 2026-09-10) |
+| Commit | `80a72735230882643f1ca9afe4e18af57ac065db` |
+| Tag | `v0.11` (merge of `lead/v0.11-security-work` into `release/v0.11`) |
 
-Previously the pin was `apuslabs/HyperBEAM@28baa3d`, a merge of upstream
+The six device suites pass against it (178/178, 2026-11-18). The public node
+still runs the previous pin, `1aebe74a` on `cookbook/schema-vary`, until the
+guest is upgraded (see "Before changing it" and "Moving to v0.11").
+
+Before `1aebe74a` the pin was `apuslabs/HyperBEAM@28baa3d`, a merge of upstream
 `cookbook/schema-vary` and upstream `edge` at `2c03978a`. That fork is archived
 and must not gain new commits. The two commits produce the same code for every
 path the devices exercise; the merge existed only because no upstream branch
@@ -48,6 +52,41 @@ carried by `edge`: copycat weave offsets, the match-index `cache-write` hook,
 and serving arbitrary LMDB 1.0 files through `hb_store_arlmdb`. The node's
 `config.flat` selects none of these.
 
+## Moving to v0.11
+
+Measured on 2026-11-18 with fresh dependencies (`rebar.lock` regenerated;
+check `git -C _build/default/lib/hb rev-parse HEAD`, a stale lock silently
+tests the old pin): before the device changes 154 of 175 tests passed. Three
+kernel changes needed device changes; the suites now pass 178/178, with three
+added tests: the runtime host admission, the `http_request` relay, and the
+resolver's HashPath of the captured receipt fixture.
+
+- **Host policy.** `hb_hostname` vets every host `relay@1.0` reaches,
+  including a `peer` the call gives, against `hosts-allowed` and
+  `hosts-block-internal` (default `true`). The pre-v0.11 names
+  `relay-block-internal` and `relay-allowed-hosts` are no longer read.
+  `inference@1.0` admits only the `inference-peer` host, for its runtime
+  calls only; the node's policy is unchanged for every other relay call.
+  `relay@1.0` reads the relayed message from `relay-subject` (it was
+  `target`): `inference@1.0` and the `agent@1.0` `http_request` tool now use
+  that key.
+- **Committers.** `hb_message:signers/2` and commitment `committer` values are
+  committer URIs (`uri-did-ar-…` for an Arweave key, see `hb_committer`),
+  once per committer. Receipts and observation verification still publish
+  Arweave addresses (`hb_util:committer_address/1`); `receipt-publishers`
+  accepts addresses or URIs. Request options no longer carry the node's
+  `priv-wallet`; the receipt device reads the node address with
+  `hb_opts:address/1`.
+- **HashPaths.** AO-Core records `hb_hashpath` claims such as
+  `ao:~inference@1.0/ao:<request ID>.<result ID>`, and message IDs differ
+  from the previous kernel's for the same message. `inference@1.0` exposes
+  the step `ao:~inference@1.0/ao:<request ID>`; `verify-hashpath` and
+  `verification-status` accept the recomputed claim or the step. HashPaths
+  recorded by a node on the previous kernel do not recompute on v0.11 and
+  report `hashpath-mismatch`.
+- **Replies.** The node no longer adds `status` to a result message, so a
+  JSON reply has no top-level `status` key.
+
 ## Before changing it
 
 1. Run `make test`. The expectation is 175/175. Any failure here is a signal
@@ -67,6 +106,8 @@ and serving arbitrary LMDB 1.0 files through `hb_store_arlmdb`. The node's
 
 - 2026-10-12 — pinned to the merge `28baa3d` to get `vary` plus the `edge`
   store work in one build.
+- 2026-11-18 — branch `test/hb-v0.11` moves the pin to upstream tag `v0.11`
+  (`80a7273`) with the device changes above. Not yet on the public node.
 - 2026-10-19 — `apuslabs/HyperBEAM` archived (HyperBEAM is a core, devices are
   extensions; APUS no longer patches it). Pin moved to the upstream branch that
   passes the device suite, so the dependency no longer points at a repository

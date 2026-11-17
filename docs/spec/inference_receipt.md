@@ -55,9 +55,10 @@ in confidential-computing mode.
   `inference@1.0` and is recorded (§4, `completions`).
 - **Recorded step:** the resolution of the base message
   `{"device": "inference@1.0"}` with the executed request.
-- **HashPath:** the AO-Core identifier that commits to a step's base message
-  and request (`hb_path:hashpath/3`). AO-Core places it in the response's
-  private `hashpath`.
+- **HashPath:** the AO-Core claim of a step, in the form `hb_hashpath`
+  writes: `ao:<base>/<request>` (the step), followed by `.<ID>` of the result
+  (the claim that executing the request on the base gave that result).
+  AO-Core places it in the response's private `hashpath`.
 - **Transcript:** the recorded step's base message, executed request and
   response.
 - **Truthy:** the values `true`, `"true"`, `"1"` and `1`.
@@ -221,7 +222,9 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      Otherwise the transcript is `verification-input` with `base`,
      `request`, `response` and optional `rest`, whose link objects are
      restored to AO-Core links.
-  2. Recompute the HashPath from `base` and `request`.
+  2. Recompute the HashPath from `base`, `request` and `response`: the step
+     `ao:<base>/<request>` and the claim, the step followed by `.<ID>` of
+     `response`. `recomputed-hashpath` is the claim.
   3. Collect the recorded values: `ao-core.hashpath`, and the response's
      private `hashpath` when the transcript arrived as
      `verification-input-term` (HTTP requests cannot carry private keys).
@@ -231,7 +234,8 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
   `verified`, `recomputed-hashpath` and, when a value was recorded,
   `expected-hashpath` (the first recorded value) and `hashpath-sources`
   (`ao-core.hashpath`, `response.priv.hashpath`). `verified` is `true`
-  exactly when every recorded value equals the recomputed HashPath and the
+  exactly when every recorded value equals the recomputed claim, or the step
+  alone (as `inference@1.0` exposes it before its response exists), and the
   chain check (if any) holds. Otherwise `reason` is `hashpath-mismatch`,
   `hashpath-chain-mismatch` or `hashpath-not-captured` (nothing recorded;
   `recomputed-hashpath` is then informational). Unusable input returns an
@@ -356,10 +360,10 @@ of its fields is defined by `inference_measurement@1.0`.
 | `source` | The `source` of the evidence `inference@1.0` exposed, else `HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)`. Both name the AO-Core stage whose function, `hb_path:hashpath/3`, computes the HashPath. |
 | `hashpath-algorithm` | The recorded base message's `hashpath-alg`, which AO-Core uses to chain the HashPath, else `sha-256-chain (AO-Core default)`. The recorded base `{"device": "inference@1.0"}` names none. |
 | `request-id`, `response-id` | Unsigned message IDs of the executed request and of the response. |
-| `commitment-device`, `signers` | Commitment device and signers of the response (an unsigned response has none). |
+| `commitment-device`, `signers` | Commitment device and signers of the response (an unsigned response has none). A signer with an Arweave key is given by its address; any other by the URI of its committer. |
 | `verification-input` | The transcript: `base`, `request`, `response`. |
 | `verification-input-term` | The same transcript as an uncompressed Erlang external term, unpadded base64url, which preserves private keys. Omitted when the term is larger than 1 MiB (1,048,576 bytes), the limit of `verify-hashpath`. |
-| `verification-status` | `verified` or `failed` when the recomputed HashPath equals or differs from `hashpath`; `unavailable` when it cannot be recomputed; `not-captured` when nothing was recorded. |
+| `verification-status` | `verified` or `failed` when `hashpath` matches or does not match the transcript, as `verify-hashpath` compares them; `unavailable` when it cannot be recomputed; `not-captured` when nothing was recorded. |
 
 **JSON form.** The receipt is built in its JSON form before it is committed:
 absent values are removed, AO-Core links become `{"id", "type": "link",

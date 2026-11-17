@@ -319,10 +319,9 @@ Request `accept: application/json` and `accept-bundle: true` to receive an
 envelope as one JSON object with nested objects inline. Booleans are rendered
 as `"true"` and `"false"`, typed through `ao-types`.
 
-The serving node adds top-level `status` and `hashpath` keys and
-commitments of its own, including a commitment signed with its key that
-covers `hashpath` alone; the node's address therefore appears twice among
-the object's committers. None of these is an observation commitment or
+The serving node adds a top-level `hashpath` key and commitments of its
+own, including a commitment signed with its key that covers `hashpath`
+alone; the node's address therefore signs two of the object's commitments. None of these is an observation commitment or
 covered by one, so `verify` accepts the object exactly as received: it
 reports the node in `signers` once and the same `observation-id` as for the
 envelope `fresh` returned.
@@ -384,7 +383,8 @@ itself, so with that content type send `{"body": "<the JSON text>"}`.
   GPU claim set is acceptable is policy that belongs to the verifier.
 - For an observation envelope only observation commitments count:
   `signature-verified` is true when all of them verify, whoever signed
-  them, and `signers` lists their committers. The node's commitment over
+  them, and `signers` lists their committers (the address of an Arweave
+  key, else the committer's URI). The node's commitment over
   `hashpath` alone is not an observation commitment, so on its own it never
   makes its committer a signer. A verifier MUST check that `signers`
   contains the address of the node it expects.

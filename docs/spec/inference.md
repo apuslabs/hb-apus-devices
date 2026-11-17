@@ -138,6 +138,14 @@ node's HTTP client timeouts apply; for `hackney` these are
 `http-client-connect-timeout` and `http-client-hackney-recv-timeout`. A
 runtime that does not answer within them is reported as unreachable (503).
 
+**Host policy.** HyperBEAM vets every host that `relay@1.0` reaches against
+the node's `hosts-allowed` and `hosts-block-internal` options; internal hosts
+(loopback, private, link-local and the node's own subnets) are blocked by
+default. The runtime is usually internal, so each runtime call, and only it,
+runs with `hosts-block-internal: false` and `hosts-allowed` set to the host
+of `inference-peer`. The node's policy for every other relay call is
+unchanged, and requests never choose the peer.
+
 ## 4. Resolved keys (normative)
 
 ### `completions` — run one chat completion
@@ -243,16 +251,16 @@ runtime that does not answer within them is reported as unreachable (503).
 |---|---|
 | `status` | `captured` when the HashPath of the public step could be computed, otherwise `not-captured`. |
 | `source` | `HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)`: the AO-Core resolution stage that links a result to its inputs, whose function `hb_path:hashpath/3` computes this HashPath. |
-| `hashpath` | The HashPath (`hb_path:hashpath/3`) of the public step. Omitted when `status` is `not-captured`. |
+| `hashpath` | The HashPath of the public step in the form AO-Core records it (`hb_hashpath`): `ao:~inference@1.0/<request>`, where `<request>` is `ao:` and the ID of the step request. AO-Core assigns the executed step this value followed by `.<ID>` of its result. Omitted when `status` is `not-captured`. |
 | `hashpath-algorithm` | `sha-256-chain (AO-Core default)`. |
 | `request-id` | Unsigned message ID of the public step request. Omitted when it cannot be computed. |
 | `response-id` | Unsigned message ID of the runtime response, private keys removed. Omitted when it cannot be computed. |
 | `verification-status` | `captured`. |
 
 A request that `inference_receipt@1.0` executes carries only public step
-keys, so for it the public step is the AO-Core step that ran: `hashpath`
-equals the HashPath AO-Core assigns to the result at stage 8, which the
-receipt records.
+keys, so for it the public step is the AO-Core step that ran: the HashPath
+that AO-Core assigns to the result, which the receipt records, is `hashpath`
+followed by `.<ID>` of the result.
 
 **Attestation.** The attestation nonce is the lowercase hexadecimal SHA-256
 of the `raw` bytes (64 characters). The device resolves the attestation
@@ -362,9 +370,10 @@ error whose body is a JSON object is returned with that body unchanged.
 ## 9. Composition
 
 - **`relay@1.0`.** Every runtime call is a `relay@1.0` `call` with the
-  runtime origin as `peer` and the configured path. The device sets the
-  relay's HTTP client to the node's `http-client` (§3); the relay's other
-  node options apply.
+  runtime origin as `peer` and the configured path, relayed under
+  `relay-subject`. The device sets the relay's HTTP client to the node's
+  `http-client` and admits the runtime's host (§3, host policy); the relay's
+  other node options apply.
 - **Attestation device.** The default `sev_gpu@1.0` answers `generate` with
   NVIDIA GPU evidence for the nonce. Any device that answers `generate` with
   a JSON object or a map can be configured instead.

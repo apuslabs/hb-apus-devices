@@ -308,9 +308,10 @@ and `priv` keys at every level (Erlang term text when not encodable as JSON).
   and IP-address literals (short, integer, IPv6 and IPv4-mapped forms included) that are
   not public unicast addresses under HyperBEAM's hostname policy (loopback, private,
   link-local, unspecified and other special-use ranges, and the node's own subnets). Host
-  names are checked by `relay@1.0`, which applies DNS-based checks under its
-  `relay-block-internal` (default true) and `relay-allowed-hosts` options; under the
-  default relay policy, names that resolve to private addresses are refused as well.
+  names are checked by `relay@1.0`, which applies HyperBEAM's host policy, the node
+  options `hosts-block-internal` (default true) and `hosts-allowed`; under the
+  default policy, internal hosts and names that resolve to private addresses are
+  refused as well.
   `agent-http-allow-private` disables only this device's check; to reach private hosts the
   relay policy MUST also allow them.
 - **`bundle_item` writes with the node's identity.** When enabled, data chosen by the
