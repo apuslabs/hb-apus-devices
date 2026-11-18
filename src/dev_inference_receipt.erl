@@ -22,9 +22,27 @@
 -define(INFERENCE_BASE, #{<<"device">> => <<"inference@1.0">>}).
 -define(JSON, <<"application/json">>).
 
-%% The AO-Core stage whose function computes the recorded HashPath.
+%% Where a HashPath that AO-Core assigned to the recorded response comes
+%% from: the resolver's stage 10, which generates it with
+%% `hb_hashpath:generate/8'.
 -define(HASHPATH_SOURCE,
-    <<"HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)">>).
+    <<"HyperBEAM v0.11 AO-Core resolver stage 10 (hb_hashpath:generate/8)">>).
+
+%% The HashPath algorithms `verify-hashpath' recomputes. HyperBEAM v0.11
+%% records `hb_hashpath' claims (`ao:<base>/<request>.<result>'), which hash
+%% nothing beyond the message IDs they name. HyperBEAM before v0.11
+%% (`28baa3d', `1aebe74') recorded `<base>/<request>' from
+%% `hb_path:hashpath/3': a SHA-256 chain over `httpsig@1.0' HMAC IDs.
+-define(ALG_CLAIM, <<"hb-hashpath-v0.11">>).
+-define(ALG_LEGACY, <<"legacy-sha-256-chain">>).
+
+%% The constant key of the unsigned `httpsig@1.0' HMAC that gave a message
+%% its ID before v0.11, and the largest value it sent as a header.
+-define(LEGACY_HMAC_KEY, <<"constant:ao">>).
+-define(LEGACY_MAX_HEADER_LENGTH, 4096).
+-define(LEGACY_DERIVED_COMPONENTS, [<<"method">>, <<"target-uri">>,
+    <<"authority">>, <<"scheme">>, <<"request-target">>, <<"path">>,
+    <<"query">>, <<"query-param">>]).
 
 %% Upper bound on the external term of a transcript (1 MiB), and on the
 %% unpadded base64url text of `verification-input-term' (the encoded length
@@ -307,6 +325,16 @@ error_reply(Status, Body) ->
         <<"body">> => JSON
     }}.
 
+%% A successful result that HyperBEAM serves as `Status' with a JSON body.
+%% Its values stay text: as keys of a message, HyperBEAM would read a value
+%% that starts with `ao:' (such as a HashPath) as a link and try to load it.
+json_reply(Status, Body) ->
+    {ok, #{
+        <<"status">> => Status,
+        <<"content-type">> => ?JSON,
+        <<"body">> => hb_json:encode(json_safe(Body))
+    }}.
+
 %% Without `receipt-publishers' any caller may publish. With it, a listed
 %% address must have committed to the published key (`receipt', else `body'),
 %% and its commitments must verify against the request as the device sees
@@ -406,7 +434,7 @@ publish_opts(Opts) ->
         _ => _
     },
     map()
-) -> {ok, #{ status := 200, body := _ }}
+) -> {ok, #{ status := 200, 'content-type' := binary(), body := binary() }}
     | {error, #{ status := 400 | 422, 'content-type' := binary(),
         body := binary() }}.
 verify_hashpath(_Base, Req, Opts) ->
@@ -426,12 +454,18 @@ verify_hashpath(_Base, Req, Opts) ->
     case verification_messages(TermInput, Input, Opts) of
         {ok, Base, Request, Response, Rest} ->
             try
-                Recomputed = recompute_hashpath(Base, Request, Response, Opts),
                 Recorded = recorded_hashpaths(Sections, Response, Opts),
+                Algorithm = case Recorded of
+                    [{_, Expected} | _] -> hashpath_algorithm(Expected);
+                    [] -> ?ALG_CLAIM
+                end,
+                Recomputed =
+                    recompute_hashpath(Algorithm, Base, Request, Response, Opts),
                 ChainVerified = Rest == [] orelse
-                    hb_path:verify_hashpath([Request, Response | Rest], Opts),
-                {ok, #{<<"status">> => 200, <<"body">> =>
-                    hashpath_result(Recomputed, Recorded, ChainVerified)}}
+                    verify_chain(Algorithm, [Request, Response | Rest], Opts),
+                json_reply(200,
+                    (hashpath_result(Recomputed, Recorded, ChainVerified))#{
+                        <<"hashpath-algorithm">> => Algorithm})
             catch _:_ ->
                 error_reply(422, #{
                     <<"verified">> => false,
@@ -758,21 +792,26 @@ make_receipt(ExecutionReq, Body, Response, Opts) ->
 ao_core_evidence(Base, Req, Response, Opts) ->
     Priv = hb_private:from_message(Response),
     PublicEvidence = public_ao_core_evidence(Response, Opts),
-    Hashpath = first_defined([
-        maps:get(<<"hashpath">>, Priv, undefined),
-        maps:get(<<"hashpath">>, PublicEvidence, undefined)
-    ]),
+    %% `source' names where the HashPath that is reported came from: AO-Core
+    %% (the response's private copy), else the evidence `inference@1.0'
+    %% exposed, with that evidence's own `source'.
+    {Hashpath, Source} =
+        case {maps:get(<<"hashpath">>, Priv, undefined),
+                maps:get(<<"hashpath">>, PublicEvidence, undefined)} of
+            {Assigned, _} when Assigned =/= undefined ->
+                {Assigned, ?HASHPATH_SOURCE};
+            {undefined, Exposed} ->
+                {Exposed, maps:get(<<"source">>, PublicEvidence,
+                    ?HASHPATH_SOURCE)}
+        end,
     #{
         <<"status">> => case Hashpath of
             undefined -> <<"not-captured">>;
             _ -> <<"captured">>
         end,
-        <<"source">> => case maps:get(<<"source">>, PublicEvidence, undefined) of
-            undefined -> ?HASHPATH_SOURCE;
-            Source -> Source
-        end,
+        <<"source">> => Source,
         <<"hashpath">> => Hashpath,
-        <<"hashpath-algorithm">> => hashpath_algorithm(Base),
+        <<"hashpath-algorithm">> => hashpath_algorithm(Hashpath),
         <<"request-id">> => safe_message_id(Req, none, Opts),
         <<"response-id">> => safe_message_id(Response, none, Opts),
         <<"commitment-device">> => commitment_device(Response, Opts),
@@ -797,7 +836,8 @@ ao_core_evidence(Base, Req, Response, Opts) ->
 hashpath_verification(_Base, _Req, _Response, undefined, _Opts) ->
     <<"not-captured">>;
 hashpath_verification(Base, Req, Response, Hashpath, Opts) ->
-    try recompute_hashpath(Base, Req, Response, Opts) of
+    try recompute_hashpath(hashpath_algorithm(Hashpath), Base, Req, Response,
+            Opts) of
         Recomputed ->
             case hashpath_matches(Hashpath, Recomputed) of
                 true -> <<"verified">>;
@@ -806,12 +846,18 @@ hashpath_verification(Base, Req, Response, Hashpath, Opts) ->
     catch _:_ -> <<"unavailable">>
     end.
 
-%% @doc Recompute the HashPath of a recorded step in the form AO-Core records
-%% it (`hb_hashpath'): `Step' is `ao:<base>/<request>', the step itself, and
-%% `Claim' is `Step' followed by `.<ID>' of the response, the claim that
-%% executing the request on the base gave that response. A response without
-%% an ID gives no claim, and `Claim' is `Step'.
-recompute_hashpath(Base, Request, Response, Opts) ->
+%% @doc Recompute the HashPath of a recorded step with `Algorithm', as
+%% `{Step, Claim}'. For a legacy HashPath both are `<base>/<request>' of the
+%% previous kernel (`legacy_hashpath/2').
+%%
+%% For an `hb_hashpath' claim, `Step' is `ao:<base>/<request>', the step
+%% itself, and `Claim' is `Step' followed by `.<ID>' of the response, the
+%% claim that executing the request on the base gave that response. A
+%% response without an ID gives no claim, and `Claim' is `Step'.
+recompute_hashpath(?ALG_LEGACY, Base, Request, _Response, _Opts) ->
+    Legacy = legacy_hashpath(Base, Request),
+    {Legacy, Legacy};
+recompute_hashpath(?ALG_CLAIM, Base, Request, Response, Opts) ->
     Step = hb_hashpath:format(
         #{<<"base">> => Base, <<"request">> => Request}, Opts),
     Claim =
@@ -860,12 +906,302 @@ transcript_term(Transcript) ->
         false -> undefined
     end.
 
-%% AO-Core chains a HashPath with the algorithm its base message names.
-hashpath_algorithm(Base) ->
-    case maps:get(<<"hashpath-alg">>, Base, undefined) of
-        undefined -> <<"sha-256-chain (AO-Core default)">>;
-        Value -> Value
+%% @doc The algorithm of a recorded HashPath, from its form: a value of the
+%% previous kernel is `<base>/<request>', where `<base>' is a 43-character
+%% ID and `<request>' one path part; everything else, including `ao:'
+%% claims and no value at all, is a HyperBEAM v0.11 `hb_hashpath' claim.
+%% HyperBEAM v0.11 does not read a base message's `hashpath-alg'.
+hashpath_algorithm(Hashpath) when is_binary(Hashpath) ->
+    case binary:split(Hashpath, <<"/">>) of
+        [Base, Request] when byte_size(Base) == 43, Request =/= <<>> ->
+            case is_id_text(Base)
+                    andalso binary:match(Request, <<"/">>) == nomatch of
+                true -> ?ALG_LEGACY;
+                false -> ?ALG_CLAIM
+            end;
+        _ -> ?ALG_CLAIM
+    end;
+hashpath_algorithm(_) ->
+    ?ALG_CLAIM.
+
+is_id_text(Bin) ->
+    lists:all(
+        fun(C) ->
+            (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z)
+                orelse (C >= $0 andalso C =< $9) orelse C == $_ orelse C == $-
+        end,
+        binary_to_list(Bin)).
+
+%% @doc Verify the HashPath chain `[Base, Request, Result | Rest]': each
+%% result records the HashPath of the step before it.
+verify_chain(?ALG_LEGACY, Messages, _Opts) ->
+    legacy_verify_chain(Messages);
+verify_chain(?ALG_CLAIM, Messages, Opts) ->
+    hb_path:verify_hashpath(Messages, Opts).
+
+%%% Legacy HashPaths
+%%%
+%%% Receipts recorded before HyperBEAM v0.11 carry HashPaths of the form
+%%% `<base>/<request>', computed by that kernel's `hb_path:hashpath/3' over
+%%% message IDs of its `httpsig@1.0' codec. Both changed in v0.11, which can
+%%% no longer compute them. The functions below port the parts of the
+%%% previous kernel (permaweb/HyperBEAM 1aebe74a, identical in apuslabs
+%%% 28baa3d2 for these paths) that give those values for the plain data of a
+%%% transcript: `hb_path:hashpath/2,3,4', `dev_message:id/3' with
+%%% `committers: all', `hb_link:normalize/3' in `discard' mode,
+%%% `dev_structured:from/3', `dev_httpsig:commit/3' for `hmac-sha256' with the
+%%% key `constant:ao', and the `dev_httpsig_conv:to/3' encoding it signs. A
+%%% value they cannot reproduce (a lazy link, a process or a function)
+%%% throws, which `verify-hashpath' reports as `invalid-hashpath-transcript'.
+
+%% @doc The HashPath the previous kernel assigned to executing `Request' on
+%% `Base': `<base hashpath>/<request part>', where a base hashpath that is
+%% itself `<a>/<b>' is first chained to the SHA-256 of `a' and `b'.
+legacy_hashpath(Base, Request) ->
+    BaseHashpath = legacy_message_hashpath(Base),
+    Part = legacy_request_part(Request),
+    case binary:split(BaseHashpath, <<"/">>, [global, trim_all]) of
+        [_] -> <<BaseHashpath/binary, "/", Part/binary>>;
+        [Prev1, Prev2] ->
+            Next = (legacy_hashpath_alg(Base))(
+                hb_util:native_id(Prev1),
+                case byte_size(Prev2) of
+                    43 -> hb_util:native_id(Prev2);
+                    _ -> Prev2
+                end),
+            <<(hb_util:human_id(Next))/binary, "/", Part/binary>>
     end.
+
+%% A message's own HashPath: its private `hashpath', else its ID.
+legacy_message_hashpath(Msg) when is_map(Msg) ->
+    case hb_private:from_message(Msg) of
+        #{<<"hashpath">> := Hashpath} when is_binary(Hashpath) -> Hashpath;
+        _ -> legacy_id(Msg)
+    end.
+
+%% A request of only a `path' is named by its first path part, any other
+%% request by its ID.
+legacy_request_part(Request) when is_map(Request) ->
+    Rest = maps:without([<<"path">>, <<"hashpath">>, <<"priv">>],
+        legacy_keys(Request)),
+    case {map_size(Rest), maps:get(<<"path">>, legacy_keys(Request), undefined)} of
+        {0, Path} when is_binary(Path), Path =/= <<>> ->
+            hd(binary:split(Path, <<"/">>, [global, trim_all]));
+        {0, [First | _]} -> hb_util:bin(First);
+        _ -> legacy_id(Request)
+    end.
+
+legacy_hashpath_alg(Base) ->
+    case maps:get(<<"hashpath-alg">>, legacy_keys(Base), <<"sha-256-chain">>) of
+        <<"accumulate-256">> -> fun(A, B) -> legacy_accumulate([A, B]) end;
+        _ -> fun(A, B) -> crypto:hash(sha256, <<A:32/binary, B/binary>>) end
+    end.
+
+%% @doc A message's ID: the sum (modulo 2^256) of the IDs of its signed
+%% commitments, else of its unsigned `httpsig@1.0' commitments, else the
+%% HMAC of its `httpsig@1.0' encoding.
+legacy_id(Msg) when is_map(Msg) ->
+    Commitments = case maps:get(<<"commitments">>, Msg, #{}) of
+        C when is_map(C) -> C;
+        _ -> #{}
+    end,
+    Signed = [ID || {ID, #{<<"committer">> := _}} <- maps:to_list(Commitments)],
+    Unsigned = [ID || {ID, Comm} <- maps:to_list(Commitments), is_map(Comm),
+        not maps:is_key(<<"committer">>, Comm),
+        maps:get(<<"commitment-device">>, Comm, undefined) == <<"httpsig@1.0">>],
+    case {Signed, Unsigned} of
+        {[], []} -> legacy_hmac_id(legacy_tabm(Msg));
+        {[], _} -> hb_util:human_id(legacy_accumulate(Unsigned));
+        _ -> hb_util:human_id(legacy_accumulate(Signed))
+    end;
+legacy_id(List) when is_list(List) ->
+    legacy_hmac_id(legacy_list_tabm(List)).
+
+legacy_accumulate(IDs) ->
+    Sum = lists:foldl(
+        fun(ID, Acc) ->
+            <<N:256>> = hb_util:native_id(ID),
+            (Acc + N) rem (1 bsl 256)
+        end, 0, IDs),
+    <<Sum:256>>.
+
+legacy_keys(Msg) ->
+    maps:fold(fun(K, V, Acc) -> Acc#{hb_util:bin(K) => V} end, #{}, Msg).
+
+%% @doc The type-annotated binary message of `dev_structured:from/3', with
+%% every nested message or list replaced by a `+link' to its ID.
+legacy_tabm(Msg) ->
+    legacy_tabm(Msg, []).
+legacy_tabm(Msg, ExtraTypes) ->
+    {Values, Types} = maps:fold(
+        fun(Key, Value, {Vs, Ts}) ->
+            case legacy_skip_key(Key) of
+                true -> {Vs, Ts};
+                false -> legacy_field(Key, Value, Vs, Ts)
+            end
+        end,
+        {#{}, ExtraTypes},
+        legacy_keys(Msg)),
+    case Types of
+        [] -> Values;
+        _ -> Values#{<<"ao-types">> => legacy_ao_types(Types)}
+    end.
+
+%% A list is a message with numbered keys whose `ao-types' marks it a list.
+legacy_list_tabm(List) ->
+    Numbered = maps:from_list(
+        lists:zip([integer_to_binary(N) || N <- lists:seq(1, length(List))],
+            List)),
+    legacy_tabm(Numbered, [{<<".">>, <<"list">>}]).
+
+legacy_skip_key(<<"priv", _/binary>>) -> true;
+legacy_skip_key(<<"commitments">>) -> true;
+legacy_skip_key(<<"unsigned_id">>) -> true;
+legacy_skip_key(<<"content-digest">>) -> true;
+legacy_skip_key(_) -> false.
+
+legacy_field(Key, {link, ID, #{<<"type">> := <<"link">>} = Meta}, Vs, Ts) ->
+    case maps:get(<<"lazy">>, Meta, false) of
+        false -> {Vs#{<<Key/binary, "+link">> => ID}, Ts};
+        Lazy -> throw({legacy_hashpath_unsupported, {lazy_link, Key, Lazy}})
+    end;
+legacy_field(Key, Value, Vs, Ts) when is_map(Value); is_list(Value) ->
+    {Vs#{<<Key/binary, "+link">> => legacy_id(Value)}, Ts};
+legacy_field(Key, Value, Vs, Ts) when is_binary(Value) ->
+    {Vs#{Key => Value}, Ts};
+legacy_field(Key, Value, Vs, Ts) when is_integer(Value) ->
+    {Vs#{Key => integer_to_binary(Value)}, [{Key, <<"integer">>} | Ts]};
+legacy_field(Key, Value, Vs, Ts) when is_float(Value) ->
+    {Vs#{Key => float_to_binary(Value)}, [{Key, <<"float">>} | Ts]};
+legacy_field(Key, Value, Vs, Ts) when is_atom(Value) ->
+    {Vs#{Key => atom_to_binary(Value)}, [{Key, <<"atom">>} | Ts]};
+legacy_field(Key, Value, _Vs, _Ts) ->
+    throw({legacy_hashpath_unsupported, {value, Key, Value}}).
+
+%% `ao-types' is a structured-field dictionary `key="type", ...', in key
+%% order, with each key URI-escaped.
+legacy_ao_types(Types) ->
+    iolist_to_binary(lists:join(<<", ">>,
+        [[legacy_escape(Key), <<"=\"">>, Type, <<"\"">>] ||
+            {Key, Type} <- lists:keysort(1, Types)])).
+
+%% @doc The ID of a TABM: the HMAC-SHA256, keyed `constant:ao', of the
+%% RFC 9421 signature base of its `httpsig@1.0' encoding.
+legacy_hmac_id(TABM) ->
+    hb_util:human_id(crypto:mac(hmac, sha256, ?LEGACY_HMAC_KEY,
+        legacy_signature_base(legacy_httpsig(TABM)))).
+
+%% Every encoded field is a signature component, in the order of the
+%% encoded map's keys; derived components are named with `@' in the
+%% parameters line only.
+legacy_signature_base(Encoded) ->
+    Keys = maps:keys(Encoded),
+    Lines = [<<"\"", K/binary, "\": ", (maps:get(K, Encoded))/binary>> ||
+        K <- Keys],
+    Params = [<<"\"", (legacy_component(K))/binary, "\"">> || K <- Keys],
+    iolist_to_binary([lists:join(<<"\n">>, Lines),
+        <<"\n\"@signature-params\": (">>, lists:join(<<" ">>, Params),
+        <<");alg=\"hmac-sha256\";keyid=\"constant:ao\"">>]).
+
+legacy_component(Key) ->
+    case lists:member(Key, ?LEGACY_DERIVED_COMPONENTS) of
+        true -> <<"@", Key/binary>>;
+        false -> Key
+    end.
+
+%% @doc The `httpsig@1.0' encoding of a TABM that is signed: values of at
+%% most 4096 bytes are headers (with `\', CR and LF escaped); the inline
+%% body key and larger values form the body, which is a multipart document
+%% unless it is only the inline body, and is replaced by its
+%% `content-digest'.
+legacy_httpsig(TABM) ->
+    Msg = maps:without([<<"commitments">>, <<"signature">>,
+        <<"signature-input">>, <<"priv">>], legacy_encode_ids(TABM)),
+    {InlineHeaders, InlineKey} = legacy_inline_key(Msg),
+    {Headers, BodyMap} = maps:fold(
+        fun(<<"body">>, V, {H, B}) -> {H, B#{<<"body">> => V}};
+           (K, V, {H, B}) when K =:= InlineKey -> {H, B#{K => V}};
+           (K, V, {H, B}) when byte_size(V) =< ?LEGACY_MAX_HEADER_LENGTH ->
+                {H#{K => legacy_escape_header(V)}, B};
+           (K, V, {H, B}) -> {H, B#{K => V}}
+        end,
+        {InlineHeaders, #{}},
+        Msg),
+    WithBody = case maps:to_list(BodyMap) of
+        [] -> Headers;
+        [{InlineKey, Inline}] -> Headers#{<<"body">> => Inline};
+        Parts -> legacy_multipart(Headers, lists:keysort(1, Parts), InlineKey)
+    end,
+    case maps:take(<<"body">>, WithBody) of
+        error -> WithBody;
+        {Body, Rest} ->
+            Rest#{<<"content-digest">> => <<"sha-256=:",
+                (base64:encode(crypto:hash(sha256, Body)))/binary, ":">>}
+    end.
+
+legacy_multipart(Headers, Parts, InlineKey) ->
+    PartBins = [
+        <<"content-disposition: ",
+            (case Name of
+                InlineKey -> <<"inline">>;
+                _ -> <<"form-data;name=\"", Name/binary, "\"">>
+            end)/binary,
+            "\r\n\r\n", Value/binary>>
+    || {Name, Value} <- Parts],
+    Boundary = hb_util:encode(crypto:hash(sha256,
+        iolist_to_binary(lists:join(<<"\r\n">>, PartBins)))),
+    Body = iolist_to_binary([
+        lists:join(<<"\r\n">>,
+            [<<"--", Boundary/binary, "\r\n", P/binary>> || P <- PartBins]),
+        <<"\r\n--">>, Boundary, <<"--">>]),
+    Headers#{
+        <<"content-type">> =>
+            <<"multipart/form-data; boundary=\"", Boundary/binary, "\"">>,
+        <<"body">> => Body
+    }.
+
+%% The inline body is `ao-body-key' when set, else `body', else `data'
+%% (named by an added `ao-body-key' header).
+legacy_inline_key(#{<<"ao-body-key">> := Key}) -> {#{}, Key};
+legacy_inline_key(#{<<"body">> := _}) -> {#{}, <<"body">>};
+legacy_inline_key(#{<<"data">> := _}) ->
+    {#{<<"ao-body-key">> => <<"data">>}, <<"data">>};
+legacy_inline_key(_) -> {#{}, <<"body">>}.
+
+legacy_encode_ids(Msg) ->
+    maps:fold(
+        fun(K, V, Acc) when byte_size(K) == 32; byte_size(K) == 42;
+                byte_size(K) == 43 ->
+                Acc#{legacy_escape(K) => V};
+           (K, V, Acc) -> Acc#{K => V}
+        end, #{}, Msg).
+
+%% The previous kernel's `hb_escape:encode/1': bytes other than lowercase
+%% letters, digits and `.-_/?&' become lowercase `%xx'.
+legacy_escape(Bin) ->
+    << <<(legacy_escape_byte(C))/binary>> || <<C>> <= Bin >>.
+
+legacy_escape_byte(C) when (C >= $a andalso C =< $z); (C >= $0 andalso C =< $9);
+        C == $.; C == $-; C == $_; C == $/; C == $?; C == $& ->
+    <<C>>;
+legacy_escape_byte(C) ->
+    list_to_binary(io_lib:format("%~2.16.0b", [C])).
+
+legacy_escape_header(Bin) ->
+    << <<(case C of
+            $\\ -> <<"\\\\">>;
+            $\r -> <<"\\r">>;
+            $\n -> <<"\\n">>;
+            _ -> <<C>>
+        end)/binary>> || <<C>> <= Bin >>.
+
+%% @doc Verify a chain of the previous kernel: each result's HashPath (its
+%% private `hashpath', else its ID) is the HashPath of the step before it.
+legacy_verify_chain([Base, Request, Result | Rest]) ->
+    legacy_hashpath(Base, Request) =:= legacy_message_hashpath(Result)
+        andalso (Rest == [] orelse legacy_verify_chain([Request, Result | Rest]));
+legacy_verify_chain(_) ->
+    false.
 
 commitment_device(Response, Opts) ->
     case catch hb_message:commitment_devices(Response, Opts) of
@@ -1204,7 +1540,9 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
             ?assertNot(maps:is_key(<<"implementation-id">>, DeviceChain)),
             ?assertEqual(<<"HyperBEAM Device Forge">>,
                 maps:get(<<"loader">>, DeviceChain)),
+            %% AO-Core assigned the reported HashPath, a v0.11 claim.
             ?assertEqual(?HASHPATH_SOURCE, maps:get(<<"source">>, AOCore)),
+            ?assertEqual(?ALG_CLAIM, maps:get(<<"hashpath-algorithm">>, AOCore)),
             Term = maps:get(<<"verification-input-term">>, AOCore),
             %% The term is uncompressed, as `verify-hashpath' requires.
             ?assertMatch(<<131, Tag, _/binary>> when Tag =/= 80,
@@ -1215,9 +1553,11 @@ receipt_excludes_transport_fields_and_verifies_test_() ->
             ?assertEqual(RequestDigest, digest(maps:get(request, Transcript))),
             ?assertEqual(<<"verified">>,
                 maps:get(<<"verification-status">>, AOCore)),
-            {ok, #{<<"body">> := Verification}} = verify_hashpath(#{},
-                #{<<"verification-input-term">> => Term}, Opts),
+            Verification = verify_json(verify_hashpath(#{},
+                #{<<"verification-input-term">> => Term}, Opts)),
             ?assertEqual(true, maps:get(<<"verified">>, Verification)),
+            ?assertEqual(?ALG_CLAIM,
+                maps:get(<<"hashpath-algorithm">>, Verification)),
             %% `tee=true' attests the same response: the report is bound to
             %% the SHA-256 of the published `raw'.
             #{<<"attestation">> := #{<<"raw">> := Raw, <<"nonce">> := Nonce,
@@ -1464,6 +1804,11 @@ generation_value(_Key) -> <<"value">>.
 error_json({error, #{<<"status">> := Status, <<"content-type">> := ?JSON,
         <<"body">> := Body}}) ->
     {Status, hb_json:decode(Body)}.
+
+%% The JSON result of a successful `verify-hashpath'.
+verify_json({ok, #{<<"status">> := 200, <<"content-type">> := ?JSON,
+        <<"body">> := Body}}) ->
+    hb_json:decode(Body).
 
 streaming_request_is_rejected_test() ->
     lists:foreach(
@@ -1852,8 +2197,8 @@ verify_hashpath_checks_base_and_request_test() ->
     Verify = fun(B, R) ->
         Term = hb_util:encode(term_to_binary(
             #{base => B, request => R, response => Response})),
-        {ok, #{<<"body">> := Result}} = verify_hashpath(#{},
-            #{<<"verification-input-term">> => Term}, #{}),
+        Result = verify_json(verify_hashpath(#{},
+            #{<<"verification-input-term">> => Term}, #{})),
         maps:get(<<"verified">>, Result)
     end,
     ?assertEqual(true, Verify(Base, Request)),
@@ -1904,10 +2249,10 @@ verify_hashpath_bounds_the_erlang_term_test() ->
     ?assertEqual(<<"undecodable">>, Reason(<<"not a term">>)),
     ?assertEqual(<<"undecodable">>, Reason(Encode(#{other => 1}, []))),
     %% Within the limits, a plain transcript is recomputed.
-    {ok, #{<<"status">> := 200, <<"body">> := #{<<"reason">> :=
-            <<"hashpath-not-captured">>}}} =
-        verify_hashpath(#{}, #{<<"verification-input-term">> =>
-            Encode(Transcript(#{<<"path">> => <<"x">>, <<"n">> => 1}), [])}, #{}).
+    #{<<"reason">> := <<"hashpath-not-captured">>} =
+        verify_json(verify_hashpath(#{}, #{<<"verification-input-term">> =>
+            Encode(Transcript(#{<<"path">> => <<"x">>, <<"n">> => 1}), [])},
+            #{})).
 
 %% Operator bindings take precedence over request declarations.
 execution_bindings_prefer_node_options_test() ->
@@ -1951,8 +2296,8 @@ digest_is_canonical_for_objects_of_any_size_test() ->
     ?assertEqual(hb_json:encode(Small), canonical_json(Small)).
 
 %% Transcript recorded on the reference deployment on 2026-10-12 by
-%% HyperBEAM 28baa3d2 (`ao-core.status=captured'). The HashPath is specific to
-%% the pinned HyperBEAM version.
+%% HyperBEAM 28baa3d2 (`ao-core.status=captured'), which recorded the legacy
+%% HashPath `?LEGACY_CAPTURED_HASHPATH'.
 %% The HashPath that HyperBEAM v0.11 assigns to the captured step: the step
 %% `ao:<base>/<request>' (`?CAPTURED_STEP_HASHPATH', as `inference@1.0'
 %% exposes it) followed by `.<ID>' of the captured response.
@@ -2007,9 +2352,7 @@ http_request(Msg) ->
         <<"structured@1.0">>, <<"json@1.0">>, #{})).
 
 verify_http(Msg) ->
-    {ok, #{<<"status">> := 200, <<"body">> := Result}} =
-        verify_hashpath(#{}, http_request(Msg), #{}),
-    Result.
+    verify_json(verify_hashpath(#{}, http_request(Msg), #{})).
 
 %% The fixture is the HashPath that AO-Core's resolver assigns to the
 %% captured step and response.
@@ -2060,18 +2403,275 @@ verify_hashpath_accepts_captured_receipt_test() ->
     ?assertEqual(false, maps:get(<<"verified">>, Bare)),
     ?assertEqual(<<"hashpath-not-captured">>, maps:get(<<"reason">>, Bare)).
 
+%% The HashPath that HyperBEAM 28baa3d2 recorded for the captured transcript
+%% on the reference deployment (`<base ID>/<request ID>', `hb_path:hashpath/3'),
+%% as this module's tests carried it before the v0.11 port; HyperBEAM
+%% 1aebe74a recomputes the same value.
+-define(LEGACY_CAPTURED_HASHPATH, <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
+    "hDjPRer0jfXtHMDhJIRBozzWusYX6-sed0_5HEH2NFk">>).
+
+%% A receipt recorded by the previous kernel, as it was published: its
+%% response carries the legacy HashPath.
+legacy_captured_transcript() ->
+    #{<<"response">> := Response} = Transcript = captured_transcript(),
+    Transcript#{<<"response">> => Response#{
+        <<"priv">> => #{<<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH}}}.
+
+%% Legacy vectors computed by HyperBEAM 1aebe74a (`hb_message:id(M, all, #{})'
+%% and `hb_path:hashpath/3') for messages that exercise each part of the
+%% ported encoding: typed values, floats, atoms, nested messages and lists,
+%% empty values, an uppercase key, a header escape, non-ASCII bytes, a value
+%% too large for a header, a multipart body, `data' as the inline body and
+%% more than 32 keys.
+legacy_vector_messages() ->
+    Probe = #{
+        <<"path">> => <<"completions">>,
+        <<"temperature">> => 0.7,
+        <<"stop">> => [<<"a">>, <<"b c">>],
+        <<"stream">> => false,
+        <<"empty">> => <<>>,
+        <<"emptylist">> => [],
+        <<"emptymap">> => #{},
+        <<"Upper">> => <<"x">>,
+        <<"nested">> => #{<<"k">> => 1, <<"deep">> => #{<<"z">> => <<"q">>}},
+        <<"messages">> => [#{<<"role">> => <<"user">>,
+            <<"content">> =>
+                <<"line1\nline2 \"quoted\" \\ \r tab\t ", 195, 188, "n", 239>>}],
+        <<"big">> => binary:copy(<<"a">>, 5000),
+        <<"body">> => <<"{\"x\":1}">>
+    },
+    Receipt = #{
+        <<"path">> => <<"completions">>,
+        <<"model">> => <<"google/gemma-4-26B-A4B-it">>,
+        <<"messages">> => [
+            #{<<"role">> => <<"system">>,
+                <<"content">> => <<"You are terse.\nAnswer briefly.">>},
+            #{<<"role">> => <<"user">>,
+                <<"content">> => binary:copy(<<"long prompt ">>, 400)}
+        ],
+        <<"max_tokens">> => 64,
+        <<"temperature">> => 0.2,
+        <<"top_p">> => 1,
+        <<"seed">> => -7,
+        <<"stop">> => [<<"\n\n">>, <<"END">>],
+        <<"tee">> => true,
+        <<"logit_bias">> => #{<<"50256">> => -100},
+        <<"tools">> => [#{<<"type">> => <<"function">>,
+            <<"function">> => #{<<"name">> => <<"get_time">>,
+                <<"parameters">> => #{<<"type">> => <<"object">>,
+                    <<"properties">> => #{}}}}],
+        <<"response_format">> => null,
+        <<"request-nonce">> => <<"q0oXl0ZbJ1v3uUeZ5yI8c6m2dV1kF9pX4sT7wA0bC2E">>
+    },
+    Lists = #{<<"ints">> => [1, 2, 3], <<"mixed">> => [1, <<"two">>, 3.5, true],
+        <<"nested">> => [[<<"a">>], [#{<<"k">> => <<"v">>}]],
+        <<"data">> => <<"payload">>},
+    Wide = maps:from_list([{<<"k", (integer_to_binary(N))/binary>>,
+        integer_to_binary(N * 7)} || N <- lists:seq(1, 40)]),
+    #{probe => Probe, receipt => Receipt, lists => Lists, wide => Wide}.
+
+legacy_ids_match_the_previous_kernel_test() ->
+    #{probe := Probe, receipt := Receipt, lists := Lists, wide := Wide} =
+        legacy_vector_messages(),
+    #{<<"base">> := Base, <<"request">> := Request} = captured_transcript(),
+    ?assertEqual(<<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo">>,
+        legacy_id(Base)),
+    ?assertEqual(<<"hDjPRer0jfXtHMDhJIRBozzWusYX6-sed0_5HEH2NFk">>,
+        legacy_id(Request)),
+    ?assertEqual(<<"AcBtxL3fEzPPLOqw5iPr7_XCmfi8EGSTzz2NDkawJFU">>,
+        legacy_id(Probe)),
+    ?assertEqual(<<"B9uYYXNmHttpmYyQQYH9EMpCqKh5mDZWSCc-3FV1AKE">>,
+        legacy_id(Receipt)),
+    ?assertEqual(<<"PFUwDOuVGq3UMGbt7cL3g_c3IDHrHW2EiYd3Zc2FBjU">>,
+        legacy_id(Lists)),
+    ?assertEqual(<<"BJnEgbmQNSlF7JKQM-Ojwb9_MUk-kHmpAijHLbrVF0M">>,
+        legacy_id(Wide)).
+
+legacy_hashpaths_match_the_previous_kernel_test() ->
+    #{receipt := Receipt, wide := Wide} = legacy_vector_messages(),
+    #{<<"base">> := Base, <<"request">> := Request} = captured_transcript(),
+    ?assertEqual(?LEGACY_CAPTURED_HASHPATH, legacy_hashpath(Base, Request)),
+    ?assertEqual(<<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
+            "B9uYYXNmHttpmYyQQYH9EMpCqKh5mDZWSCc-3FV1AKE">>,
+        legacy_hashpath(Base, Receipt)),
+    ?assertEqual(<<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
+            "BJnEgbmQNSlF7JKQM-Ojwb9_MUk-kHmpAijHLbrVF0M">>,
+        legacy_hashpath(Base, Wide)),
+    %% A request of only a path is named by that path.
+    ?assertEqual(<<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/info">>,
+        legacy_hashpath(Base, #{<<"path">> => <<"info">>})),
+    %% A base that carries a HashPath is chained with SHA-256.
+    Chained = Base#{<<"priv">> => #{<<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH}},
+    ?assertEqual(<<"CA5ugkWwPUvzOjr7kLrhdgq46gq3c0IHmglzPRTcaJU/"
+            "B9uYYXNmHttpmYyQQYH9EMpCqKh5mDZWSCc-3FV1AKE">>,
+        legacy_hashpath(Chained, Receipt)).
+
+hashpath_algorithm_follows_the_recorded_form_test() ->
+    ?assertEqual(?ALG_LEGACY, hashpath_algorithm(?LEGACY_CAPTURED_HASHPATH)),
+    ?assertEqual(?ALG_LEGACY, hashpath_algorithm(
+        <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/info">>)),
+    ?assertEqual(?ALG_CLAIM, hashpath_algorithm(?CAPTURED_HASHPATH)),
+    ?assertEqual(?ALG_CLAIM, hashpath_algorithm(?CAPTURED_STEP_HASHPATH)),
+    ?assertEqual(?ALG_CLAIM, hashpath_algorithm(undefined)),
+    ?assertEqual(?ALG_CLAIM, hashpath_algorithm(<<"short/info">>)),
+    ?assertEqual(?ALG_CLAIM, hashpath_algorithm(
+        <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/a/b">>)).
+
+%% A receipt published by a node on the previous kernel verifies with the
+%% legacy algorithm, over HTTP (JSON transcript) and as an Erlang term, and
+%% the result names that algorithm. A changed transcript does not verify.
+verify_hashpath_accepts_legacy_receipt_test() ->
+    AOCore = #{
+        <<"status">> => <<"captured">>,
+        <<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH,
+        <<"verification-input">> => legacy_captured_transcript()
+    },
+    Result = verify_http(#{<<"ao-core">> => AOCore}),
+    ?assertEqual(true, maps:get(<<"verified">>, Result)),
+    ?assertEqual(?ALG_LEGACY, maps:get(<<"hashpath-algorithm">>, Result)),
+    ?assertEqual(?LEGACY_CAPTURED_HASHPATH,
+        maps:get(<<"recomputed-hashpath">>, Result)),
+    ?assertEqual(true, maps:get(<<"verified">>,
+        verify_http(#{<<"receipt">> => #{<<"ao-core">> => AOCore}}))),
+    #{<<"base">> := Base, <<"request">> := Request,
+        <<"response">> := Response} = legacy_captured_transcript(),
+    Term = hb_util:encode(term_to_binary(
+        #{base => Base, request => Request, response => Response})),
+    FromTerm = verify_json(verify_hashpath(#{}, #{<<"ao-core">> => #{
+        <<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH,
+        <<"verification-input-term">> => Term}}, #{})),
+    ?assertEqual(true, maps:get(<<"verified">>, FromTerm)),
+    ?assertEqual(?ALG_LEGACY, maps:get(<<"hashpath-algorithm">>, FromTerm)),
+    ?assertEqual([<<"ao-core.hashpath">>, <<"response.priv.hashpath">>],
+        maps:get(<<"hashpath-sources">>, FromTerm)),
+    Tampered = verify_http(#{<<"ao-core">> => AOCore#{
+        <<"verification-input">> => (legacy_captured_transcript())#{
+            <<"request">> => Request#{<<"max_tokens">> => 9}}}}),
+    ?assertEqual(false, maps:get(<<"verified">>, Tampered)),
+    ?assertEqual(<<"hashpath-mismatch">>, maps:get(<<"reason">>, Tampered)),
+    ?assertEqual(?ALG_LEGACY, maps:get(<<"hashpath-algorithm">>, Tampered)),
+    %% A legacy HashPath recorded for another request does not match.
+    Other = verify_http(#{<<"ao-core">> => AOCore#{<<"hashpath">> =>
+        <<"QdzzDp_izRHiWSt3D3zBQcgym1XnDtQJJ9W8DuaWOHo/"
+            "B9uYYXNmHttpmYyQQYH9EMpCqKh5mDZWSCc-3FV1AKE">>}}),
+    ?assertEqual(false, maps:get(<<"verified">>, Other)),
+    %% A v0.11 receipt names the v0.11 algorithm.
+    Current = verify_http(#{<<"ao-core">> => AOCore#{
+        <<"hashpath">> => ?CAPTURED_HASHPATH,
+        <<"verification-input">> => captured_transcript()}}),
+    ?assertEqual(true, maps:get(<<"verified">>, Current)),
+    ?assertEqual(?ALG_CLAIM, maps:get(<<"hashpath-algorithm">>, Current)).
+
+%% A legacy chain, checked as both kernels' `hb_path:verify_hashpath/2'
+%% does: in each window `[A, B, C | _]' the HashPath of `C' is that of
+%% executing `B' on `A'.
+verify_hashpath_checks_a_legacy_chain_test() ->
+    #{<<"base">> := Base, <<"request">> := Request} = captured_transcript(),
+    Response = #{<<"body">> => <<"r1">>,
+        <<"priv">> => #{<<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH}},
+    Linked = #{<<"body">> => <<"r2">>, <<"priv">> => #{<<"hashpath">> =>
+        legacy_hashpath(Request, Response)}},
+    Unlinked = #{<<"body">> => <<"r2">>, <<"priv">> => #{<<"hashpath">> =>
+        ?LEGACY_CAPTURED_HASHPATH}},
+    ?assert(legacy_verify_chain([Base, Request, Response, Linked])),
+    ?assertNot(legacy_verify_chain([Base, Request, Response, Unlinked])),
+    %% `verify-hashpath' checks the chain of `rest' with the same algorithm.
+    Verify = fun(Rest) ->
+        Input = #{<<"base">> => Base, <<"request">> => Request,
+            <<"response">> => Response, <<"rest">> => Rest},
+        R = verify_json(verify_hashpath(#{}, #{<<"ao-core">> => #{
+            <<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH,
+            <<"verification-input">> => Input}}, #{})),
+        R
+    end,
+    ?assertEqual(true, maps:get(<<"verified">>, Verify([Linked]))),
+    ?assertEqual(<<"hashpath-chain-mismatch">>,
+        maps:get(<<"reason">>, Verify([Unlinked]))).
+
+%% Over a node's HTTP server, `verify-hashpath' answers with a JSON body
+%% whatever the client accepts. HashPath values that start with `ao:' are
+%% text in it: as message keys, HyperBEAM would load them as links and fail
+%% with `necessary_message_not_found'. A receipt published by the previous
+%% kernel verifies with the legacy algorithm.
+verify_hashpath_over_http_test_() ->
+    {timeout, 120, fun() ->
+        Node = hb_http_server:start_node(#{
+            <<"port">> => 0,
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"store">> => hb_test_utils:test_store()
+        }),
+        Post = fun(Headers, Json) ->
+            {ok, {{_, Status, _}, RespHeaders, Body}} = httpc:request(post,
+                {binary_to_list(Node) ++ "~inference_receipt@1.0/verify-hashpath",
+                    Headers, "application/json", hb_json:encode(json_safe(Json))},
+                [{timeout, 60000}], [{body_format, binary}]),
+            ?assertMatch("application/json" ++ _,
+                proplists:get_value("content-type", RespHeaders)),
+            {Status, hb_json:decode(Body)}
+        end,
+        Legacy = #{
+            <<"status">> => <<"captured">>,
+            <<"hashpath">> => ?LEGACY_CAPTURED_HASHPATH,
+            <<"verification-input">> => legacy_captured_transcript()
+        },
+        Current = #{
+            <<"status">> => <<"captured">>,
+            <<"hashpath">> => ?CAPTURED_HASHPATH,
+            <<"verification-input">> => captured_transcript()
+        },
+        lists:foreach(
+            fun(Headers) ->
+                {200, LegacyResult} = Post(Headers, #{<<"ao-core">> => Legacy}),
+                ?assertMatch(#{<<"verified">> := true,
+                        <<"hashpath-algorithm">> := ?ALG_LEGACY,
+                        <<"expected-hashpath">> := ?LEGACY_CAPTURED_HASHPATH,
+                        <<"recomputed-hashpath">> := ?LEGACY_CAPTURED_HASHPATH},
+                    LegacyResult),
+                {200, Receipt} = Post(Headers,
+                    #{<<"receipt">> => #{<<"ao-core">> => Legacy}}),
+                ?assertMatch(#{<<"verified">> := true}, Receipt),
+                #{<<"request">> := Request} = legacy_captured_transcript(),
+                {200, Tampered} = Post(Headers, #{<<"ao-core">> => Legacy#{
+                    <<"verification-input">> => (legacy_captured_transcript())#{
+                        <<"request">> => Request#{<<"max_tokens">> => 9}}}}),
+                ?assertMatch(#{<<"verified">> := false,
+                        <<"reason">> := <<"hashpath-mismatch">>,
+                        <<"hashpath-algorithm">> := ?ALG_LEGACY},
+                    Tampered),
+                {200, CurrentResult} = Post(Headers, #{<<"ao-core">> => Current}),
+                ?assertEqual(#{<<"verified">> => true,
+                        <<"hashpath-algorithm">> => ?ALG_CLAIM,
+                        <<"expected-hashpath">> => ?CAPTURED_HASHPATH,
+                        <<"recomputed-hashpath">> => ?CAPTURED_HASHPATH},
+                    maps:with([<<"verified">>, <<"hashpath-algorithm">>,
+                        <<"expected-hashpath">>, <<"recomputed-hashpath">>],
+                        CurrentResult))
+            end,
+            [[], [{"accept", "application/json"}],
+                [{"accept", "application/json"}, {"accept-bundle", "true"}]]
+        )
+    end}.
+
+%% A value the previous kernel loaded from its cache cannot be reproduced.
+legacy_hashpath_refuses_lazy_links_test() ->
+    #{<<"base">> := Base} = captured_transcript(),
+    ?assertThrow({legacy_hashpath_unsupported, _}, legacy_hashpath(Base,
+        #{<<"messages+link">> => <<"x">>, <<"messages">> =>
+            {link, ?CAPTURED_STEP_HASHPATH,
+                #{<<"type">> => <<"link">>, <<"lazy">> => true}}})).
+
 verify_hashpath_checks_every_recorded_copy_test() ->
     #{<<"base">> := Base, <<"request">> := Request,
         <<"response">> := Response} = captured_transcript(),
     Term = hb_util:encode(term_to_binary(
         #{base => Base, request => Request, response => Response})),
     Verify = fun(Hashpath) ->
-        {ok, #{<<"body">> := Result}} = verify_hashpath(#{}, #{
+        Result = verify_json(verify_hashpath(#{}, #{
             <<"ao-core">> => #{
                 <<"hashpath">> => Hashpath,
                 <<"verification-input-term">> => Term
             }
-        }, #{}),
+        }, #{})),
         Result
     end,
     Agreeing = Verify(?CAPTURED_HASHPATH),

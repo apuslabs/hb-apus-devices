@@ -18,7 +18,7 @@ of the public node**, not an ordinary dependency bump.
 | Commit | `80a72735230882643f1ca9afe4e18af57ac065db` |
 | Tag | `v0.11` (merge of `lead/v0.11-security-work` into `release/v0.11`) |
 
-The six device suites pass against it (178/178, 2026-11-18). The public node
+The six device suites pass against it (187/187, 2026-11-18). The public node
 still runs the previous pin, `1aebe74a` on `cookbook/schema-vary`, until the
 guest is upgraded (see "Before changing it" and "Moving to v0.11").
 
@@ -57,9 +57,10 @@ and serving arbitrary LMDB 1.0 files through `hb_store_arlmdb`. The node's
 Measured on 2026-11-18 with fresh dependencies (`rebar.lock` regenerated;
 check `git -C _build/default/lib/hb rev-parse HEAD`, a stale lock silently
 tests the old pin): before the device changes 154 of 175 tests passed. Three
-kernel changes needed device changes; the suites now pass 178/178, with three
+kernel changes needed device changes; the suites passed 178/178, with three
 added tests: the runtime host admission, the `http_request` relay, and the
-resolver's HashPath of the captured receipt fixture.
+resolver's HashPath of the captured receipt fixture. Legacy receipt
+verification and the JSON `verify-hashpath` reply bring them to 187/187.
 
 - **Host policy.** `hb_hostname` vets every host `relay@1.0` reaches,
   including a `peer` the call gives, against `hosts-allowed` and
@@ -82,14 +83,20 @@ resolver's HashPath of the captured receipt fixture.
   from the previous kernel's for the same message. `inference@1.0` exposes
   the step `ao:~inference@1.0/ao:<request ID>`; `verify-hashpath` and
   `verification-status` accept the recomputed claim or the step. HashPaths
-  recorded by a node on the previous kernel do not recompute on v0.11 and
-  report `hashpath-mismatch`.
+  recorded by a node on the previous kernel (`<base ID>/<request ID>`) do
+  not recompute with v0.11's functions, so `inference_receipt@1.0` carries
+  a port of that kernel's `hb_path:hashpath/3` and `httpsig@1.0` HMAC IDs
+  and verifies them with it; `verify-hashpath` names the algorithm it used
+  in `hashpath-algorithm` (`legacy-sha-256-chain` or `hb-hashpath-v0.11`).
 - **Replies.** The node no longer adds `status` to a result message, so a
-  JSON reply has no top-level `status` key.
+  JSON reply has no top-level `status` key. Text values of a result message
+  that start with `ao:` are read as links when the reply is encoded, so
+  `verify-hashpath`, whose results carry HashPaths, answers with a JSON
+  body.
 
 ## Before changing it
 
-1. Run `make test`. The expectation is 175/175. Any failure here is a signal
+1. Run `make test`. The expectation is 187/187. Any failure here is a signal
    that the new commit does not carry what the devices need.
 2. Check that the new commit is on a branch that upstream will keep. A commit
    reachable only from an unmerged, unprotected topic branch can be deleted.

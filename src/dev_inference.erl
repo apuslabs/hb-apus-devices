@@ -64,9 +64,15 @@
 %% Base message of the public step.
 -define(STEP_BASE, #{<<"device">> => <<"inference@1.0">>}).
 
-%% The AO-Core stage whose function computes the recorded HashPath.
+%% Where the exposed HashPath comes from: this device writes the public
+%% step with HyperBEAM v0.11's `hb_hashpath:format/2', the form AO-Core
+%% records, before the step's result exists.
 -define(HASHPATH_SOURCE,
-    <<"HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)">>).
+    <<"inference@1.0 public step (HyperBEAM v0.11 hb_hashpath:format/2)">>).
+
+%% The HashPath algorithm: an `hb_hashpath' claim of HyperBEAM v0.11, the
+%% value `inference_receipt@1.0' reports for it.
+-define(HASHPATH_ALGORITHM, <<"hb-hashpath-v0.11">>).
 
 %% Model and runtime facts an operator declares under the `inference-opts'
 %% node option. Only these keys are reported in `resolved_model'.
@@ -630,7 +636,7 @@ ao_core_evidence(Req, Response, Opts) ->
             end,
             <<"source">> => ?HASHPATH_SOURCE,
             <<"hashpath">> => Hashpath,
-            <<"hashpath-algorithm">> => <<"sha-256-chain (AO-Core default)">>,
+            <<"hashpath-algorithm">> => ?HASHPATH_ALGORITHM,
             <<"request-id">> => RequestID,
             <<"response-id">> => safe_message_id(Response, Opts),
             <<"verification-status">> => <<"captured">>
@@ -923,6 +929,10 @@ ao_core_evidence_excludes_client_metadata_test() ->
     ?assertMatch(#{<<"status">> := <<"captured">>, <<"hashpath">> := _,
         <<"request-id">> := _, <<"response-id">> := _}, Evidence),
     ?assertEqual(?HASHPATH_SOURCE, maps:get(<<"source">>, Evidence)),
+    ?assertEqual(<<"hb-hashpath-v0.11">>,
+        maps:get(<<"hashpath-algorithm">>, Evidence)),
+    ?assertMatch(<<"ao:~inference@1.0/ao:", _:43/binary>>,
+        maps:get(<<"hashpath">>, Evidence)),
     ?assertEqual(
         lists:sort([<<"max_tokens">>, <<"messages">>, <<"model">>, <<"tee">>]),
         lists:sort(maps:keys(public_step_request(request_with_client_metadata(), #{})))),

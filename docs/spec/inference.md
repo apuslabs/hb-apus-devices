@@ -253,9 +253,9 @@ unchanged, and requests never choose the peer.
 | Key | Value |
 |---|---|
 | `status` | `captured` when the HashPath of the public step could be computed, otherwise `not-captured`. |
-| `source` | `HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)`: the AO-Core resolution stage that links a result to its inputs, whose function `hb_path:hashpath/3` computes this HashPath. |
+| `source` | `inference@1.0 public step (HyperBEAM v0.11 hb_hashpath:format/2)`: this device writes the HashPath of the public step with `hb_hashpath:format/2`, in the form AO-Core records, before the step's result exists. |
 | `hashpath` | The HashPath of the public step in the form AO-Core records it (`hb_hashpath`): `ao:~inference@1.0/<request>`, where `<request>` is `ao:` and the ID of the step request. AO-Core assigns the executed step this value followed by `.<ID>` of its result. Omitted when `status` is `not-captured`. |
-| `hashpath-algorithm` | `sha-256-chain (AO-Core default)`. |
+| `hashpath-algorithm` | `hb-hashpath-v0.11`: an `hb_hashpath` claim of HyperBEAM v0.11, the name `inference_receipt@1.0` reports for it. |
 | `request-id` | Unsigned message ID of the public step request. Omitted when it cannot be computed. |
 | `response-id` | Unsigned message ID of the runtime response, private keys removed. Omitted when it cannot be computed. |
 | `verification-status` | `captured`. |

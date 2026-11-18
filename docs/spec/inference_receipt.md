@@ -58,7 +58,18 @@ in confidential-computing mode.
 - **HashPath:** the AO-Core claim of a step, in the form `hb_hashpath`
   writes: `ao:<base>/<request>` (the step), followed by `.<ID>` of the result
   (the claim that executing the request on the base gave that result).
-  AO-Core places it in the response's private `hashpath`.
+  AO-Core places it in the response's private `hashpath`. Its algorithm is
+  named `hb-hashpath-v0.11`.
+- **Legacy HashPath:** the value a node on HyperBEAM before v0.11
+  (`28baa3d`, `1aebe74`) recorded: `<base>/<request>`, where `<base>` is the
+  43-character ID of the base message (or, for a base that carries a
+  HashPath `<a>/<b>`, the SHA-256 of `a` and `b`) and `<request>` is the ID
+  of the request, or its first path part for a request of only a `path`.
+  IDs are that kernel's `httpsig@1.0` IDs: the HMAC-SHA256, keyed
+  `constant:ao`, of the RFC 9421 signature base of the message's encoding,
+  or the sum modulo 2^256 of its commitment IDs. Its algorithm is named
+  `legacy-sha-256-chain`. HyperBEAM v0.11 computes neither the form nor the
+  IDs; this device recomputes them itself.
 - **Transcript:** the recorded step's base message, executed request and
   response.
 - **Truthy:** the values `true`, `"true"`, `"1"` and `1`.
@@ -222,21 +233,34 @@ configuration are node options of `inference@1.0`, `gpu_inventory@1.0` and
      Otherwise the transcript is `verification-input` with `base`,
      `request`, `response` and optional `rest`, whose link objects are
      restored to AO-Core links.
-  2. Recompute the HashPath from `base`, `request` and `response`: the step
-     `ao:<base>/<request>` and the claim, the step followed by `.<ID>` of
-     `response`. `recomputed-hashpath` is the claim.
-  3. Collect the recorded values: `ao-core.hashpath`, and the response's
+  2. Collect the recorded values: `ao-core.hashpath`, and the response's
      private `hashpath` when the transcript arrived as
      `verification-input-term` (HTTP requests cannot carry private keys).
-  4. When `rest` is present, also verify the HashPath chain of
-     `[request, response | rest]`.
-- **Returns:** `{ok, #{status => 200, body => Result}}` where `Result` holds
-  `verified`, `recomputed-hashpath` and, when a value was recorded,
+  3. Select the algorithm from the form of the first recorded value: a
+     legacy HashPath (§2: a 43-character ID, `/`, and one path part without
+     `/`) selects `legacy-sha-256-chain`; any other value, or none,
+     selects `hb-hashpath-v0.11`.
+  4. Recompute the HashPath from `base`, `request` and `response` with that
+     algorithm. For `hb-hashpath-v0.11`: the step `ao:<base>/<request>` and
+     the claim, the step followed by `.<ID>` of `response`;
+     `recomputed-hashpath` is the claim. For `legacy-sha-256-chain`: the
+     legacy HashPath of `base` and `request`, which is
+     `recomputed-hashpath`. A transcript value that the legacy algorithm
+     cannot reproduce (a lazy link) makes the transcript unusable (§8).
+  5. When `rest` is present, also verify the HashPath chain of
+     `[request, response | rest]` with the same algorithm.
+- **Returns:** `{ok, #{status => 200, content-type => application/json,
+  body => Result}}`, where `Result` is a JSON object, so that HashPath values
+  that start with `ao:` are returned as text and never read as links. It
+  holds `verified`, `hashpath-algorithm` (the selected algorithm),
+  `recomputed-hashpath` and, when a value was recorded,
   `expected-hashpath` (the first recorded value) and `hashpath-sources`
   (`ao-core.hashpath`, `response.priv.hashpath`). `verified` is `true`
   exactly when every recorded value equals the recomputed claim, or the step
-  alone (as `inference@1.0` exposes it before its response exists), and the
-  chain check (if any) holds. Otherwise `reason` is `hashpath-mismatch`,
+  alone (as `inference@1.0` exposes it before its response exists), or, for
+  `legacy-sha-256-chain`, the recomputed legacy HashPath, and the chain
+  check (if any) holds. A recorded value in the other algorithm's form does
+  not match. Otherwise `reason` is `hashpath-mismatch`,
   `hashpath-chain-mismatch` or `hashpath-not-captured` (nothing recorded;
   `recomputed-hashpath` is then informational). Unusable input returns an
   error result (§8).
@@ -356,9 +380,9 @@ of its fields is defined by `inference_measurement@1.0`.
 | Key | Value |
 |---|---|
 | `status` | `captured` when a HashPath was recorded, else `not-captured`. |
-| `hashpath` | The response's private `hashpath`, which AO-Core assigns at stage 8, else the one `inference@1.0` exposed in its response JSON (`ao-core`, or `attestation.raw` → `ao-core`). |
-| `source` | The `source` of the evidence `inference@1.0` exposed, else `HyperBEAM AO-Core stage 8 (cryptographic linking, hb_path:hashpath/3)`. Both name the AO-Core stage whose function, `hb_path:hashpath/3`, computes the HashPath. |
-| `hashpath-algorithm` | The recorded base message's `hashpath-alg`, which AO-Core uses to chain the HashPath, else `sha-256-chain (AO-Core default)`. The recorded base `{"device": "inference@1.0"}` names none. |
+| `hashpath` | The response's private `hashpath`, which the AO-Core resolver assigns at stage 10 (`hb_hashpath:generate/8`), else the one `inference@1.0` exposed in its response JSON (`ao-core`, or `attestation.raw` → `ao-core`). |
+| `source` | Where `hashpath` comes from: `HyperBEAM v0.11 AO-Core resolver stage 10 (hb_hashpath:generate/8)` for the response's private `hashpath`, else the `source` of the evidence `inference@1.0` exposed (`inference@1.0 public step (HyperBEAM v0.11 hb_hashpath:format/2)`). |
+| `hashpath-algorithm` | The algorithm of `hashpath`, from its form (§4, `verify-hashpath`): `hb-hashpath-v0.11` for the HashPaths this node records, `legacy-sha-256-chain` for a legacy HashPath. HyperBEAM v0.11 does not read a base message's `hashpath-alg`. |
 | `request-id`, `response-id` | Unsigned message IDs of the executed request and of the response. |
 | `commitment-device`, `signers` | Commitment device and signers of the response (an unsigned response has none). A signer with an Arweave key is given by its address; any other by the URI of its committer. |
 | `verification-input` | The transcript: `base`, `request`, `response`. |
@@ -555,9 +579,11 @@ of §8. In these bodies `verified` is the JSON literal `false`.
    `inference_measurement@1.0` returned it, and `nonce-binding` is the
    composition's, else the envelope's top-level one.
 10. The response's `body` carries the runtime's JSON with `receipt` added.
-11. `verify-hashpath` reports `verified: true` exactly when every recorded
-    HashPath equals the one recomputed from `base` and `request` (and the
-    chain check holds when `rest` is given). It refuses with 400 a
+11. `verify-hashpath` answers with a JSON body. It reports `verified: true`
+    exactly when every recorded HashPath equals the one recomputed from
+    `base` and `request` with the algorithm that the first recorded value's
+    form selects (and the chain check holds when `rest` is given), and names
+    that algorithm in `hashpath-algorithm`. It refuses with 400 a
     `verification-input-term` that breaks a check of §4, never decodes more
     than 1 MiB or a compressed term, and answers 422 for other unusable
     input.
