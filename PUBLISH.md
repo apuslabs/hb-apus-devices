@@ -6,16 +6,16 @@ whose `implements-device` tag is the specification ID.
 
 | Field | Value |
 |---|---|
-| Published at | 2026-10-18T22:00:37Z |
+| Published at | 2026-11-18T15:20:03Z |
 | Signer | `lpJ5Edz_8DbNnVDL0XdbsY9vCOs45NACzfI4jvo4Ba8` |
-| Source commit | `ab8322624ca8b364aae30f7f3b6bbbfac193d9f7` |
-| HyperBEAM | `apuslabs/HyperBEAM` at `28baa3d27d70c4268f439587ba0398fb7771e0e3` |
+| Source commit | `499cfbf89019576c4ad7e53682171f31754eea10` |
+| HyperBEAM | `permaweb/HyperBEAM` at `80a72735230882643f1ca9afe4e18af57ac065db` |
 
 | Device | Specification ID | Implementation ID |
 |---|---|---|
-| `agent@1.0` | `puR2sj2Q2mIkIgJBikyG68i5mu3wOt3RBwbYDgiRBrI` | `Bo9jiTsFFpXw_riKcolCvXE_R_gDXkK1kkbVB_hM8-4` |
-| `gpu_inventory@1.0` | `k1Boi24_QvkaVBxlzgr9b3bvrVbNAE2p4UH6g-nFcpE` | `3HPyfL_PQAAmYIEtWTPcKRtErN7FDnFF9yZFy2zZF0s` |
-| `inference@1.0` | `FMzz78sgDpgdJhjeQexe5V1AhqF-2s1aEVtlHcGCayw` | `KMEG4h1IxlMoIM0gq19qFWUjey6bH1BuaKOi5g9Y100` |
-| `inference_measurement@1.0` | `OX2fN8q3JjHJQmca7mZmSqPqRjsosZ8XYGkrire6TdM` | `I3oSsl4cZxXanCYDEiOE_11wf_tPgrU5f1pW2f3Lubs` |
-| `inference_receipt@1.0` | `gzgJCo-icR752odI-YZ8Fpamsh0txzwHOZiHpDrsQKM` | `cyhQqMkFPyHjc0p1aEc2kTrTEWW6pn6cORcCS1Y-rms` |
-| `sev_gpu@1.0` | `dRL0FGlnrLPe_xy-8uMlMnYtv6HyWtxzLbp1YgFkIw0` | `d9lNZizqiQjz2hWbjAuK3Mz_lclLEZr-Zc1R4cVY5EI` |
+| `agent@1.0` | `GDx1MLKRvel9dthE2tFi95UlxUYCwZguH7P90qIu0NQ` | `FxhTba1he302gQYCvqncXF7DjyOnRzZVXcMFN10ybqY` |
+| `gpu_inventory@1.0` | `GMJaJ90J8VLKYmSNvUkKxLcGg_1MzUvDIl3ng3GFCPA` | `50Rh7b8hxUl67QMYL_V449g3IoHKfk4jr5L1GLpjlDk` |
+| `inference@1.0` | `1X0c4fx1-hLHcvCEWZ2jiMIKAqQYX0R9b61vWAAgpCM` | `vCgZstCUS6qSdE7kr441xtvcORLAhRjSUbcAr_tA7lM` |
+| `inference_measurement@1.0` | `5kT_xFkVN8BLkQfZi3K0049Y55GL5geqOF4tLEpQ8i8` | `TvbEu0ts6rai8Nq7h4qhsbP2QObeguzVSoq5WbdSx68` |
+| `inference_receipt@1.0` | `gkEzPuxSVnsTzUE__N1UP6aVQk2VOerVZe173W8G2xs` | `l-RuuuTDLGVRHiSLwA_pW_lZgRwJTIyhPuV0c7hwp4s` |
+| `sev_gpu@1.0` | `TnrXYFl-r3OlXGzGpY4MyjFvoWjAyIvQTVUb7DHBtcs` | `xxTc61pH5AxX0p3lNhv6O_otXEgGE6NiwANQ7rx-Klk` |
