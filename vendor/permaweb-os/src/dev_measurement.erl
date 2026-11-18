@@ -277,6 +277,30 @@ build_measurement_body(Opts) ->
             Body
     end.
 
+
+%% @doc Decode `+link' keys of a message into links. A local copy of
+%% `hb_link:decode_all_links/1', which HyperBEAM v0.11 removed.
+decode_all_links(Msg) when is_map(Msg) ->
+    maps:from_list(
+        lists:map(
+            fun({Key, MaybeID}) when is_binary(Key), byte_size(Key) >= 5 ->
+                    case binary:part(Key, byte_size(Key) - 5, 5) of
+                        <<"+link">> ->
+                            {binary:part(Key, 0, byte_size(Key) - 5),
+                                {link, MaybeID,
+                                    #{ <<"type">> => <<"link">>, <<"lazy">> => false }}};
+                        _ -> {Key, MaybeID}
+                    end;
+               (KV) -> KV
+            end,
+            maps:to_list(Msg)
+        )
+    );
+decode_all_links(List) when is_list(List) ->
+    lists:map(fun decode_all_links/1, List);
+decode_all_links(Other) ->
+    Other.
+
 -ifdef(TEST).
 test_measurement_body(_Opts) ->
     persistent_term:get({dev_measurement, test_body}, undefined).
@@ -787,7 +811,7 @@ response_body({ok, Msg}, Opts) ->
 response_body({error, Reason}, _Opts) ->
     throw({measurement_error, Reason});
 response_body(Msg, Opts) when is_map(Msg) ->
-    Normalized = hb_link:decode_all_links(normalize_top_keys(Msg)),
+    Normalized = decode_all_links(normalize_top_keys(Msg)),
     Status = maps:get(<<"status">>, Normalized, undefined),
     Body = maps:get(<<"body">>, Normalized, undefined),
     Type = maps:get(<<"type">>, Normalized, undefined),

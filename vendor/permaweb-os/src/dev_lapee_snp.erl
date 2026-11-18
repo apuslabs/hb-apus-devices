@@ -127,7 +127,7 @@ measure(_Base, Req, Opts) ->
     end.
 
 verify(Base, Req, Opts) ->
-    Measurement = hb_link:decode_all_links(
+    Measurement = decode_all_links(
         response_body(resolve_envelope(Base, Req, Opts), Opts)),
     Evidence = measurement_part(<<"evidence">>, Measurement, Opts),
     Body = hb_maps:get(<<"body">>, Measurement, #{}, Opts),
@@ -628,6 +628,30 @@ nonzero_binary(Bin) when is_binary(Bin), byte_size(Bin) > 0 ->
 nonzero_binary(_Other) ->
     false.
 
+
+%% @doc Decode `+link' keys of a message into links. A local copy of
+%% `hb_link:decode_all_links/1', which HyperBEAM v0.11 removed.
+decode_all_links(Msg) when is_map(Msg) ->
+    maps:from_list(
+        lists:map(
+            fun({Key, MaybeID}) when is_binary(Key), byte_size(Key) >= 5 ->
+                    case binary:part(Key, byte_size(Key) - 5, 5) of
+                        <<"+link">> ->
+                            {binary:part(Key, 0, byte_size(Key) - 5),
+                                {link, MaybeID,
+                                    #{ <<"type">> => <<"link">>, <<"lazy">> => false }}};
+                        _ -> {Key, MaybeID}
+                    end;
+               (KV) -> KV
+            end,
+            maps:to_list(Msg)
+        )
+    );
+decode_all_links(List) when is_list(List) ->
+    lists:map(fun decode_all_links/1, List);
+decode_all_links(Other) ->
+    Other.
+
 -ifdef(TEST).
 publisher_digest(Msg, Opts) when map_size(Opts) =:= 0 ->
     hb_util:encode(crypto:hash(sha256, term_to_binary(Msg)));
@@ -712,7 +736,7 @@ evidence_certificates(Evidence, Opts) ->
         ]).
 
 evidence_certificate_map(Evidence0, Opts) ->
-    Evidence = hb_link:decode_all_links(Evidence0),
+    Evidence = decode_all_links(Evidence0),
     case hb_maps:get(<<"certificates">>, Evidence, undefined, Opts) of
         undefined -> #{};
         Certs -> certificate_map_value(Certs, Opts)
@@ -723,7 +747,7 @@ certificate_map_value(Link, Opts) when ?IS_LINK(Link) ->
 certificate_map_value({ok, Msg}, Opts) ->
     certificate_map_value(Msg, Opts);
 certificate_map_value(Msg, Opts) when is_map(Msg) ->
-    Decoded = hb_link:decode_all_links(Msg),
+    Decoded = decode_all_links(Msg),
     Entries =
         [
             {Type, certificate_entry_value(Cert, Opts)}
@@ -747,7 +771,7 @@ certificate_entry_value(Link, Opts) when ?IS_LINK(Link) ->
 certificate_entry_value({ok, Msg}, Opts) ->
     certificate_entry_value(Msg, Opts);
 certificate_entry_value(Msg, Opts) when is_map(Msg) ->
-    Decoded = hb_link:decode_all_links(Msg),
+    Decoded = decode_all_links(Msg),
     case hb_maps:get(<<"body">>, Decoded, undefined, Opts) of
         Body when is_map(Body) -> Body;
         _ -> Decoded
@@ -1604,7 +1628,7 @@ link_id({link, ID, _LinkOpts}) ->
 canonical_payload(Link, Opts) when ?IS_LINK(Link) ->
     canonical_payload(response_body(Link, Opts), Opts);
 canonical_payload(Msg, Opts) when is_map(Msg) ->
-    Decoded = hb_link:decode_all_links(Msg),
+    Decoded = decode_all_links(Msg),
     maps:from_list(
         [
             {Key, canonical_payload(Value, Opts)}
@@ -1641,7 +1665,7 @@ load_part(Link, Opts) when ?IS_LINK(Link) ->
 load_part({ok, Msg}, Opts) ->
     load_part(Msg, Opts);
 load_part(Msg, _Opts) when is_map(Msg) ->
-    hb_link:decode_all_links(Msg);
+    decode_all_links(Msg);
 load_part(Value, _Opts) ->
     Value.
 
